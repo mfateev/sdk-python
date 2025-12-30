@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the design for integrating CrewAI with Temporal, enabling durable execution of AI agent crews. The integration follows the same patterns established by the LangGraph and OpenAI Agents integrations: execute orchestration logic in workflows, perform all IO operations in activities.
+This document describes the design for integrating CrewAI with Temporal, enabling durable execution of AI agent crews. The integration follows the same patterns established by the OpenAI Agents integration: execute orchestration logic in workflows, perform all IO operations in activities.
 
 ## Goals
 
@@ -50,7 +50,6 @@ class ResearchWorkflow:
             goal=f"Research {topic} thoroughly",
             backstory="You are an expert researcher...",
             llm=llm_stub("gpt-4o"),  # LLM calls become activities
-            inject_date=False,  # REQUIRED: datetime.now() is non-deterministic
             tools=[
                 activity_as_tool(
                     search_web,
@@ -68,7 +67,6 @@ class ResearchWorkflow:
             goal="Write clear documentation",
             backstory="You are an expert technical writer...",
             llm=llm_stub("gpt-4o"),
-            inject_date=False,
         )
 
         # Define tasks
@@ -90,13 +88,12 @@ class ResearchWorkflow:
         crew = Crew(
             agents=[researcher, writer],
             tasks=[research_task, write_task],
-            verbose=False,  # Recommended: minimize console I/O
-            planning=False,  # REQUIRED unless planning wrapped in activity
+            planning=False,  # REQUIRED unless planning_llm=llm_stub()
         )
 
         # Execute crew with Temporal durability
         runner = TemporalCrewRunner(crew)
-        result = await runner.kickoff()
+        result = await runner.akickoff()
 
         return result.raw
 ```
@@ -144,7 +141,7 @@ class CrewWithMemoryWorkflow:
         )
 
         runner = TemporalCrewRunner(crew)
-        return (await runner.kickoff()).raw
+        return (await runner.akickoff()).raw
 ```
 
 ### With Knowledge Base
@@ -208,19 +205,23 @@ from temporalio.contrib.crewai import (
     crewai_activities,
     CrewAIActivityConfig,
 )
+from crewai.llm import LLM
+from crewai.memory.storage.rag_storage import RAGStorage
+from crewai.memory.storage.ltm_sqlite_storage import LTMSQLiteStorage
+from crewai.knowledge.storage.knowledge_storage import KnowledgeStorage
 
 async def main():
     client = await Client.connect("localhost:7233")
 
     # Create activity config with actual LLM/storage implementations
     activity_config = CrewAIActivityConfig(
-        # Default LLM for activities (can be overridden per-agent)
-        default_llm_factory=lambda model: LLM(model=model),
+        # LLM factory: model name -> LLM instance
+        llm_factory=lambda model: LLM(model=model),
         # Storage factories for memory activities
-        short_term_storage_factory=lambda: RAGStorage(type="short_term"),
-        long_term_storage_factory=lambda: LTMSQLiteStorage(),
-        entity_storage_factory=lambda: RAGStorage(type="entity"),
-        knowledge_storage_factory=lambda config: KnowledgeStorage(**config),
+        short_term_storage_factory=lambda **kw: RAGStorage(type="short_term", **kw),
+        entity_storage_factory=lambda **kw: RAGStorage(type="entity", **kw),
+        ltm_storage_factory=lambda **kw: LTMSQLiteStorage(**kw),
+        knowledge_storage_factory=lambda **kw: KnowledgeStorage(**kw),
     )
 
     worker = Worker(
@@ -358,7 +359,7 @@ class _LLMStub(BaseLLM):
         """Synchronous LLM call - not supported in workflows."""
         raise NotImplementedError(
             "llm_stub only supports async execution. "
-            "Use Crew.kickoff_async() or run within an async context."
+            "Use Crew.akickoff() or run within an async context."
         )
 
     async def acall(
@@ -368,8 +369,12 @@ class _LLMStub(BaseLLM):
         callbacks: Any | None = None,
         available_functions: dict | None = None,
         **kwargs: Any,
-    ) -> str:
-        """Async LLM call - executes as Temporal activity."""
+    ) -> str | Any:
+        """Async LLM call - executes as Temporal activity.
+
+        Returns either a string (for simple responses) or a response object
+        with tool_calls (when the LLM requests tool execution).
+        """
         input_data = LLMCallInput(
             model=self.model,
             messages=messages,
@@ -386,7 +391,15 @@ class _LLMStub(BaseLLM):
             task_queue=self.activity_config.task_queue,
         )
 
-        return result.content
+        # If the LLM returned tool calls, return them directly.
+        # CrewAI's agent executor expects tool_calls as a list when the LLM
+        # wants to execute tools. It will handle the tool execution loop.
+        # (Verified: crewai/llm.py:1203 returns tool_calls directly when
+        # available_functions is not provided)
+        if result.tool_calls:
+            return result.tool_calls
+
+        return result.content or ""
 
     @property
     def supports_function_calling(self) -> bool:
@@ -409,6 +422,24 @@ from temporalio import activity, workflow
 from typing import Any, Callable
 import inspect
 import json
+
+# Marker attribute to identify tools created via activity_as_tool()
+_TEMPORAL_TOOL_MARKER = "_is_temporal_activity_tool"
+
+
+def _is_temporal_tool(tool: Any) -> bool:
+    """Check if a tool was created via activity_as_tool().
+
+    This is used by TemporalCrewRunner to validate that all tools
+    are activity-backed for workflow execution.
+
+    Args:
+        tool: A CrewAI tool instance
+
+    Returns:
+        True if the tool was created with activity_as_tool()
+    """
+    return getattr(tool, _TEMPORAL_TOOL_MARKER, False)
 
 
 def activity_as_tool(
@@ -484,13 +515,18 @@ def activity_as_tool(
         # CrewAI expects string results
         return str(result) if result is not None else ""
 
-    return CrewStructuredTool(
+    tool = CrewStructuredTool(
         name=activity_name,
         description=doc,
         func=lambda **kw: None,  # Sync version not supported
         coroutine=_run_activity,
         args_schema=args_schema,
     )
+
+    # Mark as a Temporal activity tool for validation
+    setattr(tool, _TEMPORAL_TOOL_MARKER, True)
+
+    return tool
 
 
 def _build_args_schema(fn: Callable) -> type:
@@ -916,6 +952,11 @@ from crewai import Crew
 from crewai.crews.crew_output import CrewOutput
 from typing import Any
 
+from temporalio.contrib.crewai._llm import _LLMStub
+from temporalio.contrib.crewai._tools import _is_temporal_tool
+from temporalio.contrib.crewai._memory import _RAGStorageStub, _LTMStorageStub
+from temporalio.contrib.crewai._knowledge import _KnowledgeStorageStub
+
 
 class TemporalCrewRunner:
     """Runner that executes a CrewAI Crew within a Temporal workflow.
@@ -932,9 +973,19 @@ class TemporalCrewRunner:
         """Validate that the crew is configured for Temporal execution."""
         # Validate crew-level settings
         if getattr(self.crew, 'planning', False):
+            # Check if planning_llm is an llm_stub
+            planning_llm = getattr(self.crew, 'planning_llm', None)
+            if not isinstance(planning_llm, _LLMStub):
+                raise ValueError(
+                    "Crew with planning=True must use planning_llm=llm_stub() "
+                    "for workflow execution, or set planning=False."
+                )
+
+        # Check max_rpm is not set (causes time.sleep blocking)
+        if getattr(self.crew, 'max_rpm', None):
             raise ValueError(
-                "Crew with planning=True is not supported in workflows. "
-                "CrewPlanner makes synchronous LLM calls. Set planning=False."
+                "Crew with max_rpm set is not supported in workflows. "
+                "time.sleep() blocks the workflow thread. Remove max_rpm."
             )
 
         for agent in self.crew.agents:
@@ -945,11 +996,11 @@ class TemporalCrewRunner:
                     f"Got: {type(agent.llm).__name__}"
                 )
 
-            # Check inject_date is disabled (datetime.now() is non-deterministic)
-            if getattr(agent, 'inject_date', True):
+            # Check max_rpm is not set on agent
+            if getattr(agent, 'max_rpm', None):
                 raise ValueError(
-                    f"Agent '{agent.role}' must set inject_date=False for workflow execution. "
-                    "datetime.now() is non-deterministic."
+                    f"Agent '{agent.role}' has max_rpm set, which is not supported "
+                    "in workflows. time.sleep() blocks the workflow thread."
                 )
 
             # Check that tools are activity-backed (if any)
@@ -969,27 +1020,54 @@ class TemporalCrewRunner:
                     "for workflow execution. Use Temporal signals for human input."
                 )
 
-            # Warn about output_file (file I/O should be in activities)
-            if getattr(task, 'output_file', None):
-                import warnings
-                warnings.warn(
-                    f"Task '{task.description[:50]}...' has output_file set. "
-                    "File I/O in workflows is non-deterministic. Consider using "
-                    "an activity for file operations.",
-                    UserWarning,
-                )
-
         # Validate memory configuration if enabled
         if self.crew.memory:
+            # Validate short-term memory
             if self.crew.short_term_memory:
                 storage = getattr(self.crew.short_term_memory, 'storage', None)
                 if not isinstance(storage, _RAGStorageStub):
                     raise ValueError(
-                        "Crew with memory=True must use short_term_memory_stub()"
+                        "Crew with memory=True must use short_term_memory_stub() "
+                        "for short_term_memory"
                     )
 
-    async def kickoff(self, inputs: dict[str, Any] | None = None) -> CrewOutput:
-        """Execute the crew asynchronously.
+            # Validate long-term memory
+            if self.crew.long_term_memory:
+                storage = getattr(self.crew.long_term_memory, 'storage', None)
+                if not isinstance(storage, _LTMStorageStub):
+                    raise ValueError(
+                        "Crew with memory=True must use long_term_memory_stub() "
+                        "for long_term_memory"
+                    )
+
+            # Validate entity memory
+            if self.crew.entity_memory:
+                storage = getattr(self.crew.entity_memory, 'storage', None)
+                if not isinstance(storage, _RAGStorageStub):
+                    raise ValueError(
+                        "Crew with memory=True must use entity_memory_stub() "
+                        "for entity_memory"
+                    )
+
+        # Validate knowledge sources on agents
+        for agent in self.crew.agents:
+            for knowledge in (getattr(agent, 'knowledge_sources', None) or []):
+                storage = getattr(knowledge, 'storage', None)
+                if storage is not None and not isinstance(storage, _KnowledgeStorageStub):
+                    raise ValueError(
+                        f"Agent '{agent.role}' has knowledge source with non-stub storage. "
+                        "Use knowledge_storage_stub() for workflow execution."
+                    )
+
+    async def akickoff(self, inputs: dict[str, Any] | None = None) -> CrewOutput:
+        """Execute the crew asynchronously using native async.
+
+        Uses Crew.akickoff() which provides true async execution via
+        llm.acall() -> litellm.acompletion(). This is required for
+        proper activity scheduling in Temporal workflows.
+
+        Note: Do NOT use Crew.kickoff_async() as it wraps sync code in
+        asyncio.to_thread(), which would bypass our activity stubs.
 
         Args:
             inputs: Optional inputs to pass to the crew
@@ -997,13 +1075,13 @@ class TemporalCrewRunner:
         Returns:
             CrewOutput containing the execution results
         """
-        return await self.crew.kickoff_async(inputs=inputs)
+        return await self.crew.akickoff(inputs=inputs)
 
-    async def kickoff_for_each(
+    async def akickoff_for_each(
         self,
         inputs: list[dict[str, Any]],
     ) -> list[CrewOutput]:
-        """Execute the crew for each input set.
+        """Execute the crew for each input set using native async.
 
         Args:
             inputs: List of input dictionaries
@@ -1011,14 +1089,18 @@ class TemporalCrewRunner:
         Returns:
             List of CrewOutput results
         """
-        return await self.crew.kickoff_for_each_async(inputs=inputs)
+        return await self.crew.akickoff_for_each(inputs=inputs)
 ```
 
 ---
 
 ## Activity Definitions
 
-### 7. LLM Activity
+Activities are implemented using a class-based pattern to inject configuration. This follows the pattern established by the OpenAI Agents integration (see `temporalio/contrib/openai_agents/_invoke_model_activity.py`).
+
+**Important**: The Temporal Python SDK does not have `activity.info().activity_config`. Configuration must be injected via class-based activities where the config is passed to `__init__`.
+
+### 7. Activity Class Pattern
 
 ```python
 # File: temporalio/contrib/crewai/_activities.py
@@ -1028,196 +1110,172 @@ from dataclasses import dataclass
 from typing import Any
 
 
-@dataclass
-class LLMCallInput:
-    """Input for LLM call activity."""
-    model: str
-    messages: list[dict[str, str]]
-    tools: list[dict] | None = None
-    llm_kwargs: dict[str, Any] | None = None
+class CrewAIActivities:
+    """All CrewAI activities with injected configuration.
 
+    This class holds the configuration needed to create real LLM and storage
+    instances. Activities are methods on this class, allowing access to
+    self._config for factory functions.
 
-@dataclass
-class LLMCallOutput:
-    """Output from LLM call activity."""
-    content: str
-    tool_calls: list[dict] | None = None
-    usage: dict[str, int] | None = None
-
-
-@activity.defn(name="crewai_llm_call")
-async def llm_call_activity(input: LLMCallInput) -> LLMCallOutput:
-    """Execute an LLM call.
-
-    This activity creates a real LLM instance and makes the API call.
-    The LLM factory is injected via activity context.
+    Usage:
+        config = CrewAIActivityConfig(llm_factory=lambda m: LLM(model=m))
+        activities = CrewAIActivities(config)
+        worker = Worker(..., activities=[activities.llm_call, activities.memory_save, ...])
     """
-    # Get LLM factory from activity context
-    config = activity.info().activity_config
-    llm_factory = config.llm_factory
 
-    # Create LLM instance
-    llm = llm_factory(input.model)
+    def __init__(self, config: "CrewAIActivityConfig"):
+        self._config = config
 
-    # Make the call
-    kwargs = input.llm_kwargs or {}
-    result = await llm.acall(
-        messages=input.messages,
-        tools=input.tools,
-        **kwargs,
-    )
+    @activity.defn(name="crewai_llm_call")
+    async def llm_call(self, input: LLMCallInput) -> LLMCallOutput:
+        """Execute an LLM call.
 
-    # Send heartbeat for long calls
-    activity.heartbeat({"model": input.model, "status": "completed"})
+        Note: We do NOT pass available_functions to the LLM. This causes tool_calls
+        to be returned directly rather than executed internally. Tool execution
+        happens in the workflow via activity_as_tool wrappers.
 
-    return LLMCallOutput(
-        content=result if isinstance(result, str) else result.content,
-        tool_calls=getattr(result, "tool_calls", None),
-        usage=getattr(result, "usage", None),
-    )
-```
+        The LLM (crewai/llm.py:1203) returns tool_calls directly when:
+        - tool_calls exist AND available_functions is not provided AND no text_response
+        """
+        llm = self._config.llm_factory(input.model)
 
-### 8. Memory Activities
+        kwargs = input.llm_kwargs or {}
+        # Do NOT pass available_functions - we want tool_calls returned, not executed
+        result = await llm.acall(
+            messages=input.messages,
+            tools=input.tools,
+            available_functions=None,  # Explicitly None to get tool_calls back
+            **kwargs,
+        )
 
-```python
-# File: temporalio/contrib/crewai/_activities.py (continued)
+        activity.heartbeat({"model": input.model, "status": "completed"})
 
-@dataclass
-class MemorySaveInput:
-    """Input for memory save activity."""
-    storage_type: str  # "short_term", "entity", etc.
-    value: Any
-    metadata: dict[str, Any]
-    embedder_config: dict | None = None
+        # Result can be:
+        # 1. str - simple text response
+        # 2. list - tool_calls that need to be executed by the workflow
+        if isinstance(result, list):
+            # Tool calls returned
+            return LLMCallOutput(
+                content=None,
+                tool_calls=result,
+            )
+        elif isinstance(result, str):
+            return LLMCallOutput(
+                content=result,
+                tool_calls=None,
+            )
+        else:
+            # Fallback for unexpected response types
+            return LLMCallOutput(
+                content=str(result) if result else None,
+                tool_calls=getattr(result, "tool_calls", None),
+                usage=getattr(result, "usage", None),
+            )
 
+    @activity.defn(name="crewai_memory_save")
+    async def memory_save(self, input: MemorySaveInput) -> None:
+        """Save to memory storage."""
+        storage = self._config.get_storage(input.storage_type, input.embedder_config)
+        await storage.asave(value=input.value, metadata=input.metadata)
+        activity.heartbeat({"storage_type": input.storage_type, "action": "save"})
 
-@dataclass
-class MemorySearchInput:
-    """Input for memory search activity."""
-    storage_type: str
-    query: str
-    limit: int = 5
-    score_threshold: float = 0.6
-    embedder_config: dict | None = None
+    @activity.defn(name="crewai_memory_search")
+    async def memory_search(self, input: MemorySearchInput) -> MemorySearchOutput:
+        """Search memory storage (RAGStorage)."""
+        storage = self._config.get_storage(input.storage_type, input.embedder_config)
+        # Note: RAGStorage uses 'filter' parameter, not 'metadata_filter'
+        results = await storage.asearch(
+            query=input.query,
+            limit=input.limit,
+            filter=input.filter,
+            score_threshold=input.score_threshold,
+        )
+        activity.heartbeat({
+            "storage_type": input.storage_type,
+            "action": "search",
+            "results_count": len(results),
+        })
+        return MemorySearchOutput(results=[_to_dict(r) for r in results])
 
+    @activity.defn(name="crewai_memory_reset")
+    async def memory_reset(self, input: MemoryResetInput) -> None:
+        """Reset memory storage.
 
-@dataclass
-class MemorySearchOutput:
-    """Output from memory search activity."""
-    results: list[dict[str, Any]]
+        Note: RAGStorage does NOT have areset(), only sync reset().
+        We run the sync version in the activity (which is fine since activities
+        can block). For LTMStorage, areset() exists and is used.
+        """
+        storage = self._config.get_storage(input.storage_type, input.embedder_config)
+        # RAGStorage only has sync reset(), but that's OK in an activity
+        if hasattr(storage, 'areset'):
+            await storage.areset()
+        else:
+            storage.reset()
+        activity.heartbeat({"storage_type": input.storage_type, "action": "reset"})
 
+    @activity.defn(name="crewai_ltm_save")
+    async def ltm_save(self, input: LTMSaveInput) -> None:
+        """Save to long-term memory."""
+        storage = self._config.ltm_storage_factory(db_path=input.db_path)
+        await storage.asave(
+            task_description=input.task_description,
+            score=input.score,
+            metadata=input.metadata,
+            datetime=input.datetime,
+        )
 
-@activity.defn(name="crewai_memory_save")
-async def memory_save_activity(input: MemorySaveInput) -> None:
-    """Save to memory storage."""
-    config = activity.info().activity_config
-    storage = config.get_storage(input.storage_type, input.embedder_config)
+    @activity.defn(name="crewai_ltm_load")
+    async def ltm_load(self, input: LTMLoadInput) -> LTMLoadOutput:
+        """Load from long-term memory."""
+        storage = self._config.ltm_storage_factory(db_path=input.db_path)
+        results = await storage.aload(
+            task_description=input.task_description,
+            latest_n=input.latest_n,
+        )
+        return LTMLoadOutput(results=results or [])
 
-    await storage.asave(value=input.value, metadata=input.metadata)
+    @activity.defn(name="crewai_knowledge_search")
+    async def knowledge_search(self, input: KnowledgeSearchInput) -> KnowledgeSearchOutput:
+        """Search knowledge base."""
+        storage = self._config.knowledge_storage_factory(
+            collection_name=input.collection_name,
+            embedder_config=input.embedder_config,
+        )
+        results = await storage.asearch(
+            query=input.query,
+            limit=input.limit,
+            metadata_filter=input.metadata_filter,
+            score_threshold=input.score_threshold,
+        )
+        activity.heartbeat({
+            "collection": input.collection_name,
+            "action": "search",
+            "results_count": len(results),
+        })
+        return KnowledgeSearchOutput(results=[_to_dict(r) for r in results])
 
-    activity.heartbeat({"storage_type": input.storage_type, "action": "save"})
+    @activity.defn(name="crewai_knowledge_save")
+    async def knowledge_save(self, input: KnowledgeSaveInput) -> None:
+        """Save documents to knowledge base."""
+        storage = self._config.knowledge_storage_factory(
+            collection_name=input.collection_name,
+            embedder_config=input.embedder_config,
+        )
+        await storage.asave(documents=input.documents)
+        activity.heartbeat({
+            "collection": input.collection_name,
+            "action": "save",
+            "doc_count": len(input.documents),
+        })
 
-
-@activity.defn(name="crewai_memory_search")
-async def memory_search_activity(input: MemorySearchInput) -> MemorySearchOutput:
-    """Search memory storage."""
-    config = activity.info().activity_config
-    storage = config.get_storage(input.storage_type, input.embedder_config)
-
-    results = await storage.asearch(
-        query=input.query,
-        limit=input.limit,
-        score_threshold=input.score_threshold,
-    )
-
-    activity.heartbeat({
-        "storage_type": input.storage_type,
-        "action": "search",
-        "results_count": len(results),
-    })
-
-    return MemorySearchOutput(results=list(results))
-
-
-@activity.defn(name="crewai_memory_reset")
-async def memory_reset_activity(input: MemoryResetInput) -> None:
-    """Reset memory storage."""
-    config = activity.info().activity_config
-    storage = config.get_storage(input.storage_type, input.embedder_config)
-
-    await storage.areset()
-
-    activity.heartbeat({"storage_type": input.storage_type, "action": "reset"})
-```
-
-### 9. Knowledge Activities
-
-```python
-# File: temporalio/contrib/crewai/_activities.py (continued)
-
-@dataclass
-class KnowledgeSearchInput:
-    """Input for knowledge search activity."""
-    collection_name: str | None
-    query: list[str]
-    limit: int = 5
-    metadata_filter: dict[str, Any] | None = None
-    score_threshold: float = 0.6
-    embedder_config: dict | None = None
-
-
-@dataclass
-class KnowledgeSearchOutput:
-    """Output from knowledge search activity."""
-    results: list[dict[str, Any]]  # SearchResult as dict
-
-
-@activity.defn(name="crewai_knowledge_search")
-async def knowledge_search_activity(
-    input: KnowledgeSearchInput,
-) -> KnowledgeSearchOutput:
-    """Search knowledge base."""
-    config = activity.info().activity_config
-    storage = config.knowledge_storage_factory(
-        collection_name=input.collection_name,
-        embedder_config=input.embedder_config,
-    )
-
-    results = await storage.asearch(
-        query=input.query,
-        limit=input.limit,
-        metadata_filter=input.metadata_filter,
-        score_threshold=input.score_threshold,
-    )
-
-    activity.heartbeat({
-        "collection": input.collection_name,
-        "action": "search",
-        "results_count": len(results),
-    })
-
-    # Convert SearchResult objects to dicts for serialization
-    return KnowledgeSearchOutput(
-        results=[_search_result_to_dict(r) for r in results]
-    )
-
-
-@activity.defn(name="crewai_knowledge_save")
-async def knowledge_save_activity(input: KnowledgeSaveInput) -> None:
-    """Save documents to knowledge base."""
-    config = activity.info().activity_config
-    storage = config.knowledge_storage_factory(
-        collection_name=input.collection_name,
-        embedder_config=input.embedder_config,
-    )
-
-    await storage.asave(documents=input.documents)
-
-    activity.heartbeat({
-        "collection": input.collection_name,
-        "action": "save",
-        "doc_count": len(input.documents),
-    })
+    @activity.defn(name="crewai_knowledge_reset")
+    async def knowledge_reset(self, input: KnowledgeResetInput) -> None:
+        """Reset knowledge base."""
+        storage = self._config.knowledge_storage_factory(
+            collection_name=input.collection_name,
+            embedder_config=input.embedder_config,
+        )
+        await storage.areset()
 ```
 
 ---
@@ -1233,17 +1291,30 @@ from typing import Any
 
 @dataclass
 class LLMCallInput:
-    """Input for LLM call activity."""
+    """Input for LLM call activity.
+
+    Note: We intentionally do NOT pass available_functions. This causes the LLM
+    to return tool_calls directly (if any) rather than executing them internally.
+    Tool execution happens in the workflow via activity_as_tool wrappers.
+    """
     model: str
-    messages: list[dict[str, str]]
+    messages: list[dict[str, Any]]  # LLMMessage format: {role, content}
     tools: list[dict] | None = None
     llm_kwargs: dict[str, Any] = field(default_factory=dict)
+    # Context for tracing (optional)
+    from_task_id: str | None = None
+    from_agent_role: str | None = None
 
 
 @dataclass
 class LLMCallOutput:
-    """Output from LLM call activity."""
-    content: str
+    """Output from LLM call activity.
+
+    Either content OR tool_calls will be set, typically not both:
+    - content: Text response from the LLM
+    - tool_calls: List of tool calls the LLM wants to execute
+    """
+    content: str | None = None
     tool_calls: list[dict] | None = None
     usage: dict[str, int] | None = None
 
@@ -1259,10 +1330,14 @@ class MemorySaveInput:
 
 @dataclass
 class MemorySearchInput:
-    """Input for memory search activity."""
-    storage_type: str
+    """Input for memory search activity (RAGStorage).
+
+    Note: RAGStorage uses 'filter' parameter, not 'metadata_filter'.
+    """
+    storage_type: str  # "short_term" or "entity"
     query: str
     limit: int = 5
+    filter: dict[str, Any] | None = None  # RAGStorage uses 'filter', not 'metadata_filter'
     score_threshold: float = 0.6
     embedder_config: dict = field(default_factory=dict)
 
@@ -1350,12 +1425,14 @@ from crewai.memory.storage.rag_storage import RAGStorage
 from crewai.memory.storage.ltm_sqlite_storage import LTMSQLiteStorage
 from crewai.knowledge.storage.knowledge_storage import KnowledgeStorage
 
+from temporalio.contrib.crewai._activities import CrewAIActivities
+
 
 @dataclass
 class CrewAIActivityConfig:
     """Configuration for CrewAI activities.
 
-    This configuration is passed to the worker and provides factories
+    This configuration is passed to CrewAIActivities and provides factories
     for creating the actual LLM and storage instances used in activities.
     """
 
@@ -1407,6 +1484,9 @@ class CrewAIActivityConfig:
 def crewai_activities(config: CrewAIActivityConfig | None = None) -> list[Callable]:
     """Get all CrewAI activities configured with the given config.
 
+    This function creates a CrewAIActivities instance with the given config
+    and returns all activity methods for registration with a Worker.
+
     Args:
         config: Activity configuration with LLM and storage factories
 
@@ -1424,110 +1504,8 @@ def crewai_activities(config: CrewAIActivityConfig | None = None) -> list[Callab
         )
     """
     config = config or CrewAIActivityConfig()
+    instance = CrewAIActivities(config)
 
-    # Create activity instances bound to config
-    # This uses a class-based approach to inject config
-
-    class ConfiguredActivities:
-        def __init__(self, cfg: CrewAIActivityConfig):
-            self.config = cfg
-
-        @activity.defn(name="crewai_llm_call")
-        async def llm_call(self, input: LLMCallInput) -> LLMCallOutput:
-            llm = self.config.llm_factory(input.model)
-            result = await llm.acall(
-                messages=input.messages,
-                tools=input.tools,
-                **(input.llm_kwargs or {}),
-            )
-            activity.heartbeat({"model": input.model, "status": "completed"})
-            return LLMCallOutput(
-                content=result if isinstance(result, str) else str(result),
-            )
-
-        @activity.defn(name="crewai_memory_save")
-        async def memory_save(self, input: MemorySaveInput) -> None:
-            storage = self.config.get_storage(
-                input.storage_type,
-                input.embedder_config,
-            )
-            await storage.asave(value=input.value, metadata=input.metadata)
-
-        @activity.defn(name="crewai_memory_search")
-        async def memory_search(self, input: MemorySearchInput) -> MemorySearchOutput:
-            storage = self.config.get_storage(
-                input.storage_type,
-                input.embedder_config,
-            )
-            results = await storage.asearch(
-                query=input.query,
-                limit=input.limit,
-                score_threshold=input.score_threshold,
-            )
-            return MemorySearchOutput(results=list(results))
-
-        @activity.defn(name="crewai_memory_reset")
-        async def memory_reset(self, input: MemoryResetInput) -> None:
-            storage = self.config.get_storage(
-                input.storage_type,
-                input.embedder_config,
-            )
-            await storage.areset()
-
-        @activity.defn(name="crewai_ltm_save")
-        async def ltm_save(self, input: LTMSaveInput) -> None:
-            storage = self.config.ltm_storage_factory(db_path=input.db_path)
-            await storage.asave(
-                task_description=input.task_description,
-                score=input.score,
-                metadata=input.metadata,
-                datetime=input.datetime,
-            )
-
-        @activity.defn(name="crewai_ltm_load")
-        async def ltm_load(self, input: LTMLoadInput) -> LTMLoadOutput:
-            storage = self.config.ltm_storage_factory(db_path=input.db_path)
-            results = await storage.aload(
-                task_description=input.task_description,
-                latest_n=input.latest_n,
-            )
-            return LTMLoadOutput(results=results or [])
-
-        @activity.defn(name="crewai_knowledge_search")
-        async def knowledge_search(
-            self, input: KnowledgeSearchInput
-        ) -> KnowledgeSearchOutput:
-            storage = self.config.knowledge_storage_factory(
-                collection_name=input.collection_name,
-                embedder=input.embedder_config,
-            )
-            results = await storage.asearch(
-                query=input.query,
-                limit=input.limit,
-                metadata_filter=input.metadata_filter,
-                score_threshold=input.score_threshold,
-            )
-            return KnowledgeSearchOutput(
-                results=[_to_dict(r) for r in results]
-            )
-
-        @activity.defn(name="crewai_knowledge_save")
-        async def knowledge_save(self, input: KnowledgeSaveInput) -> None:
-            storage = self.config.knowledge_storage_factory(
-                collection_name=input.collection_name,
-                embedder=input.embedder_config,
-            )
-            await storage.asave(documents=input.documents)
-
-        @activity.defn(name="crewai_knowledge_reset")
-        async def knowledge_reset(self, input: KnowledgeResetInput) -> None:
-            storage = self.config.knowledge_storage_factory(
-                collection_name=input.collection_name,
-                embedder=input.embedder_config,
-            )
-            await storage.areset()
-
-    instance = ConfiguredActivities(config)
     return [
         instance.llm_call,
         instance.memory_save,
@@ -1539,15 +1517,35 @@ def crewai_activities(config: CrewAIActivityConfig | None = None) -> list[Callab
         instance.knowledge_save,
         instance.knowledge_reset,
     ]
+```
+
+### Utility Functions
+
+```python
+# File: temporalio/contrib/crewai/_utils.py
+
+from typing import Any
 
 
 def _to_dict(obj: Any) -> dict:
     """Convert object to dict for serialization."""
+    if hasattr(obj, "model_dump"):  # Pydantic v2
+        return obj.model_dump()
+    if hasattr(obj, "dict"):  # Pydantic v1
+        return obj.dict()
     if hasattr(obj, "__dict__"):
         return obj.__dict__
-    if hasattr(obj, "dict"):
-        return obj.dict()
     return dict(obj)
+
+
+def _serialize_tools(tools: list[dict] | None) -> list[dict] | None:
+    """Serialize tool definitions for activity input.
+
+    Ensures tool definitions are JSON-serializable.
+    """
+    if tools is None:
+        return None
+    return [_to_dict(t) if not isinstance(t, dict) else t for t in tools]
 ```
 
 ---
@@ -1582,7 +1580,7 @@ Example:
             )
             crew = Crew(agents=[agent], tasks=[...])
             runner = TemporalCrewRunner(crew)
-            return (await runner.kickoff()).raw
+            return (await runner.akickoff()).raw
 """
 
 from temporalio.contrib.crewai._llm import (
@@ -1591,6 +1589,7 @@ from temporalio.contrib.crewai._llm import (
 )
 from temporalio.contrib.crewai._tools import (
     activity_as_tool,
+    _is_temporal_tool,  # For internal validation; not typically used by users
 )
 from temporalio.contrib.crewai._memory import (
     short_term_memory_stub,
@@ -1631,6 +1630,7 @@ __all__ = [
     "LLMActivityConfig",
     # Tools
     "activity_as_tool",
+    "_is_temporal_tool",
     # Memory
     "short_term_memory_stub",
     "long_term_memory_stub",
@@ -1669,19 +1669,43 @@ __all__ = [
 temporalio/contrib/crewai/
 ├── __init__.py           # Public API exports
 ├── _llm.py               # llm_stub implementation
-├── _tools.py             # activity_as_tool converter
-├── _memory.py            # Memory stub implementations
+├── _tools.py             # activity_as_tool converter, _is_temporal_tool
+├── _memory.py            # Memory stub implementations (short-term, long-term, entity)
 ├── _knowledge.py         # Knowledge storage stub
-├── _runner.py            # TemporalCrewRunner
-├── _worker.py            # Activity configuration and factory
+├── _runner.py            # TemporalCrewRunner with validation
+├── _activities.py        # CrewAIActivities class with all activity methods
+├── _worker.py            # CrewAIActivityConfig and crewai_activities factory
 ├── _models.py            # Data models for activity IO
-├── _utils.py             # Internal utilities
-└── DESIGN.md             # This document
+├── _utils.py             # Internal utilities (_to_dict, _serialize_tools)
+├── DESIGN.md             # This document
+└── DETERMINISM_ISSUES.md # Determinism analysis
 ```
 
 ---
 
 ## Considerations and Limitations
+
+### Async Execution Model
+
+CrewAI has three execution methods with different concurrency models:
+
+| Method | Implementation | Thread Blocking |
+|--------|----------------|-----------------|
+| `kickoff()` | Synchronous | Blocks workflow thread |
+| `kickoff_async()` | `asyncio.to_thread(kickoff)` | Blocks pool thread |
+| `akickoff()` | Native async via `llm.acall()` | Non-blocking |
+
+**For Temporal workflows, we MUST use `akickoff()`** (native async) because:
+
+1. **`kickoff()`**: Synchronous - would block the workflow thread entirely
+2. **`kickoff_async()`**: Uses `asyncio.to_thread()` which spawns threads that:
+   - Run sync code (`llm.call()`) bypassing our async `llm_stub.acall()`
+   - Would not properly schedule activities
+3. **`akickoff()`**: Uses native async throughout:
+   - `agent.aexecute_task()` → `agent_executor.ainvoke()` → `llm.acall()`
+   - Our `llm_stub.acall()` properly awaits activity calls
+
+The `TemporalCrewRunner.akickoff()` method uses `crew.akickoff()` internally.
 
 ### Streaming
 
@@ -1718,30 +1742,33 @@ CrewAI has internal retry logic for LLM calls. With Temporal:
 
 ### Determinism
 
-Workflow code must be deterministic. The integration ensures:
-- All IO happens in activities (non-deterministic OK there)
-- Orchestration logic runs in workflow (must be deterministic)
-- Random/time operations in workflows should use `workflow.random()` and `workflow.now()`
+**The key principle: All I/O must happen in activities.**
 
-See [DETERMINISM_ISSUES.md](./DETERMINISM_ISSUES.md) for a comprehensive analysis of CrewAI operations that could break workflow determinism.
+Non-deterministic data (timestamps, UUIDs) in activity inputs is fine because activity inputs are recorded in workflow history and replayed identically. Things like logging timestamps and diagnostic output don't affect workflow determinism.
 
-#### Asyncio Operations
+See [DETERMINISM_ISSUES.md](./DETERMINISM_ISSUES.md) for detailed analysis.
 
-Per Temporal Python SDK sandbox restrictions:
+#### Actually Dangerous Issues
 
-| Operation | Status | Notes |
-|-----------|--------|-------|
-| `asyncio.create_task()` | ✅ Safe | Deterministic in Temporal's event loop |
-| `asyncio.gather()` | ✅ Safe | Results returned in input order |
-| `asyncio.sleep()` | ✅ Safe | Mapped to deterministic workflow timers |
-| `asyncio.as_completed()` | ⚠️ Non-deterministic | Use `workflow.as_completed()` |
-| `asyncio.wait()` | ⚠️ Non-deterministic | Use `workflow.wait()` |
+| Issue | Why | Mitigation |
+|-------|-----|------------|
+| `human_input=True` | `input()` blocks workflow thread forever | Set `human_input=False` on all tasks |
+| `planning=True` | Creates untracked LLM call outside activities | Set `planning=False` or use `planning_llm=llm_stub()` |
+| `max_rpm` set | `time.sleep(60)` blocks workflow thread | Don't set `max_rpm` on agents/crew |
+| Hooks with `input()` | `input()` blocks workflow thread forever | Don't use hooks that call `request_human_input()` |
 
-**Good news**: CrewAI primarily uses `asyncio.gather()` and `asyncio.create_task()` for concurrency, which are safe.
+#### Safe to Use
 
-#### Required Crew Configuration
+These are often incorrectly flagged as determinism issues but are actually safe:
 
-For workflow-safe execution, crews must be configured with:
+- **`inject_date=True`**: Date goes into activity input, recorded in history
+- **`verbose=True`**: Console output doesn't affect execution
+- **`datetime.now()` in logs**: Diagnostics don't affect execution path
+- **`uuid.uuid4()` for IDs**: Either in activity input or diagnostic only
+- **`asyncio.gather()`/`create_task()`**: Deterministic in Temporal's event loop
+- **`asyncio.sleep()`**: Mapped to deterministic workflow timers
+
+#### Required Configuration
 
 ```python
 crew = Crew(
@@ -1749,50 +1776,38 @@ crew = Crew(
     tasks=[
         Task(
             ...,
-            human_input=False,  # REQUIRED: input() blocks indefinitely
+            human_input=False,  # REQUIRED: input() blocks forever
         )
     ],
-    verbose=False,         # Recommended: minimize console I/O side effects
-    planning=False,        # REQUIRED unless planning is wrapped in activity
+    planning=False,  # REQUIRED unless planning_llm=llm_stub()
+    # max_rpm NOT set - avoid time.sleep() blocking
 )
 
-# For agents:
 agent = Agent(
     ...,
     llm=llm_stub("gpt-4o"),  # REQUIRED: LLM calls via activities
-    inject_date=False,        # REQUIRED: datetime.now() is non-deterministic
+    # max_rpm NOT set
 )
 ```
-
-#### CrewAI Operations Requiring Attention
-
-| Category | Issue | Mitigation |
-|----------|-------|------------|
-| **Time** | `datetime.now()` in date injection | Set `inject_date=False` on agents |
-| **Time** | `time.time()` in memory/metrics | Handled by memory stubs (activities) |
-| **UUID** | `uuid.uuid4()` for task/crew IDs | Pre-generated before workflow or handled by framework |
-| **I/O** | LLM API calls | Use `llm_stub()` (activities) |
-| **I/O** | Tool execution | Use `activity_as_tool()` |
-| **I/O** | Memory storage | Use memory stubs (activities) |
-| **I/O** | File operations | Task `output_file` should be avoided or use activity |
-| **Human Input** | `input()` calls | Set `human_input=False` or implement via signals |
-| **Planning** | CrewPlanner LLM calls | Set `planning=False` or wrap in activity |
-| **Threading** | RPM controller timers | Disable or handle via activity-level rate limiting |
-| **Callbacks** | User-provided callbacks | Ensure callbacks are deterministic (no I/O) |
 
 #### Validation Checklist
 
 Before running a CrewAI crew in a Temporal workflow:
 
-- [ ] All agents use `llm_stub()` instead of direct LLM
+- [ ] All agents use `llm_stub()` for their LLM
 - [ ] All tools are created with `activity_as_tool()`
-- [ ] Memory stubs are used if `memory=True`
+- [ ] If `memory=True`:
+  - [ ] `short_term_memory_stub()` used for short-term memory
+  - [ ] `long_term_memory_stub()` used for long-term memory
+  - [ ] `entity_memory_stub()` used for entity memory
+- [ ] If agents have knowledge sources:
+  - [ ] `knowledge_storage_stub()` used for knowledge storage
 - [ ] `human_input=False` on all tasks
-- [ ] `inject_date=False` on all agents
-- [ ] `planning=False` on crew (or planning wrapped in activity)
-- [ ] `verbose=False` recommended
-- [ ] No custom callbacks that perform I/O
-- [ ] Task `output_file` is not set (or file write handled via activity)
+- [ ] `planning=False` on crew (or `planning_llm=llm_stub()`)
+- [ ] `max_rpm` is NOT set on agents or crew
+- [ ] No hooks that call `input()` or `request_human_input()`
+
+The `TemporalCrewRunner` validates all of these at construction time and provides actionable error messages.
 
 ---
 
@@ -1807,10 +1822,26 @@ Before running a CrewAI crew in a Temporal workflow:
 
 ---
 
+## Implementation Notes
+
+**Phase 0 Complete**: Interface verification has been completed. See [PHASE0_INTERFACE_VERIFICATION.md](./PHASE0_INTERFACE_VERIFICATION.md) for detailed findings.
+
+Key discoveries from Phase 0:
+1. **Tool call handling**: LLM returns `tool_calls` directly when `available_functions` is None - we use this to route tool execution through workflow activities
+2. **RAGStorage**: Uses `filter` parameter (not `metadata_filter`), and has no `areset()` method (only sync `reset()`)
+3. **LTMSQLiteStorage**: Uses `load()` not `search()`, with different parameters
+4. **BaseKnowledgeStorage**: `query` is `list[str]`, not `str`
+
+The code in this document has been updated to reflect verified interfaces.
+
+---
+
 ## References
 
 - [CrewAI Documentation](https://docs.crewai.com/)
 - [CrewAI Source Code](https://github.com/crewAIInc/crewAI)
 - [Temporal Python SDK](https://docs.temporal.io/develop/python)
-- [LangGraph Integration](../langgraph/DESIGN.md)
-- [OpenAI Agents Integration](../openai_agents/)
+- [OpenAI Agents Integration](../openai_agents/) - Reference implementation for activity patterns
+- [Implementation Plan](./IMPLEMENTATION_PLAN.md) - Phased implementation approach
+- [Phase 0 Interface Verification](./PHASE0_INTERFACE_VERIFICATION.md) - Verified CrewAI interfaces
+- [Determinism Issues](./DETERMINISM_ISSUES.md) - Analysis of determinism concerns
