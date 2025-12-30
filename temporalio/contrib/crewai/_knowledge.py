@@ -74,9 +74,10 @@ class _KnowledgeStorageStub:
         metadata_filter: dict[str, Any] | None = None,
         score_threshold: float = 0.6,
     ) -> list[Any]:
-        """Search is not supported - use asearch() instead.
+        """Synchronous search is not supported in Temporal workflows.
 
-        KnowledgeStorage.search() is synchronous but we need async for activities.
+        Use asearch instead. KnowledgeStorage.search is synchronous but we need
+        async for activities.
         """
         raise NotImplementedError(
             "Synchronous search() is not supported in Temporal workflows. "
@@ -115,7 +116,7 @@ class _KnowledgeStorageStub:
         return result.results
 
     def save(self, documents: list[str]) -> None:
-        """Save is not supported - use asave() instead."""
+        """Synchronous save is not supported in Temporal workflows."""
         raise NotImplementedError(
             "Synchronous save() is not supported in Temporal workflows. "
             "Use asave() instead."
@@ -137,7 +138,7 @@ class _KnowledgeStorageStub:
         )
 
     def reset(self) -> None:
-        """Reset is not supported - use areset() instead."""
+        """Synchronous reset is not supported in Temporal workflows."""
         raise NotImplementedError(
             "Synchronous reset() is not supported in Temporal workflows. "
             "Use areset() instead."

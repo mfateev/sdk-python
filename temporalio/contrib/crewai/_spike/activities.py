@@ -39,6 +39,7 @@ class SpikeActivities:
     """
 
     def __init__(self, config: SpikeActivityConfig):
+        """Initialize spike activities with configuration."""
         self._config = config
         # Initialize in-memory storage if not provided
         if self._config.memory_store is None:
@@ -90,9 +91,7 @@ class SpikeActivities:
         allowing full visibility and retry handling.
         """
         if not self._config.tool_registry:
-            return ToolCallOutput(
-                result="", error=f"Tool registry not configured"
-            )
+            return ToolCallOutput(result="", error="Tool registry not configured")
 
         tool_fn = self._config.tool_registry.get(input.tool_name)
         if not tool_fn:
@@ -145,11 +144,13 @@ class SpikeActivities:
 
         # Heartbeat only if in activity context
         try:
-            activity.heartbeat({
-                "storage_type": input.storage_type,
-                "action": "search",
-                "results_count": len(results),
-            })
+            activity.heartbeat(
+                {
+                    "storage_type": input.storage_type,
+                    "action": "search",
+                    "results_count": len(results),
+                }
+            )
         except RuntimeError:
             pass  # Not in activity context
         return MemorySearchOutput(results=results)

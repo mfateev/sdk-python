@@ -13,7 +13,6 @@ import pytest
 
 from temporalio.contrib.crewai import CrewAIActivityConfig, CrewAIPlugin
 
-
 # =============================================================================
 # Unit Tests: Plugin Initialization
 # =============================================================================
@@ -71,6 +70,7 @@ def test_plugin_adds_activities():
     plugin = CrewAIPlugin(config=config)
 
     # Get activities via the hook (it's a callable)
+    assert callable(plugin.activities)
     activities = plugin.activities(None)
 
     # Should have all CrewAI activities (LLM, memory, knowledge)
@@ -103,6 +103,7 @@ def test_plugin_appends_to_existing_activities():
     existing = [existing_activity]
 
     # Get activities via the hook
+    assert callable(plugin.activities)
     activities = plugin.activities(existing)
 
     # Should include existing plus CrewAI activities
@@ -117,6 +118,7 @@ def test_plugin_register_activities_false():
     plugin = CrewAIPlugin(config=config, register_activities=False)
 
     # Get activities via the hook
+    assert callable(plugin.activities)
     activities = plugin.activities(None)
 
     # Should be empty
@@ -133,6 +135,7 @@ def test_plugin_register_activities_false_preserves_existing():
     existing = [existing_activity]
 
     # Get activities via the hook
+    assert callable(plugin.activities)
     activities = plugin.activities(existing)
 
     # Should only have existing
@@ -153,6 +156,7 @@ def test_plugin_data_converter_uses_crewai_converter():
     plugin = CrewAIPlugin(config=config)
 
     # Get converter via the hook with None
+    assert callable(plugin.data_converter)
     converter = plugin.data_converter(None)
 
     # Should return the crewai_data_converter
@@ -168,6 +172,7 @@ def test_plugin_data_converter_preserves_custom():
     custom_converter = MagicMock()
 
     # Get converter via the hook with custom
+    assert callable(plugin.data_converter)
     converter = plugin.data_converter(custom_converter)
 
     # Should return the custom converter
@@ -185,6 +190,7 @@ def test_plugin_workflow_runner_raises_without_runner():
 
     plugin = CrewAIPlugin(config=config)
 
+    assert callable(plugin.workflow_runner)
     with pytest.raises(ValueError) as exc_info:
         plugin.workflow_runner(None)
 
@@ -201,6 +207,7 @@ def test_plugin_workflow_runner_returns_non_sandbox_runner():
     mock_runner.__class__.__name__ = "SomeOtherRunner"
 
     # Simulate not being a SandboxedWorkflowRunner
+    assert callable(plugin.workflow_runner)
     result = plugin.workflow_runner(mock_runner)
 
     # Should return the same runner

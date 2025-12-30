@@ -7,7 +7,6 @@ They are designed to be JSON-serializable via the Pydantic payload converter.
 from dataclasses import dataclass, field
 from typing import Any
 
-
 # =============================================================================
 # LLM Activity Models
 # =============================================================================

@@ -13,24 +13,21 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from temporalio import activity, workflow
-from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Worker
-
 from temporalio.contrib.crewai import (
     CrewAIActivityConfig,
     knowledge_storage_stub,
 )
 from temporalio.contrib.crewai._knowledge import (
-    _KnowledgeStorageStub,
     _is_temporal_knowledge_stub,
+    _KnowledgeStorageStub,
 )
 from temporalio.contrib.crewai._models import (
     KnowledgeResetInput,
     KnowledgeSaveInput,
     KnowledgeSearchInput,
-    KnowledgeSearchOutput,
 )
-
+from temporalio.testing import WorkflowEnvironment
+from temporalio.worker import Worker
 
 # =============================================================================
 # Unit Tests: Knowledge Stub Creation
@@ -248,9 +245,7 @@ async def test_knowledge_search_activity():
     from temporalio.contrib.crewai._activities import CrewAIActivities
 
     mock_storage = AsyncMock()
-    mock_storage.asearch.return_value = [
-        {"content": "result", "score": 0.9}
-    ]
+    mock_storage.asearch.return_value = [{"content": "result", "score": 0.9}]
 
     config = CrewAIActivityConfig(
         llm_factory=lambda m: MagicMock(),

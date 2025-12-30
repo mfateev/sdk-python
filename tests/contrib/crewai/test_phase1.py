@@ -13,9 +13,6 @@ from datetime import timedelta
 import pytest
 
 from temporalio import workflow
-from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Worker
-
 from temporalio.contrib.crewai import (
     CrewAIActivityConfig,
     LLMActivityConfig,
@@ -24,7 +21,8 @@ from temporalio.contrib.crewai import (
 )
 from temporalio.contrib.crewai._activities import CrewAIActivities
 from temporalio.contrib.crewai._models import LLMCallInput, LLMCallOutput
-
+from temporalio.testing import WorkflowEnvironment
+from temporalio.worker import Worker
 
 # =============================================================================
 # Test Fixtures

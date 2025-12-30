@@ -8,15 +8,11 @@ These tests verify the memory storage stub functionality:
 """
 
 from datetime import timedelta
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from temporalio import activity, workflow
-from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Worker
-
 from temporalio.contrib.crewai import (
     CrewAIActivityConfig,
     entity_memory_stub,
@@ -24,21 +20,20 @@ from temporalio.contrib.crewai import (
     short_term_memory_stub,
 )
 from temporalio.contrib.crewai._memory import (
+    _is_temporal_memory_stub,
     _LTMStorageStub,
     _RAGStorageStub,
-    _is_temporal_memory_stub,
 )
 from temporalio.contrib.crewai._models import (
     LTMLoadInput,
-    LTMLoadOutput,
     LTMResetInput,
     LTMSaveInput,
     MemoryResetInput,
     MemorySaveInput,
     MemorySearchInput,
-    MemorySearchOutput,
 )
-
+from temporalio.testing import WorkflowEnvironment
+from temporalio.worker import Worker
 
 # =============================================================================
 # Unit Tests: Memory Stub Creation

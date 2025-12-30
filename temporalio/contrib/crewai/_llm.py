@@ -94,21 +94,25 @@ class _LLMStub:
 
         # Add optional parameters if configured
         if self.activity_config.schedule_to_close_timeout:
-            activity_options[
-                "schedule_to_close_timeout"
-            ] = self.activity_config.schedule_to_close_timeout
+            activity_options["schedule_to_close_timeout"] = (
+                self.activity_config.schedule_to_close_timeout
+            )
 
         if self.activity_config.retry_policy:
             activity_options["retry_policy"] = self.activity_config.retry_policy
 
         if self.activity_config.heartbeat_timeout:
-            activity_options["heartbeat_timeout"] = self.activity_config.heartbeat_timeout
+            activity_options["heartbeat_timeout"] = (
+                self.activity_config.heartbeat_timeout
+            )
 
         if self.activity_config.task_queue:
             activity_options["task_queue"] = self.activity_config.task_queue
 
         if self.activity_config.cancellation_type:
-            activity_options["cancellation_type"] = self.activity_config.cancellation_type
+            activity_options["cancellation_type"] = (
+                self.activity_config.cancellation_type
+            )
 
         # Execute as activity
         result = await workflow.execute_activity(

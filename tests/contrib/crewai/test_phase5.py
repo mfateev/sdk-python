@@ -13,7 +13,6 @@ import pytest
 from temporalio.contrib.crewai import (
     knowledge_storage_stub,
     llm_stub,
-    long_term_memory_stub,
     short_term_memory_stub,
 )
 from temporalio.contrib.crewai._llm import _is_llm_stub
@@ -21,7 +20,6 @@ from temporalio.contrib.crewai._runner import (
     CrewValidationError,
     TemporalCrewRunner,
 )
-
 
 # =============================================================================
 # Unit Tests: _is_llm_stub helper

@@ -8,28 +8,21 @@ Requirements:
 - crewai package installed
 """
 
-import asyncio
-from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from temporalio import workflow
-from temporalio.client import Client
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from .activities import SpikeActivities, SpikeActivityConfig, get_spike_activities
 from .models import (
     LLMCallInput,
-    LLMCallOutput,
     MemorySaveInput,
     MemorySearchInput,
     ToolCallInput,
 )
-
 
 # =============================================================================
 # Test Workflows
@@ -66,11 +59,13 @@ class ToolCallWorkflow:
             LLMCallInput(
                 model="gpt-4",
                 messages=[{"role": "user", "content": prompt}],
-                tools=[{
-                    "name": "calculator",
-                    "description": "Performs calculations",
-                    "parameters": {"expression": {"type": "string"}},
-                }],
+                tools=[
+                    {
+                        "name": "calculator",
+                        "description": "Performs calculations",
+                        "parameters": {"expression": {"type": "string"}},
+                    }
+                ],
             ),
             start_to_close_timeout=timedelta(seconds=30),
         )

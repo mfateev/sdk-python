@@ -109,9 +109,9 @@ def activity_as_tool(
             "start_to_close_timeout": config.start_to_close_timeout,
         }
         if config.schedule_to_close_timeout:
-            activity_options[
-                "schedule_to_close_timeout"
-            ] = config.schedule_to_close_timeout
+            activity_options["schedule_to_close_timeout"] = (
+                config.schedule_to_close_timeout
+            )
         if config.retry_policy:
             activity_options["retry_policy"] = config.retry_policy
         if config.heartbeat_timeout:

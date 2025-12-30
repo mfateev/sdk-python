@@ -7,7 +7,6 @@ CrewAI activity inputs and outputs, including dataclasses and complex types.
 from temporalio.contrib.pydantic import (
     PydanticPayloadConverter,
     ToJsonOptions,
-    pydantic_data_converter,
 )
 from temporalio.converter import DataConverter, DefaultPayloadConverter
 

@@ -91,7 +91,9 @@ class TemporalCrewRunner:
         errors.extend(crew_errors)
 
         if errors:
-            error_msg = "Crew validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
+            error_msg = "Crew validation failed:\n" + "\n".join(
+                f"  - {e}" for e in errors
+            )
             raise CrewValidationError(error_msg)
 
     def _validate_agent(self, agent: Any, index: int) -> list[str]:

@@ -75,10 +75,10 @@ class _RAGStorageStub:
         return options
 
     def save(self, value: Any, metadata: dict[str, Any]) -> None:
-        """Save is not supported - use asave() instead.
+        """Synchronous save is not supported in Temporal workflows.
 
-        RAGStorage.save() is synchronous but we need async for activities.
-        CrewAI should use asave() when memory=True.
+        RAGStorage.save is synchronous but we need async for activities.
+        CrewAI should use asave when memory=True.
         """
         raise NotImplementedError(
             "Synchronous save() is not supported in Temporal workflows. "
@@ -109,7 +109,7 @@ class _RAGStorageStub:
         filter: dict[str, Any] | None = None,
         score_threshold: float = 0.6,
     ) -> list[Any]:
-        """Search is not supported - use asearch() instead."""
+        """Synchronous search is not supported in Temporal workflows."""
         raise NotImplementedError(
             "Synchronous search() is not supported in Temporal workflows. "
             "Use asearch() instead. Ensure your crew uses async methods."
@@ -147,7 +147,7 @@ class _RAGStorageStub:
         return result.results
 
     def reset(self) -> None:
-        """Reset is not supported - use areset() instead."""
+        """Synchronous reset is not supported in Temporal workflows."""
         raise NotImplementedError(
             "Synchronous reset() is not supported in Temporal workflows. "
             "Use areset() instead."
@@ -217,7 +217,7 @@ class _LTMStorageStub:
         datetime: str,
         score: int | float,
     ) -> None:
-        """Save is not supported - use asave() instead."""
+        """Synchronous save is not supported in Temporal workflows."""
         raise NotImplementedError(
             "Synchronous save() is not supported in Temporal workflows. "
             "Use asave() instead."
@@ -250,10 +250,8 @@ class _LTMStorageStub:
             **self._get_activity_options(),
         )
 
-    def load(
-        self, task_description: str, latest_n: int
-    ) -> list[dict[str, Any]] | None:
-        """Load is not supported - use aload() instead."""
+    def load(self, task_description: str, latest_n: int) -> list[dict[str, Any]] | None:
+        """Synchronous load is not supported in Temporal workflows."""
         raise NotImplementedError(
             "Synchronous load() is not supported in Temporal workflows. "
             "Use aload() instead."
@@ -283,7 +281,7 @@ class _LTMStorageStub:
         return result.results if result.results else None
 
     def reset(self) -> None:
-        """Reset is not supported - use areset() instead."""
+        """Synchronous reset is not supported in Temporal workflows."""
         raise NotImplementedError(
             "Synchronous reset() is not supported in Temporal workflows. "
             "Use areset() instead."

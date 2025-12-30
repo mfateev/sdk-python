@@ -4,8 +4,7 @@ import inspect
 from collections.abc import Callable
 from typing import Any, get_type_hints
 
-from pydantic import Field, create_model
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, create_model
 
 
 def _serialize_tools(tools: list[Any] | None) -> list[dict] | None:

@@ -9,7 +9,7 @@ from temporalio.common import RetryPolicy
 from temporalio.workflow import ActivityCancellationType
 
 if TYPE_CHECKING:
-    from ._activities import CrewAIActivities
+    pass
 
 
 @dataclass
@@ -20,7 +20,9 @@ class LLMActivityConfig:
     including timeouts, retries, and task queue routing.
     """
 
-    start_to_close_timeout: timedelta = field(default_factory=lambda: timedelta(seconds=60))
+    start_to_close_timeout: timedelta = field(
+        default_factory=lambda: timedelta(seconds=60)
+    )
     """Maximum time for the LLM call to complete.
 
     Should be set based on expected LLM response time. Consider that
