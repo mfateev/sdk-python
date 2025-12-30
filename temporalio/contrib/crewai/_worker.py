@@ -64,6 +64,42 @@ class LLMActivityConfig:
 
 
 @dataclass
+class ToolActivityConfig:
+    """Configuration for tool activity execution.
+
+    This controls how tool calls are executed as Temporal activities,
+    including timeouts, retries, and task queue routing.
+
+    Example:
+        tool = activity_as_tool(
+            my_activity,
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+    """
+
+    start_to_close_timeout: timedelta = field(
+        default_factory=lambda: timedelta(seconds=60)
+    )
+    """Maximum time for the tool to complete."""
+
+    schedule_to_close_timeout: timedelta | None = None
+    """Maximum time from scheduling to completion."""
+
+    retry_policy: RetryPolicy | None = None
+    """Retry policy for failed tool calls."""
+
+    heartbeat_timeout: timedelta | None = None
+    """Heartbeat timeout for long-running tools."""
+
+    task_queue: str | None = None
+    """Task queue for tool activities. If None, uses workflow's queue."""
+
+    cancellation_type: ActivityCancellationType = ActivityCancellationType.TRY_CANCEL
+    """How activity handles workflow cancellation."""
+
+
+@dataclass
 class CrewAIActivityConfig:
     """Configuration for all CrewAI activities.
 

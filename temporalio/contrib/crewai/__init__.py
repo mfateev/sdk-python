@@ -47,9 +47,11 @@ from ._converter import (
     make_crewai_data_converter,
 )
 from ._llm import _LLMStub, llm_stub
+from ._tools import activity_as_tool
 from ._worker import (
     CrewAIActivityConfig,
     LLMActivityConfig,
+    ToolActivityConfig,
     crewai_activities,
 )
 
@@ -57,9 +59,12 @@ __all__ = [
     # LLM stub for workflow-side calls
     "llm_stub",
     "_LLMStub",
+    # Tool wrapper for activities
+    "activity_as_tool",
     # Configuration
     "CrewAIActivityConfig",
     "LLMActivityConfig",
+    "ToolActivityConfig",
     # Worker setup
     "crewai_activities",
     # Data conversion

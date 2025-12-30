@@ -1,6 +1,11 @@
 """Shared utilities for CrewAI Temporal integration."""
 
-from typing import Any
+import inspect
+from collections.abc import Callable
+from typing import Any, get_type_hints
+
+from pydantic import Field, create_model
+from pydantic import BaseModel
 
 
 def _serialize_tools(tools: list[Any] | None) -> list[dict] | None:
@@ -90,3 +95,62 @@ def _safe_heartbeat(details: dict[str, Any]) -> None:
     except RuntimeError:
         # Not in activity context (e.g., unit tests)
         pass
+
+
+def _build_args_schema(func: Callable) -> type[BaseModel]:
+    """Build a Pydantic args schema from a function signature.
+
+    This is used to generate the args_schema for CrewStructuredTool
+    from an activity function's signature.
+
+    Args:
+        func: The function to build schema from
+
+    Returns:
+        A Pydantic model class for the function's arguments
+
+    Example:
+        @activity.defn
+        async def search(query: str, limit: int = 10) -> str:
+            ...
+
+        schema = _build_args_schema(search)
+        # schema has fields: query (required str), limit (optional int, default 10)
+    """
+    sig = inspect.signature(func)
+
+    # Try to get type hints, fall back to empty dict if it fails
+    try:
+        type_hints = get_type_hints(func)
+    except Exception:
+        type_hints = {}
+
+    fields: dict[str, Any] = {}
+    for param_name, param in sig.parameters.items():
+        # Skip self/cls for methods
+        if param_name in ("self", "cls"):
+            continue
+        # Skip *args, **kwargs
+        if param.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+
+        # Get type annotation
+        annotation = type_hints.get(param_name, Any)
+
+        # Get default value
+        if param.default is param.empty:
+            default = ...  # Required field
+        else:
+            default = param.default
+
+        fields[param_name] = (annotation, Field(default=default))
+
+    # Generate schema name from function name
+    func_name = getattr(func, "__name__", "Activity")
+    # Convert snake_case to TitleCase and add Schema suffix
+    schema_name = "".join(word.title() for word in func_name.split("_")) + "Schema"
+
+    return create_model(schema_name, **fields)
