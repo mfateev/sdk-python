@@ -132,6 +132,18 @@ class _LLMStub:
         return content or ""
 
 
+def _is_llm_stub(obj: Any) -> bool:
+    """Check if an object is a Temporal LLM stub.
+
+    Args:
+        obj: Object to check
+
+    Returns:
+        True if the object is an _LLMStub instance
+    """
+    return isinstance(obj, _LLMStub)
+
+
 def llm_stub(
     model: str,
     activity_config: LLMActivityConfig | None = None,

@@ -2,16 +2,30 @@
 
 This module contains the activity class that implements all CrewAI activities.
 Activities are executed by Temporal workers and provide durability for
-non-deterministic operations like LLM calls.
+non-deterministic operations like LLM calls, memory, and knowledge operations.
 """
+
+from typing import TYPE_CHECKING
 
 from temporalio import activity
 
-from ._models import LLMCallInput, LLMCallOutput
+from ._models import (
+    KnowledgeResetInput,
+    KnowledgeSaveInput,
+    KnowledgeSearchInput,
+    KnowledgeSearchOutput,
+    LLMCallInput,
+    LLMCallOutput,
+    LTMLoadInput,
+    LTMLoadOutput,
+    LTMResetInput,
+    LTMSaveInput,
+    MemoryResetInput,
+    MemorySaveInput,
+    MemorySearchInput,
+    MemorySearchOutput,
+)
 from ._utils import _safe_heartbeat
-
-# Use TYPE_CHECKING to avoid circular imports
-from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ._worker import CrewAIActivityConfig
@@ -86,12 +100,152 @@ class CrewAIActivities:
                 tool_calls=getattr(result, "tool_calls", None),
             )
 
-    # Future phases will add:
-    # @activity.defn(name="crewai_tool_call")
-    # async def tool_call(self, input: ToolCallInput) -> ToolCallOutput: ...
-    #
-    # @activity.defn(name="crewai_memory_save")
-    # async def memory_save(self, input: MemorySaveInput) -> None: ...
-    #
-    # @activity.defn(name="crewai_memory_search")
-    # async def memory_search(self, input: MemorySearchInput) -> MemorySearchOutput: ...
+    # =========================================================================
+    # Memory Activities (Phase 3)
+    # =========================================================================
+
+    @activity.defn(name="crewai_memory_save")
+    async def memory_save(self, input: MemorySaveInput) -> None:
+        """Save a value to RAG memory storage.
+
+        Args:
+            input: Contains storage_type, value, and metadata
+        """
+        storage = self._config.get_rag_storage(input.storage_type)
+        await storage.asave(input.value, input.metadata)
+        _safe_heartbeat({"storage_type": input.storage_type, "operation": "save"})
+
+    @activity.defn(name="crewai_memory_search")
+    async def memory_search(self, input: MemorySearchInput) -> MemorySearchOutput:
+        """Search RAG memory storage.
+
+        Args:
+            input: Contains storage_type, query, limit, filter, score_threshold
+
+        Returns:
+            MemorySearchOutput with list of results
+        """
+        storage = self._config.get_rag_storage(input.storage_type)
+        results = await storage.asearch(
+            query=input.query,
+            limit=input.limit,
+            filter=input.filter,
+            score_threshold=input.score_threshold,
+        )
+        _safe_heartbeat({"storage_type": input.storage_type, "operation": "search"})
+        return MemorySearchOutput(results=results)
+
+    @activity.defn(name="crewai_memory_reset")
+    async def memory_reset(self, input: MemoryResetInput) -> None:
+        """Reset RAG memory storage.
+
+        Args:
+            input: Contains storage_type to reset
+        """
+        storage = self._config.get_rag_storage(input.storage_type)
+        # RAGStorage.reset() is synchronous in CrewAI
+        storage.reset()
+        _safe_heartbeat({"storage_type": input.storage_type, "operation": "reset"})
+
+    # =========================================================================
+    # Long-term Memory Activities (Phase 3)
+    # =========================================================================
+
+    @activity.defn(name="crewai_ltm_save")
+    async def ltm_save(self, input: LTMSaveInput) -> None:
+        """Save data to long-term memory storage.
+
+        Args:
+            input: Contains task_description, metadata, datetime, score, db_path
+        """
+        storage = self._config.get_ltm_storage(input.db_path)
+        await storage.asave(
+            task_description=input.task_description,
+            metadata=input.metadata,
+            datetime=input.datetime,
+            score=input.score,
+        )
+        _safe_heartbeat({"operation": "ltm_save"})
+
+    @activity.defn(name="crewai_ltm_load")
+    async def ltm_load(self, input: LTMLoadInput) -> LTMLoadOutput:
+        """Load data from long-term memory storage.
+
+        Args:
+            input: Contains task_description, latest_n, db_path
+
+        Returns:
+            LTMLoadOutput with list of results
+        """
+        storage = self._config.get_ltm_storage(input.db_path)
+        results = await storage.aload(
+            task_description=input.task_description,
+            latest_n=input.latest_n,
+        )
+        _safe_heartbeat({"operation": "ltm_load"})
+        return LTMLoadOutput(results=results or [])
+
+    @activity.defn(name="crewai_ltm_reset")
+    async def ltm_reset(self, input: LTMResetInput) -> None:
+        """Reset long-term memory storage.
+
+        Args:
+            input: Contains db_path
+        """
+        storage = self._config.get_ltm_storage(input.db_path)
+        await storage.areset()
+        _safe_heartbeat({"operation": "ltm_reset"})
+
+    # =========================================================================
+    # Knowledge Activities (Phase 4)
+    # =========================================================================
+
+    @activity.defn(name="crewai_knowledge_search")
+    async def knowledge_search(
+        self, input: KnowledgeSearchInput
+    ) -> KnowledgeSearchOutput:
+        """Search the knowledge base.
+
+        Args:
+            input: Contains query, limit, metadata_filter, score_threshold, collection_name
+
+        Returns:
+            KnowledgeSearchOutput with list of results
+        """
+        storage = self._config.get_knowledge_storage(input.collection_name)
+        results = await storage.asearch(
+            query=input.query,
+            limit=input.limit,
+            metadata_filter=input.metadata_filter,
+            score_threshold=input.score_threshold,
+        )
+        _safe_heartbeat({"operation": "knowledge_search"})
+        # Convert SearchResult objects to dicts for serialization
+        return KnowledgeSearchOutput(
+            results=[
+                r if isinstance(r, dict) else {"content": str(r), "score": 0.0}
+                for r in results
+            ]
+        )
+
+    @activity.defn(name="crewai_knowledge_save")
+    async def knowledge_save(self, input: KnowledgeSaveInput) -> None:
+        """Save documents to the knowledge base.
+
+        Args:
+            input: Contains documents and collection_name
+        """
+        storage = self._config.get_knowledge_storage(input.collection_name)
+        await storage.asave(input.documents)
+        _safe_heartbeat({"operation": "knowledge_save"})
+
+    @activity.defn(name="crewai_knowledge_reset")
+    async def knowledge_reset(self, input: KnowledgeResetInput) -> None:
+        """Reset the knowledge base.
+
+        Args:
+            input: Contains collection_name
+        """
+        storage = self._config.get_knowledge_storage(input.collection_name)
+        await storage.areset()
+        _safe_heartbeat({"operation": "knowledge_reset"})

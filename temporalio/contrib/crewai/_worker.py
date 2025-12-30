@@ -109,9 +109,13 @@ class CrewAIActivityConfig:
 
     Example:
         from crewai.llm import LLM
+        from crewai.memory.storage.rag_storage import RAGStorage
+        from crewai.memory.storage.ltm_sqlite_storage import LTMSQLiteStorage
 
         config = CrewAIActivityConfig(
             llm_factory=lambda model: LLM(model=model),
+            rag_storage_factory=lambda storage_type: RAGStorage(type=storage_type),
+            ltm_storage_factory=lambda db_path: LTMSQLiteStorage(db_path=db_path),
             llm_activity_config=LLMActivityConfig(
                 start_to_close_timeout=timedelta(seconds=120),
                 retry_policy=RetryPolicy(maximum_attempts=3),
@@ -139,11 +143,91 @@ class CrewAIActivityConfig:
     llm_activity_config: LLMActivityConfig = field(default_factory=LLMActivityConfig)
     """Activity execution configuration for LLM calls."""
 
-    # Future phases will add:
-    # tool_registry: dict[str, Callable] | None = None  # Phase 2
-    # storage_factory: Callable[[str], Any] | None = None  # Phase 3
-    # ltm_storage_factory: Callable[[str | None], Any] | None = None  # Phase 3
-    # knowledge_storage_factory: Callable[[str | None], Any] | None = None  # Phase 4
+    # Phase 3: Memory storage factories
+    rag_storage_factory: Callable[[str], Any] | None = None
+    """Factory function that creates a RAGStorage instance from a storage type.
+
+    The storage_type will be "short_term" or "entity".
+
+    Example:
+        lambda storage_type: RAGStorage(type=storage_type)
+    """
+
+    ltm_storage_factory: Callable[[str | None], Any] | None = None
+    """Factory function that creates an LTMSQLiteStorage instance.
+
+    The db_path parameter may be None to use the default path.
+
+    Example:
+        lambda db_path: LTMSQLiteStorage(db_path=db_path)
+    """
+
+    # Phase 4: Knowledge storage factory
+    knowledge_storage_factory: Callable[[str | None], Any] | None = None
+    """Factory function that creates a KnowledgeStorage instance.
+
+    The collection_name parameter may be None for the default collection.
+
+    Example:
+        lambda name: KnowledgeStorage(collection_name=name)
+    """
+
+    def get_rag_storage(self, storage_type: str) -> Any:
+        """Get a RAGStorage instance for the given storage type.
+
+        Args:
+            storage_type: Type of memory ("short_term" or "entity")
+
+        Returns:
+            RAGStorage instance
+
+        Raises:
+            ValueError: If rag_storage_factory is not configured
+        """
+        if self.rag_storage_factory is None:
+            raise ValueError(
+                "rag_storage_factory must be configured to use memory activities. "
+                "Example: rag_storage_factory=lambda t: RAGStorage(type=t)"
+            )
+        return self.rag_storage_factory(storage_type)
+
+    def get_ltm_storage(self, db_path: str | None) -> Any:
+        """Get an LTMSQLiteStorage instance.
+
+        Args:
+            db_path: Optional path to the SQLite database
+
+        Returns:
+            LTMSQLiteStorage instance
+
+        Raises:
+            ValueError: If ltm_storage_factory is not configured
+        """
+        if self.ltm_storage_factory is None:
+            raise ValueError(
+                "ltm_storage_factory must be configured to use LTM activities. "
+                "Example: ltm_storage_factory=lambda p: LTMSQLiteStorage(db_path=p)"
+            )
+        return self.ltm_storage_factory(db_path)
+
+    def get_knowledge_storage(self, collection_name: str | None) -> Any:
+        """Get a KnowledgeStorage instance.
+
+        Args:
+            collection_name: Optional name of the knowledge collection
+
+        Returns:
+            KnowledgeStorage instance
+
+        Raises:
+            ValueError: If knowledge_storage_factory is not configured
+        """
+        if self.knowledge_storage_factory is None:
+            raise ValueError(
+                "knowledge_storage_factory must be configured to use knowledge activities. "
+                "Example: knowledge_storage_factory=lambda n: KnowledgeStorage(collection_name=n)"
+            )
+        return self.knowledge_storage_factory(collection_name)
 
 
 def crewai_activities(config: CrewAIActivityConfig) -> list[Callable]:
@@ -177,15 +261,15 @@ def crewai_activities(config: CrewAIActivityConfig) -> list[Callable]:
     instance = CrewAIActivities(config)
     return [
         instance.llm_call,
-        # Future phases will add:
-        # instance.tool_call,  # Phase 2
-        # instance.memory_save,  # Phase 3
-        # instance.memory_search,  # Phase 3
-        # instance.memory_reset,  # Phase 3
-        # instance.ltm_save,  # Phase 3
-        # instance.ltm_load,  # Phase 3
-        # instance.ltm_reset,  # Phase 3
-        # instance.knowledge_search,  # Phase 4
-        # instance.knowledge_save,  # Phase 4
-        # instance.knowledge_reset,  # Phase 4
+        # Phase 3: Memory activities
+        instance.memory_save,
+        instance.memory_search,
+        instance.memory_reset,
+        instance.ltm_save,
+        instance.ltm_load,
+        instance.ltm_reset,
+        # Phase 4: Knowledge activities
+        instance.knowledge_search,
+        instance.knowledge_save,
+        instance.knowledge_reset,
     ]

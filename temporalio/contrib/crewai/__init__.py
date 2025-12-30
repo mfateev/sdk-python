@@ -46,7 +46,20 @@ from ._converter import (
     crewai_data_converter,
     make_crewai_data_converter,
 )
+from ._knowledge import (
+    _KnowledgeStorageStub,
+    knowledge_storage_stub,
+)
 from ._llm import _LLMStub, llm_stub
+from ._memory import (
+    _LTMStorageStub,
+    _RAGStorageStub,
+    entity_memory_stub,
+    long_term_memory_stub,
+    short_term_memory_stub,
+)
+from ._plugin import CrewAIPlugin
+from ._runner import CrewValidationError, TemporalCrewRunner
 from ._tools import activity_as_tool
 from ._worker import (
     CrewAIActivityConfig,
@@ -61,6 +74,20 @@ __all__ = [
     "_LLMStub",
     # Tool wrapper for activities
     "activity_as_tool",
+    # Memory stubs for workflow-side calls
+    "short_term_memory_stub",
+    "entity_memory_stub",
+    "long_term_memory_stub",
+    "_RAGStorageStub",
+    "_LTMStorageStub",
+    # Knowledge stub for workflow-side calls
+    "knowledge_storage_stub",
+    "_KnowledgeStorageStub",
+    # Runner for validated crew execution
+    "TemporalCrewRunner",
+    "CrewValidationError",
+    # Plugin for simplified setup
+    "CrewAIPlugin",
     # Configuration
     "CrewAIActivityConfig",
     "LLMActivityConfig",
