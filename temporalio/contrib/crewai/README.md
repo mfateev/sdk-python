@@ -21,6 +21,7 @@ This document is organized as follows:
 - **[Knowledge Base](#knowledge-base)** - RAG with durable storage
 - **[Validation](#validation)** - Ensuring correct configuration
 - **[Plugin Setup](#plugin-setup)** - Simplified worker configuration
+- **[Important Notes](#important-notes)** - Compatibility and limitations (including [CrewAI Flow](#crewai-flow-not-supported))
 
 ## Architecture
 
@@ -594,3 +595,45 @@ worker = Worker(
     activities=[my_tool_activity],  # Only custom activities
 )
 ```
+
+### CrewAI Flow Not Supported
+
+[CrewAI Flow](https://docs.crewai.com/concepts/flows) is not compatible with Temporal workflows. Flow is CrewAI's event-driven orchestration layer using `@start`, `@listen`, and `@router` decorators.
+
+**Why Flow cannot be used:**
+
+1. **Non-deterministic initialization**: Flow calls `uuid4()` during `__init__()`, which violates Temporal's determinism requirements
+2. **Redundant durability**: Flow's persistence layer (`@persist`, `SQLiteFlowPersistence`) conflicts with Temporal's event sourcing
+3. **Feature overlap**: All Flow features have native Temporal equivalents
+
+**Use Temporal patterns instead:**
+
+| Flow Feature | Temporal Equivalent |
+|--------------|---------------------|
+| `@start` | Workflow entry point (`@workflow.run`) |
+| `@listen(trigger)` | Sequential method calls |
+| `@router` | Workflow conditional logic |
+| `@persist` | Automatic via Temporal's event history |
+| `FlowState` | Workflow instance variables |
+
+**Example - Flow pattern in Temporal:**
+
+```python
+@workflow.defn
+class MultiCrewWorkflow:
+    @workflow.run
+    async def run(self, topic: str) -> str:
+        # Step 1: Research (equivalent to @start)
+        research = await self._run_research_crew(topic)
+
+        # Step 2: Conditional routing (equivalent to @router)
+        if "insufficient" in research.lower():
+            research = await self._run_deep_research_crew(topic)
+
+        # Step 3: Writing (equivalent to @listen("research"))
+        article = await self._run_writing_crew(research)
+
+        return article
+```
+
+For complex multi-crew orchestration, use Temporal's native workflow composition with child workflows and activities.
