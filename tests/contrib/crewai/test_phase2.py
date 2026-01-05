@@ -166,15 +166,30 @@ def test_build_args_schema_generates_schema_name():
 
 
 def test_activity_as_tool_creation():
-    """Test that activity_as_tool creates a valid tool."""
+    """Test that activity_as_tool creates a valid tool.
+
+    Note: BaseTool transforms description to include tool name and args schema.
+    """
     tool = activity_as_tool(
         search_activity, start_to_close_timeout=timedelta(seconds=30)
     )
 
     assert tool.name == "search_activity"
+    # BaseTool wraps description - original docstring is preserved inside
     assert "Search for information" in tool.description
     assert hasattr(tool, "_is_temporal_activity_tool")
     assert tool._is_temporal_activity_tool is True
+
+
+def test_activity_as_tool_inherits_from_basetool():
+    """Test that activity_as_tool returns a BaseTool instance.
+
+    CrewAI 1.7.2+ requires tools to be BaseTool instances.
+    """
+    from crewai.tools.base_tool import BaseTool
+
+    tool = activity_as_tool(search_activity)
+    assert isinstance(tool, BaseTool)
 
 
 def test_activity_as_tool_with_custom_name():
@@ -185,13 +200,17 @@ def test_activity_as_tool_with_custom_name():
 
 
 def test_activity_as_tool_with_custom_description():
-    """Test activity_as_tool with custom description parameter."""
+    """Test activity_as_tool with custom description parameter.
+
+    Note: BaseTool transforms description to include tool name and args schema.
+    """
     tool = activity_as_tool(
         search_activity,
         description="Search the web for relevant information.",
     )
 
-    assert tool.description == "Search the web for relevant information."
+    # BaseTool wraps description with tool name and args schema
+    assert "Search the web for relevant information." in tool.description
 
 
 def test_activity_as_tool_uses_activity_defn_name():

@@ -6,6 +6,8 @@ Use this instead of crewai.LLM when running crews in Temporal workflows.
 
 from typing import Any
 
+from crewai.llms.base_llm import BaseLLM
+
 from temporalio import workflow
 
 from ._models import LLMCallInput
@@ -13,16 +15,20 @@ from ._utils import _serialize_tools
 from ._worker import LLMActivityConfig
 
 
-class _LLMStub:
+class _LLMStub(BaseLLM):
     """Stub that routes LLM calls through Temporal activities.
 
-    This class mimics CrewAI's BaseLLM interface but executes calls
-    as Temporal activities for durability and visibility.
+    This class inherits from CrewAI's BaseLLM to ensure it is preserved
+    by CrewAI's Agent during initialization (not converted to crewai.LLM).
 
     The stub is designed to be used as a drop-in replacement for crewai.LLM
     in workflow code. When the workflow calls acall(), the stub executes
     a Temporal activity that makes the actual LLM call.
     """
+
+    # Store activity config separately (not in BaseLLM)
+    _activity_config: LLMActivityConfig
+    _extra_llm_kwargs: dict[str, Any]
 
     def __init__(
         self,
@@ -37,9 +43,34 @@ class _LLMStub:
             activity_config: Optional activity execution configuration
             **llm_kwargs: Additional kwargs passed to the LLM
         """
-        self.model = model
-        self.activity_config = activity_config or LLMActivityConfig()
-        self._llm_kwargs = llm_kwargs
+        # Initialize BaseLLM with model
+        super().__init__(model=model)
+        # Store our custom attributes
+        object.__setattr__(
+            self, "_activity_config", activity_config or LLMActivityConfig()
+        )
+        object.__setattr__(self, "_extra_llm_kwargs", llm_kwargs)
+
+    @property
+    def activity_config(self) -> LLMActivityConfig:
+        """Get the activity configuration."""
+        return self._activity_config
+
+    def call(
+        self,
+        messages: str | list[dict[str, str]],
+        tools: list[dict] | None = None,
+        callbacks: list[Any] | None = None,
+        available_functions: dict[str, Any] | None = None,
+        from_task: Any | None = None,
+        from_agent: Any | None = None,
+    ) -> str | Any:
+        """Not supported in Temporal workflows - use async method instead."""
+        raise RuntimeError(
+            "Synchronous LLM calls are not supported in Temporal workflows. "
+            "Use acall() instead, which is called automatically by CrewAI's "
+            "async execution methods (akickoff)."
+        )
 
     async def acall(
         self,
@@ -84,7 +115,7 @@ class _LLMStub:
             model=self.model,
             messages=normalized_messages,
             tools=serialized_tools,
-            llm_kwargs={**self._llm_kwargs, **kwargs},
+            llm_kwargs={**self._extra_llm_kwargs, **kwargs},
         )
 
         # Build activity options

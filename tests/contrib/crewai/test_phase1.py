@@ -374,5 +374,47 @@ def test_llm_stub_with_kwargs():
     """Test llm_stub accepts LLM kwargs."""
     stub = llm_stub("gpt-4", temperature=0.7, max_tokens=100)
 
-    assert stub._llm_kwargs["temperature"] == 0.7
-    assert stub._llm_kwargs["max_tokens"] == 100
+    assert stub._extra_llm_kwargs["temperature"] == 0.7
+    assert stub._extra_llm_kwargs["max_tokens"] == 100
+
+
+def test_llm_stub_preserved_by_crewai_agent():
+    """Test that llm_stub is preserved when passed to CrewAI Agent.
+
+    CrewAI's Agent normally converts LLM objects to crewai.llm.LLM during
+    initialization. Our _LLMStub must inherit from BaseLLM to prevent this.
+    """
+    from crewai import Agent
+
+    from temporalio.contrib.crewai._llm import _is_llm_stub, _LLMStub
+
+    stub = llm_stub("gpt-4o-mini")
+
+    # Verify stub is correct type before Agent
+    assert isinstance(stub, _LLMStub)
+    assert _is_llm_stub(stub)
+
+    # Create Agent with stub
+    agent = Agent(
+        role="Test Agent",
+        goal="Test goal",
+        backstory="Test backstory",
+        llm=stub,
+    )
+
+    # Stub must be preserved (not converted to crewai.llm.LLM)
+    assert agent.llm is stub
+    assert isinstance(agent.llm, _LLMStub)
+    assert _is_llm_stub(agent.llm)
+
+
+def test_llm_stub_inherits_from_basellm():
+    """Test that _LLMStub inherits from CrewAI's BaseLLM."""
+    from crewai.llms.base_llm import BaseLLM
+
+    from temporalio.contrib.crewai._llm import _LLMStub
+
+    stub = llm_stub("gpt-4")
+
+    assert isinstance(stub, BaseLLM)
+    assert BaseLLM in _LLMStub.__mro__

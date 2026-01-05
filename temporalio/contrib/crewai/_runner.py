@@ -236,7 +236,12 @@ class TemporalCrewRunner:
         """Run the crew asynchronously.
 
         This is the main entry point for running the crew in a Temporal workflow.
-        It calls crew.akickoff() which properly uses async execution.
+        It calls crew.akickoff() which is the native async implementation.
+
+        Note: We use akickoff() instead of kickoff_async() because:
+        - kickoff_async() wraps sync kickoff() in asyncio.to_thread() which calls
+          run_in_executor(), not supported by Temporal's workflow event loop
+        - akickoff() is fully native async and works with Temporal
 
         Args:
             inputs: Optional inputs to pass to the crew
@@ -250,6 +255,8 @@ class TemporalCrewRunner:
 
     async def kickoff_for_each(self, inputs: list[dict[str, Any]]) -> list[Any]:
         """Run the crew for multiple input sets.
+
+        Uses crew.akickoff_for_each() which is the native async implementation.
 
         Args:
             inputs: List of input dicts to process

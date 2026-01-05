@@ -559,7 +559,15 @@ def test_runner_collects_multiple_validation_errors():
 
 @pytest.mark.asyncio
 async def test_runner_kickoff_calls_akickoff():
-    """Test runner.kickoff() calls crew.akickoff()."""
+    """Test runner.kickoff() calls crew.akickoff() (native async).
+
+    CrewAI has two async methods:
+    - kickoff_async() - wraps sync kickoff() in asyncio.to_thread(), not Temporal-compatible
+    - akickoff() - native async method, works in Temporal workflows
+
+    We must use akickoff() to avoid asyncio.to_thread() which calls run_in_executor(),
+    which is not implemented in Temporal's workflow event loop.
+    """
     mock_crew = MagicMock()
     mock_crew.agents = []
     mock_crew.tasks = []
@@ -578,7 +586,7 @@ async def test_runner_kickoff_calls_akickoff():
 
 @pytest.mark.asyncio
 async def test_runner_kickoff_with_inputs():
-    """Test runner.kickoff() passes inputs to crew."""
+    """Test runner.kickoff() passes inputs to crew.akickoff()."""
     mock_crew = MagicMock()
     mock_crew.agents = []
     mock_crew.tasks = []
@@ -597,7 +605,7 @@ async def test_runner_kickoff_with_inputs():
 
 @pytest.mark.asyncio
 async def test_runner_kickoff_for_each():
-    """Test runner.kickoff_for_each() calls crew.akickoff_for_each()."""
+    """Test runner.kickoff_for_each() calls crew.akickoff_for_each() (native async)."""
     mock_crew = MagicMock()
     mock_crew.agents = []
     mock_crew.tasks = []

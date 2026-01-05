@@ -31,7 +31,7 @@ def activity_as_tool(
 ) -> Any:
     """Wrap a Temporal activity as a CrewAI tool.
 
-    This creates a CrewStructuredTool that executes the activity via
+    This creates a BaseTool that executes the activity via
     workflow.execute_activity() when invoked by an agent. The tool must
     be created and used inside a Temporal workflow.
 
@@ -47,7 +47,7 @@ def activity_as_tool(
         description: Tool description (defaults to activity docstring)
 
     Returns:
-        A CrewStructuredTool that executes the activity
+        A BaseTool that executes the activity
 
     Example:
         @activity.defn
@@ -71,7 +71,7 @@ def activity_as_tool(
                 ...
     """
     # Import CrewAI here to avoid import errors when crewai not installed
-    from crewai.tools.structured_tool import CrewStructuredTool
+    from crewai.tools.base_tool import Tool
 
     # Get activity name from the decorated function
     # The @activity.defn decorator stores the definition in __temporal_activity_definition
@@ -136,8 +136,8 @@ def activity_as_tool(
     execute_activity.__name__ = activity_fn.__name__
     execute_activity.__doc__ = tool_description
 
-    # Create the tool
-    tool = CrewStructuredTool(
+    # Create the tool using CrewAI's Tool class (inherits from BaseTool)
+    tool = Tool(
         name=tool_name,
         description=tool_description,
         args_schema=args_schema,
