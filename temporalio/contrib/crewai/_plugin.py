@@ -88,12 +88,21 @@ class CrewAIPlugin(SimplePlugin):
             if not runner:
                 raise ValueError("No WorkflowRunner provided to the CrewAI plugin.")
 
-            # If in sandbox, add passthrough for crewai module
+            # If in sandbox, configure for CrewAI:
+            # 1. Allow open() for prompt file loading (I18N.load_prompts)
+            # 2. Pass through crewai module for @lru_cache state sharing
             if isinstance(runner, SandboxedWorkflowRunner):
-                return dataclasses.replace(
-                    runner,
-                    restrictions=runner.restrictions.with_passthrough_modules("crewai"),
+                restrictions = runner.restrictions
+                # Unrestrict open() - CrewAI reads prompt files at Agent init
+                restrictions = dataclasses.replace(
+                    restrictions,
+                    invalid_module_members=restrictions.invalid_module_members.with_child_unrestricted(
+                        "__builtins__", "open"
+                    ),
                 )
+                # Pass through crewai for cache sharing
+                restrictions = restrictions.with_passthrough_modules("crewai")
+                return dataclasses.replace(runner, restrictions=restrictions)
             return runner
 
         def data_converter(
