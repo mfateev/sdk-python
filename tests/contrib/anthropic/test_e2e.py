@@ -301,6 +301,37 @@ async def test_workflow_replay_determinism():
         await client.close()
 
 
+@workflow.defn
+class ErrorHandlingWorkflow:
+    """Workflow for testing error handling."""
+
+    @workflow.run
+    async def run(self) -> str:
+        """Try to use an invalid model to trigger an error."""
+        transport = TemporalTransport(
+            model="claude-invalid-model-xyz",  # Invalid model
+            max_tokens=100,
+        )
+
+        await transport.connect()
+
+        try:
+            user_message = {"role": "user", "content": "test"}
+            await transport.write(str(user_message))
+
+            async for message in transport.read_messages():
+                return str(message)
+
+            return "No error occurred (unexpected)"
+
+        except Exception as e:
+            # Catch and return error message
+            return f"Error caught: {type(e).__name__}"
+
+        finally:
+            await transport.close()
+
+
 @pytest.mark.e2e
 @pytest.mark.asyncio
 async def test_error_handling_with_real_api():
@@ -311,35 +342,6 @@ async def test_error_handling_with_real_api():
     2. Workflow can handle activity failures
     3. Error messages are meaningful
     """
-
-    @workflow.defn
-    class ErrorHandlingWorkflow:
-        @workflow.run
-        async def run(self) -> str:
-            """Try to use an invalid model to trigger an error."""
-            transport = TemporalTransport(
-                model="claude-invalid-model-xyz",  # Invalid model
-                max_tokens=100,
-            )
-
-            await transport.connect()
-
-            try:
-                user_message = {"role": "user", "content": "test"}
-                await transport.write(str(user_message))
-
-                async for message in transport.read_messages():
-                    return str(message)
-
-                return "No error occurred (unexpected)"
-
-            except Exception as e:
-                # Catch and return error message
-                return f"Error caught: {type(e).__name__}"
-
-            finally:
-                await transport.close()
-
     plugin = AnthropicAgentsPlugin()
     client = await Client.connect(
         TEMPORAL_ADDRESS,

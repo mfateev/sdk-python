@@ -9,6 +9,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 keywords = ["temporal", "workflow"]
 dependencies = [
+  "anthropic>=0.76.0",
   "nexus-rpc==1.3.0",
   "protobuf>=3.20,<7.0.0",
   "python-dateutil>=2.8.2,<3 ; python_version < '3.11'",

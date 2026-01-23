@@ -121,8 +121,8 @@ async def invoke_llm_activity(input: InvokeLLMInput) -> dict[str, Any]:
 def _convert_to_api_messages(sdk_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Convert Claude SDK messages to Anthropic API format.
 
-    POC: For now, assume messages are already in correct format.
-    May need adjustment based on actual SDK message format.
+    SDK messages may include a 'type' field that is not part of the
+    Anthropic API format and must be stripped.
 
     Args:
         sdk_messages: Messages from Claude SDK
@@ -130,9 +130,13 @@ def _convert_to_api_messages(sdk_messages: list[dict[str, Any]]) -> list[dict[st
     Returns:
         Messages in Anthropic API format
     """
-    # POC: Simple pass-through
-    # TODO: Implement proper conversion if formats differ
-    return sdk_messages
+    api_messages = []
+    for msg in sdk_messages:
+        # Create a copy and remove 'type' field if present
+        # Anthropic API only accepts 'role' and 'content'
+        api_msg = {"role": msg["role"], "content": msg["content"]}
+        api_messages.append(api_msg)
+    return api_messages
 
 
 def _convert_to_sdk_message(api_response: Any) -> dict[str, Any]:

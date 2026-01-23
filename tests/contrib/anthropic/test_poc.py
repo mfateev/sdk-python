@@ -109,6 +109,28 @@ async def test_simple_transport():
             print(f"✅ POC Test Passed! Response: {result}")
 
 
+@workflow.defn
+class LifecycleWorkflow:
+    """Workflow for testing transport lifecycle."""
+
+    @workflow.run
+    async def run(self) -> bool:
+        transport = TemporalTransport()
+
+        # Should not be ready initially
+        assert not transport.is_ready()
+
+        # Connect
+        await transport.connect()
+        assert transport.is_ready()
+
+        # Close
+        await transport.close()
+        assert not transport.is_ready()
+
+        return True
+
+
 @pytest.mark.asyncio
 async def test_transport_lifecycle():
     """Test transport lifecycle methods.
@@ -118,26 +140,6 @@ async def test_transport_lifecycle():
     2. connect() makes it ready
     3. close() makes it not ready
     """
-
-    @workflow.defn
-    class LifecycleWorkflow:
-        @workflow.run
-        async def run(self) -> bool:
-            transport = TemporalTransport()
-
-            # Should not be ready initially
-            assert not transport.is_ready()
-
-            # Connect
-            await transport.connect()
-            assert transport.is_ready()
-
-            # Close
-            await transport.close()
-            assert not transport.is_ready()
-
-            return True
-
     async with await WorkflowEnvironment.start_time_skipping() as env:
         client = env.client
 

@@ -115,7 +115,7 @@ class TestAnthropicAgentsPlugin:
         """Should initialize with default parameters."""
         plugin = AnthropicAgentsPlugin()
 
-        assert plugin.name == "AnthropicAgentsPlugin"
+        assert plugin.name() == "AnthropicAgentsPlugin"
 
     def test_initialization_custom_params(self):
         """Should accept custom transport parameters."""
@@ -125,27 +125,27 @@ class TestAnthropicAgentsPlugin:
 
         plugin = AnthropicAgentsPlugin(transport_params=params)
 
-        assert plugin.name == "AnthropicAgentsPlugin"
+        assert plugin.name() == "AnthropicAgentsPlugin"
 
     def test_initialization_register_activities_false(self):
         """Should accept register_activities=False."""
         plugin = AnthropicAgentsPlugin(register_activities=False)
 
-        assert plugin.name == "AnthropicAgentsPlugin"
+        assert plugin.name() == "AnthropicAgentsPlugin"
 
     def test_data_converter_configuration(self):
         """Plugin should configure data converter."""
         plugin = AnthropicAgentsPlugin()
 
         # Plugin should have data_converter callable
-        assert hasattr(plugin, "_data_converter")
+        assert hasattr(plugin, "data_converter")
 
     def test_activities_registration(self):
         """Plugin should register invoke_llm_activity."""
         plugin = AnthropicAgentsPlugin(register_activities=True)
 
         # Test activity registration function
-        activities = plugin._activities([])
+        activities = plugin.activities([])
 
         # Should add invoke_llm_activity
         assert len(activities) == 1
@@ -157,7 +157,7 @@ class TestAnthropicAgentsPlugin:
 
         # Test activity registration function
         existing_activities = [lambda: None]
-        activities = plugin._activities(existing_activities)
+        activities = plugin.activities(existing_activities)
 
         # Should not add new activities
         assert len(activities) == 1
@@ -170,7 +170,7 @@ class TestAnthropicAgentsPlugin:
         # Test with existing activities
         mock_activity = MagicMock()
         existing = [mock_activity]
-        activities = plugin._activities(existing)
+        activities = plugin.activities(existing)
 
         # Should have existing + new
         assert len(activities) == 2
@@ -205,14 +205,14 @@ class TestAnthropicAgentsPlugin:
 
         # We can't easily test the workflow_runner without full integration
         # Just verify the function exists
-        assert plugin._workflow_runner is not None
+        assert plugin.workflow_runner is not None
 
     def test_workflow_runner_no_runner_raises(self):
         """Plugin should raise if no runner provided."""
         plugin = AnthropicAgentsPlugin()
 
         with pytest.raises(ValueError, match="No WorkflowRunner"):
-            plugin._workflow_runner(None)
+            plugin.workflow_runner(None)
 
     def test_default_timeout_set(self):
         """Plugin should set default timeout if none provided."""
@@ -234,7 +234,7 @@ class TestPluginIntegration:
     def test_plugin_name(self):
         """Plugin should have correct name."""
         plugin = AnthropicAgentsPlugin()
-        assert plugin.name == "AnthropicAgentsPlugin"
+        assert plugin.name() == "AnthropicAgentsPlugin"
 
     def test_plugin_with_all_options(self):
         """Plugin should work with all options configured."""
@@ -249,12 +249,12 @@ class TestPluginIntegration:
             transport_params=params, register_activities=True
         )
 
-        assert plugin.name == "AnthropicAgentsPlugin"
+        assert plugin.name() == "AnthropicAgentsPlugin"
 
     def test_multiple_plugin_instances(self):
         """Should be able to create multiple plugin instances."""
         plugin1 = AnthropicAgentsPlugin()
         plugin2 = AnthropicAgentsPlugin()
 
-        assert plugin1.name == plugin2.name
+        assert plugin1.name() == plugin2.name()
         assert plugin1 is not plugin2
