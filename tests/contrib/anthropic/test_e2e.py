@@ -14,6 +14,7 @@ Skip with:
 
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -66,7 +67,7 @@ class SimpleAnthropicWorkflow:
         try:
             # Write prompt
             user_message = {"role": "user", "content": prompt}
-            await transport.write(str(user_message))
+            await transport.write(json.dumps(user_message))
 
             # Read response
             responses = []
@@ -123,7 +124,7 @@ class MultiTurnAnthropicWorkflow:
             for prompt in prompts:
                 # Write prompt
                 user_message = {"role": "user", "content": prompt}
-                await transport.write(str(user_message))
+                await transport.write(json.dumps(user_message))
 
                 # Read response
                 async for message in transport.read_messages():
@@ -166,32 +167,28 @@ async def test_simple_workflow_with_real_api():
         plugins=[plugin],
     )
 
-    try:
-        # Create worker with workflow
-        task_queue = f"e2e-test-{os.urandom(8).hex()}"
+    # Create worker with workflow
+    task_queue = f"e2e-test-{os.urandom(8).hex()}"
 
-        async with Worker(
-            client,
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[SimpleAnthropicWorkflow],
+    ):
+        # Execute workflow with real API call
+        result = await client.execute_workflow(
+            SimpleAnthropicWorkflow.run,
+            "What is 2+2? Answer with just the number.",
+            id=f"test-simple-{os.urandom(8).hex()}",
             task_queue=task_queue,
-            workflows=[SimpleAnthropicWorkflow],
-        ):
-            # Execute workflow with real API call
-            result = await client.execute_workflow(
-                SimpleAnthropicWorkflow.run,
-                "What is 2+2? Answer with just the number.",
-                id=f"test-simple-{os.urandom(8).hex()}",
-                task_queue=task_queue,
-            )
+        )
 
-            # Verify we got a response
-            assert result is not None
-            assert len(result) > 0
-            assert "4" in result  # Should contain the answer
+        # Verify we got a response
+        assert result is not None
+        assert len(result) > 0
+        assert "4" in result  # Should contain the answer
 
-            print(f"✓ Simple workflow result: {result}")
-
-    finally:
-        await client.close()
+        print(f"✓ Simple workflow result: {result}")
 
 
 @pytest.mark.e2e
@@ -210,40 +207,36 @@ async def test_multi_turn_conversation():
         plugins=[plugin],
     )
 
-    try:
-        task_queue = f"e2e-test-multi-{os.urandom(8).hex()}"
+    task_queue = f"e2e-test-multi-{os.urandom(8).hex()}"
 
-        async with Worker(
-            client,
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[MultiTurnAnthropicWorkflow],
+    ):
+        # Execute workflow with multiple prompts
+        prompts = [
+            "My favorite number is 7.",
+            "What is my favorite number?",
+        ]
+
+        result = await client.execute_workflow(
+            MultiTurnAnthropicWorkflow.run,
+            prompts,
+            id=f"test-multi-{os.urandom(8).hex()}",
             task_queue=task_queue,
-            workflows=[MultiTurnAnthropicWorkflow],
-        ):
-            # Execute workflow with multiple prompts
-            prompts = [
-                "My favorite number is 7.",
-                "What is my favorite number?",
-            ]
+        )
 
-            result = await client.execute_workflow(
-                MultiTurnAnthropicWorkflow.run,
-                prompts,
-                id=f"test-multi-{os.urandom(8).hex()}",
-                task_queue=task_queue,
-            )
+        # Verify we got responses
+        assert result is not None
+        assert len(result) == 2  # Two responses
 
-            # Verify we got responses
-            assert result is not None
-            assert len(result) == 2  # Two responses
+        # Second response should reference the number 7
+        assert "7" in result[1]
 
-            # Second response should reference the number 7
-            assert "7" in result[1]
-
-            print(f"✓ Multi-turn conversation:")
-            for i, response in enumerate(result):
-                print(f"  Turn {i+1}: {response[:100]}...")
-
-    finally:
-        await client.close()
+        print(f"✓ Multi-turn conversation:")
+        for i, response in enumerate(result):
+            print(f"  Turn {i+1}: {response[:100]}...")
 
 
 @pytest.mark.e2e
@@ -262,43 +255,39 @@ async def test_workflow_replay_determinism():
         plugins=[plugin],
     )
 
-    try:
-        task_queue = f"e2e-test-replay-{os.urandom(8).hex()}"
-        workflow_id = f"test-replay-{os.urandom(8).hex()}"
+    task_queue = f"e2e-test-replay-{os.urandom(8).hex()}"
+    workflow_id = f"test-replay-{os.urandom(8).hex()}"
 
-        async with Worker(
-            client,
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[SimpleAnthropicWorkflow],
+    ):
+        # First execution
+        result1 = await client.execute_workflow(
+            SimpleAnthropicWorkflow.run,
+            "Say 'test' and nothing else.",
+            id=workflow_id,
             task_queue=task_queue,
-            workflows=[SimpleAnthropicWorkflow],
-        ):
-            # First execution
-            result1 = await client.execute_workflow(
-                SimpleAnthropicWorkflow.run,
-                "Say 'test' and nothing else.",
-                id=workflow_id,
-                task_queue=task_queue,
-            )
+        )
 
-            # Get workflow handle
-            handle = client.get_workflow_handle(workflow_id)
+        # Get workflow handle
+        handle = client.get_workflow_handle(workflow_id)
 
-            # Fetch history
-            history = await handle.fetch_history()
+        # Fetch history
+        history = await handle.fetch_history()
 
-            # Verify history exists and has events
-            assert history is not None
-            events = [e async for e in history]
-            assert len(events) > 0
+        # Verify history exists and has events
+        assert history is not None
+        events = list(history.events)
+        assert len(events) > 0
 
-            print(f"✓ Workflow completed with {len(events)} history events")
-            print(f"✓ Result: {result1}")
+        print(f"✓ Workflow completed with {len(events)} history events")
+        print(f"✓ Result: {result1}")
 
-            # Note: True replay testing requires workflow_replay module
-            # which is not available in this test context
-            # This test at least verifies history is recorded correctly
-
-    finally:
-        await client.close()
+        # Note: True replay testing requires workflow_replay module
+        # which is not available in this test context
+        # This test at least verifies history is recorded correctly
 
 
 @workflow.defn
@@ -317,7 +306,7 @@ class ErrorHandlingWorkflow:
 
         try:
             user_message = {"role": "user", "content": "test"}
-            await transport.write(str(user_message))
+            await transport.write(json.dumps(user_message))
 
             async for message in transport.read_messages():
                 return str(message)
@@ -348,28 +337,24 @@ async def test_error_handling_with_real_api():
         plugins=[plugin],
     )
 
-    try:
-        task_queue = f"e2e-test-error-{os.urandom(8).hex()}"
+    task_queue = f"e2e-test-error-{os.urandom(8).hex()}"
 
-        async with Worker(
-            client,
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[ErrorHandlingWorkflow],
+    ):
+        # Execute workflow - should complete but with error
+        result = await client.execute_workflow(
+            ErrorHandlingWorkflow.run,
+            id=f"test-error-{os.urandom(8).hex()}",
             task_queue=task_queue,
-            workflows=[ErrorHandlingWorkflow],
-        ):
-            # Execute workflow - should complete but with error
-            result = await client.execute_workflow(
-                ErrorHandlingWorkflow.run,
-                id=f"test-error-{os.urandom(8).hex()}",
-                task_queue=task_queue,
-            )
+        )
 
-            # Verify error was caught and handled
-            assert "Error caught" in result or "ActivityError" in result
+        # Verify error was caught and handled
+        assert "Error caught" in result or "ActivityError" in result
 
-            print(f"✓ Error handling result: {result}")
-
-    finally:
-        await client.close()
+        print(f"✓ Error handling result: {result}")
 
 
 if __name__ == "__main__":
