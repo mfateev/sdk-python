@@ -1,14 +1,25 @@
-"""Minimal POC for Anthropic Claude Agent SDK integration with Temporal.
+"""Anthropic Claude Agent SDK integration with Temporal.
 
 .. warning::
-    This is a Proof of Concept implementation.
-    APIs are experimental and will change.
+    This API is experimental and may change in future versions.
+    Use with caution in production environments.
+
+This module provides integration between the Anthropic Claude Agent SDK and
+Temporal workflows, enabling durable execution of AI agents.
 """
 
 from temporalio.contrib.anthropic._activities import invoke_llm_activity
+from temporalio.contrib.anthropic._plugin import (
+    AnthropicAgentsPlugin,
+    AnthropicPayloadConverter,
+    TransportActivityParameters,
+)
 from temporalio.contrib.anthropic._transport import TemporalTransport
 
 __all__ = [
+    "AnthropicAgentsPlugin",
+    "AnthropicPayloadConverter",
     "invoke_llm_activity",
     "TemporalTransport",
+    "TransportActivityParameters",
 ]
