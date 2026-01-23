@@ -9,6 +9,8 @@ from .message_pb2 import (
     PendingChildExecutionInfo,
     PendingNexusOperationInfo,
     PendingWorkflowTaskInfo,
+    PostResetOperation,
+    RequestIdInfo,
     ResetPointInfo,
     ResetPoints,
     VersioningOverride,
@@ -16,6 +18,7 @@ from .message_pb2 import (
     WorkflowExecutionExtendedInfo,
     WorkflowExecutionInfo,
     WorkflowExecutionOptions,
+    WorkflowExecutionPauseInfo,
     WorkflowExecutionVersioningInfo,
 )
 
@@ -30,6 +33,8 @@ __all__ = [
     "PendingChildExecutionInfo",
     "PendingNexusOperationInfo",
     "PendingWorkflowTaskInfo",
+    "PostResetOperation",
+    "RequestIdInfo",
     "ResetPointInfo",
     "ResetPoints",
     "VersioningOverride",
@@ -37,5 +42,6 @@ __all__ = [
     "WorkflowExecutionExtendedInfo",
     "WorkflowExecutionInfo",
     "WorkflowExecutionOptions",
+    "WorkflowExecutionPauseInfo",
     "WorkflowExecutionVersioningInfo",
 ]

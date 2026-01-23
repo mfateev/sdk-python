@@ -1,16 +1,25 @@
+from .activity_pb2 import (
+    ActivityExecutionStatus,
+    ActivityIdConflictPolicy,
+    ActivityIdReusePolicy,
+)
 from .batch_operation_pb2 import BatchOperationState, BatchOperationType
 from .command_type_pb2 import CommandType
 from .common_pb2 import (
+    ApplicationErrorCategory,
     CallbackState,
     EncodingType,
     IndexedValueType,
     NexusOperationCancellationState,
     PendingNexusOperationState,
     Severity,
+    WorkerStatus,
+    WorkflowRuleActionScope,
 )
 from .deployment_pb2 import (
     DeploymentReachability,
     VersionDrainageStatus,
+    WorkerDeploymentVersionStatus,
     WorkerVersioningMode,
 )
 from .event_type_pb2 import EventType
@@ -30,6 +39,8 @@ from .schedule_pb2 import ScheduleOverlapPolicy
 from .task_queue_pb2 import (
     BuildIdTaskReachability,
     DescribeTaskQueueMode,
+    RateLimitSource,
+    RoutingConfigUpdateState,
     TaskQueueKind,
     TaskQueueType,
     TaskReachability,
@@ -37,11 +48,13 @@ from .task_queue_pb2 import (
 from .update_pb2 import UpdateAdmittedEventOrigin, UpdateWorkflowExecutionLifecycleStage
 from .workflow_pb2 import (
     ContinueAsNewInitiator,
+    ContinueAsNewVersioningBehavior,
     HistoryEventFilterType,
     ParentClosePolicy,
     PendingActivityState,
     PendingWorkflowTaskState,
     RetryState,
+    SuggestContinueAsNewReason,
     TimeoutType,
     VersioningBehavior,
     WorkflowExecutionStatus,
@@ -50,6 +63,10 @@ from .workflow_pb2 import (
 )
 
 __all__ = [
+    "ActivityExecutionStatus",
+    "ActivityIdConflictPolicy",
+    "ActivityIdReusePolicy",
+    "ApplicationErrorCategory",
     "ArchivalState",
     "BatchOperationState",
     "BatchOperationType",
@@ -58,6 +75,7 @@ __all__ = [
     "CancelExternalWorkflowExecutionFailedCause",
     "CommandType",
     "ContinueAsNewInitiator",
+    "ContinueAsNewVersioningBehavior",
     "DeploymentReachability",
     "DescribeTaskQueueMode",
     "EncodingType",
@@ -73,6 +91,7 @@ __all__ = [
     "PendingWorkflowTaskState",
     "QueryRejectCondition",
     "QueryResultType",
+    "RateLimitSource",
     "ReplicationState",
     "ResetReapplyExcludeType",
     "ResetReapplyType",
@@ -80,10 +99,12 @@ __all__ = [
     "ResourceExhaustedCause",
     "ResourceExhaustedScope",
     "RetryState",
+    "RoutingConfigUpdateState",
     "ScheduleOverlapPolicy",
     "Severity",
     "SignalExternalWorkflowExecutionFailedCause",
     "StartChildWorkflowExecutionFailedCause",
+    "SuggestContinueAsNewReason",
     "TaskQueueKind",
     "TaskQueueType",
     "TaskReachability",
@@ -92,9 +113,12 @@ __all__ = [
     "UpdateWorkflowExecutionLifecycleStage",
     "VersionDrainageStatus",
     "VersioningBehavior",
+    "WorkerDeploymentVersionStatus",
+    "WorkerStatus",
     "WorkerVersioningMode",
     "WorkflowExecutionStatus",
     "WorkflowIdConflictPolicy",
     "WorkflowIdReusePolicy",
+    "WorkflowRuleActionScope",
     "WorkflowTaskFailedCause",
 ]
