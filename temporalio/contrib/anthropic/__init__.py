@@ -15,11 +15,14 @@ from temporalio.contrib.anthropic._plugin import (
     TransportActivityParameters,
 )
 from temporalio.contrib.anthropic._transport import TemporalTransport
+from temporalio.contrib.anthropic.workflow import SdkMcpTool, activity_as_tool
 
 __all__ = [
+    "activity_as_tool",
     "AnthropicAgentsPlugin",
     "AnthropicPayloadConverter",
     "invoke_llm_activity",
+    "SdkMcpTool",
     "TemporalTransport",
     "TransportActivityParameters",
 ]
