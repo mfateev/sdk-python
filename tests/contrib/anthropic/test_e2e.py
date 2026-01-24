@@ -19,11 +19,15 @@ import os
 
 import pytest
 
-from temporalio import workflow
+from datetime import timedelta
+
+from temporalio import activity, workflow
 from temporalio.client import Client
 from temporalio.contrib.anthropic import (
     AnthropicAgentsPlugin,
+    SdkMcpTool,
     TemporalTransport,
+    activity_as_tool,
 )
 from temporalio.worker import Worker
 
@@ -321,6 +325,104 @@ class ErrorHandlingWorkflow:
             await transport.close()
 
 
+# Activity for testing activity_as_tool
+@activity.defn
+async def get_weather(city: str) -> str:
+    """Get the weather for a city.
+
+    This is a simple activity that returns mock weather data.
+    In a real application, this would call a weather API.
+    """
+    # Simulate weather lookup
+    weather_data = {
+        "tokyo": "Sunny, 22°C",
+        "london": "Cloudy, 15°C",
+        "new york": "Rainy, 18°C",
+    }
+    city_lower = city.lower()
+    if city_lower in weather_data:
+        return f"Weather in {city}: {weather_data[city_lower]}"
+    return f"Weather in {city}: Clear, 20°C"
+
+
+@workflow.defn
+class ActivityAsToolWorkflow:
+    """Workflow that tests activity_as_tool functionality.
+
+    This workflow creates a tool from an activity and invokes it directly,
+    simulating what Claude would do when calling the tool.
+    """
+
+    @workflow.run
+    async def run(self, city: str) -> str:
+        """Create a tool from activity and invoke it.
+
+        Args:
+            city: City to get weather for
+
+        Returns:
+            Weather result from the activity
+        """
+        # Create tool from activity
+        weather_tool = activity_as_tool(
+            get_weather,
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+
+        # Verify tool was created correctly
+        assert weather_tool.name == "get_weather"
+        assert "city" in weather_tool.input_schema["properties"]
+
+        # Invoke the tool's handler (simulating Claude calling it)
+        result = await weather_tool.handler({"city": city})
+
+        # Extract text from MCP response format
+        if "content" in result and result["content"]:
+            return result["content"][0].get("text", str(result))
+        return str(result)
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_activity_as_tool_e2e():
+    """Test activity_as_tool with real Temporal server.
+
+    This test verifies:
+    1. activity_as_tool creates a valid SdkMcpTool
+    2. The tool can be invoked within a workflow
+    3. The tool handler correctly calls workflow.execute_activity
+    4. The activity executes and returns the expected result
+    """
+    plugin = AnthropicAgentsPlugin()
+    client = await Client.connect(
+        TEMPORAL_ADDRESS,
+        plugins=[plugin],
+    )
+
+    task_queue = f"e2e-test-tool-{os.urandom(8).hex()}"
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[ActivityAsToolWorkflow],
+        activities=[get_weather],
+    ):
+        # Execute workflow that uses activity_as_tool
+        result = await client.execute_workflow(
+            ActivityAsToolWorkflow.run,
+            "Tokyo",
+            id=f"test-tool-{os.urandom(8).hex()}",
+            task_queue=task_queue,
+        )
+
+        # Verify the activity was called and returned weather
+        assert result is not None
+        assert "Tokyo" in result
+        assert "Sunny" in result or "22" in result
+
+        print(f"✓ activity_as_tool result: {result}")
+
+
 @pytest.mark.e2e
 @pytest.mark.asyncio
 async def test_error_handling_with_real_api():
@@ -386,6 +488,10 @@ if __name__ == "__main__":
 
             print("Test 4: Error handling...")
             await test_error_handling_with_real_api()
+            print()
+
+            print("Test 5: activity_as_tool...")
+            await test_activity_as_tool_e2e()
             print()
 
             print("✅ All E2E tests passed!")

@@ -138,22 +138,35 @@ def activity_as_tool(
         # Build args list in parameter order
         call_args = [args.get(p) for p in params if p in args]
 
+        # Activity execution options
+        activity_options = dict(
+            task_queue=task_queue,
+            schedule_to_close_timeout=schedule_to_close_timeout,
+            schedule_to_start_timeout=schedule_to_start_timeout,
+            start_to_close_timeout=start_to_close_timeout,
+            heartbeat_timeout=heartbeat_timeout,
+            retry_policy=retry_policy,
+            cancellation_type=cancellation_type,
+            activity_id=activity_id,
+            versioning_intent=versioning_intent,
+            summary=summary or tool_description,
+            priority=priority,
+        )
+
         try:
-            result = await temporal_workflow.execute_activity(
-                activity_name,
-                args=call_args if len(call_args) != 1 else call_args[0],
-                task_queue=task_queue,
-                schedule_to_close_timeout=schedule_to_close_timeout,
-                schedule_to_start_timeout=schedule_to_start_timeout,
-                start_to_close_timeout=start_to_close_timeout,
-                heartbeat_timeout=heartbeat_timeout,
-                retry_policy=retry_policy,
-                cancellation_type=cancellation_type,
-                activity_id=activity_id,
-                versioning_intent=versioning_intent,
-                summary=summary or tool_description,
-                priority=priority,
-            )
+            # Use positional arg for single-arg activities, args list for multiple
+            if len(call_args) == 1:
+                result = await temporal_workflow.execute_activity(
+                    activity_name,
+                    call_args[0],
+                    **activity_options,
+                )
+            else:
+                result = await temporal_workflow.execute_activity(
+                    activity_name,
+                    args=call_args,
+                    **activity_options,
+                )
 
             # Convert result to MCP format
             result_text = str(result) if result is not None else "Success"
