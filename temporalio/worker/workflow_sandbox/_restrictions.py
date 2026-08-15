@@ -464,6 +464,13 @@ SandboxMatcher.all_uses_runtime = SandboxMatcher(use={"*"}, only_runtime=True)
 
 SandboxRestrictions.passthrough_modules_minimum = {
     "grpc",
+    # The External Workflow Streams subscription manager. It owns the Worker's
+    # backend connections, its watcher tasks, and the buffers the Workflow
+    # thread pops from -- all of which live on the Worker's own asyncio loop.
+    # Re-importing it inside the sandbox would give the Workflow a second,
+    # empty manager watching nothing, so only an opaque handle to the real one
+    # may cross the boundary.
+    "temporalio.contrib.external_workflow_streams._manager",
     # Due to some side-effecting calls made on import, these need to be
     # allowed
     "pathlib",
