@@ -777,6 +777,35 @@ SandboxRestrictions.invalid_module_members_default = SandboxMatcher(
         "zipfile": SandboxMatcher(
             children={"ZipFile": SandboxMatcher(use={"extract", "extractall"})}
         ),
+        "temporalio": SandboxMatcher(
+            children={
+                "contrib": SandboxMatcher(
+                    children={
+                        # External stream provider instances hold connections
+                        # and credentials and live on the Worker, outside the
+                        # sandbox. Workflow code names a registered backend; it
+                        # never constructs or imports one, and a provider
+                        # reached from in here would be a second, unregistered
+                        # instance that no watcher owns.
+                        "external_workflow_streams": SandboxMatcher(
+                            children={
+                                "_redis": SandboxMatcher(
+                                    match_self=True,
+                                    leaf_message=(
+                                        "External stream providers may not be "
+                                        "imported from Workflow code. Register "
+                                        "the provider on the Worker with "
+                                        "external_stream_backends={...} and "
+                                        "name it from the Workflow instead."
+                                    ),
+                                ),
+                            },
+                            access={"RedisStreamBackend"},
+                        ),
+                    }
+                ),
+            }
+        ),
         "zoneinfo": SandboxMatcher(
             children={
                 "ZoneInfo": SandboxMatcher(

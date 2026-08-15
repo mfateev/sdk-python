@@ -15,11 +15,13 @@ that cannot be shown to fail is not evidence of anything.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
 
 from temporalio.contrib.external_workflow_streams._backend import (
     AppendConflictError,
+    ParkIntent,
     StreamBackend,
     StreamKey,
 )
@@ -175,10 +177,10 @@ async def check_range_read_reports_a_missing_record_as_missing(
     first, middle, last = placed[0].offset, placed[1].offset, placed[2].offset
     assert first is not None and middle is not None and last is not None
 
-    delete = getattr(backend, "delete", None)
+    delete = getattr(backend, "delete_for_test", None)
     if delete is None:
         return  # This provider cannot be made to lose a record on demand.
-    delete(key, middle)
+    await delete(key, middle)
 
     got = await backend.read_range(key, first, last)
 
@@ -397,6 +399,244 @@ async def check_immutability_is_declared(
         f"{type(backend).__name__} must declare a provider_id; every annotation "
         "header records it"
     )
+
+
+# --- parking (P2b) ----------------------------------------------------------
+
+SHORT_LEASE = timedelta(milliseconds=80)
+
+
+async def check_intents_are_keyed_by_stream_and_wait_id(
+    backend: StreamBackend, key: StreamKey
+) -> None:
+    """Two subscriptions to one stream must each keep their own intent.
+
+    A stream-keyed intent looks correct until a Workflow subscribes to the same
+    stream twice: the second install overwrites the first, and from then on only
+    one of the two can ever be woken. Cursors are per subscription, so the
+    surviving intent also names the wrong position for the lost one.
+    """
+    first = ParkIntent(wait_id=1, cursor=BEGINNING, park_generation=4, run_id="run-a")
+    second = ParkIntent(
+        wait_id=2, cursor=AFTER(Offset("100-0")), park_generation=4, run_id="run-a"
+    )
+
+    await backend.install_park_intent(key, first)
+    await backend.install_park_intent(key, second)
+
+    got_first = await backend.park_intent(key, 1)
+    got_second = await backend.park_intent(key, 2)
+
+    assert got_first == first, (
+        "installing a second subscription's intent overwrote the first; park "
+        f"intents must be keyed (stream key, wait_id), got {got_first!r}"
+    )
+    assert got_second == second
+    assert got_first.cursor != got_second.cursor  # type: ignore[union-attr]
+
+
+async def check_an_intent_is_removable_and_removal_is_idempotent(
+    backend: StreamBackend, key: StreamKey
+) -> None:
+    """An aborted park removes every intent it installed."""
+    await backend.install_park_intent(
+        key, ParkIntent(1, BEGINNING, park_generation=1, run_id="run-a")
+    )
+
+    await backend.remove_park_intent(key, 1)
+    assert await backend.park_intent(key, 1) is None
+
+    # Idempotent: an abort may race a removal that already happened.
+    await backend.remove_park_intent(key, 1)
+    assert await backend.park_intent(key, 1) is None
+
+
+async def check_a_new_runs_intent_replaces_its_predecessors(
+    backend: StreamBackend, key: StreamKey
+) -> None:
+    """The Run ID is the intent's value, not part of its key.
+
+    ``wait_id`` is stable across a Continue-As-New chain and the stream key
+    already carries the first execution Run ID, so the key is unique within the
+    chain. Putting the Run ID in the key instead would leave a dead intent
+    behind on every continuation.
+    """
+    await backend.install_park_intent(
+        key, ParkIntent(1, BEGINNING, park_generation=1, run_id="run-a")
+    )
+    await backend.install_park_intent(
+        key, ParkIntent(1, BEGINNING, park_generation=2, run_id="run-b")
+    )
+
+    got = await backend.park_intent(key, 1)
+    assert got is not None and got.run_id == "run-b", (
+        f"a new Run's intent must replace its predecessor's, got {got!r}"
+    )
+
+
+async def check_recheck_sees_an_append_past_the_cursor(
+    backend: StreamBackend, key: StreamKey
+) -> None:
+    """The recheck is what closes the append/park race.
+
+    A producer appends *before* it observes the park generation, so an append is
+    either seen by this recheck or paired with a wake Signal. A recheck that
+    could not see a record appended after the intent was installed would lose
+    exactly the appends the ordering was designed to catch.
+    """
+    placed = await _append_all(backend, key, [b"a"])
+    tail = placed[0].offset
+    assert tail is not None
+
+    await backend.install_park_intent(
+        key, ParkIntent(1, AFTER(tail), park_generation=1, run_id="run-a")
+    )
+    assert not await backend.recheck(key, 1), (
+        "recheck reported records with nothing past the intent's cursor"
+    )
+
+    await backend.append(key, _data("racer", 0, b"late"))
+
+    assert await backend.recheck(key, 1), (
+        "recheck missed a record appended after the intent was installed; the "
+        "append/park race is not closed"
+    )
+
+
+async def check_recheck_of_a_removed_intent_is_false(
+    backend: StreamBackend, key: StreamKey
+) -> None:
+    await _append_all(backend, key, [b"a"])
+    assert not await backend.recheck(key, 99)
+
+
+async def check_the_current_generation_is_readable(
+    backend: StreamBackend, key: StreamKey
+) -> None:
+    """A producer needs the generation to name in its wake Signal."""
+    assert await backend.current_park_generation(key, 1) is None, (
+        "no intent is installed, so there is no confirmed park to report; a "
+        "producer here must send an unparked wake rather than a stale one"
+    )
+
+    await backend.install_park_intent(
+        key, ParkIntent(1, BEGINNING, park_generation=7, run_id="run-a")
+    )
+
+    assert await backend.current_park_generation(key, 1) == 7
+
+
+async def check_a_claim_excludes_a_second_producer(
+    backend: StreamBackend, key: StreamKey
+) -> None:
+    """Only meaningful for a provider that declares leased claims."""
+    if not type(backend).supports_leased_claims:
+        return
+
+    await backend.install_park_intent(
+        key, ParkIntent(1, BEGINNING, park_generation=3, run_id="run-a")
+    )
+
+    assert await backend.claim_park_generation(
+        key, 1, 3, claimant="producer-a", lease=SHORT_LEASE
+    )
+    assert not await backend.claim_park_generation(
+        key, 1, 3, claimant="producer-b", lease=SHORT_LEASE
+    ), "two producers both believe they own the same park generation's wake"
+
+
+async def check_a_claim_is_renewable_by_its_holder(
+    backend: StreamBackend, key: StreamKey
+) -> None:
+    """Renewal must not look like contention.
+
+    A producer whose append and Signal are separated by a slow call has to be
+    able to extend its own claim; if renewal were refused it would have to drop
+    the claim and race for it again.
+    """
+    if not type(backend).supports_leased_claims:
+        return
+
+    await backend.install_park_intent(
+        key, ParkIntent(1, BEGINNING, park_generation=3, run_id="run-a")
+    )
+
+    assert await backend.claim_park_generation(
+        key, 1, 3, claimant="producer-a", lease=SHORT_LEASE
+    )
+    assert await backend.claim_park_generation(
+        key, 1, 3, claimant="producer-a", lease=SHORT_LEASE
+    ), "a claim holder could not renew its own claim"
+
+
+async def check_an_expired_claim_is_taken_over(
+    backend: StreamBackend, key: StreamKey
+) -> None:
+    """The case an unleased claim cannot recover from.
+
+    A producer that crashes between claiming a generation and sending its wake
+    Signal strands the generation: every other producer sees it claimed and
+    concludes the wake is handled, so the parked Workflow waits forever with
+    data sitting in the stream. A lease turns that into a bounded delay.
+    """
+    if not type(backend).supports_leased_claims:
+        return
+
+    await backend.install_park_intent(
+        key, ParkIntent(1, BEGINNING, park_generation=3, run_id="run-a")
+    )
+    assert await backend.claim_park_generation(
+        key, 1, 3, claimant="crashed-producer", lease=SHORT_LEASE
+    )
+
+    await asyncio.sleep(SHORT_LEASE.total_seconds() * 2.5)
+
+    assert await backend.claim_park_generation(
+        key, 1, 3, claimant="producer-b", lease=SHORT_LEASE
+    ), (
+        "an expired claim was not taken over; a producer crashing between its "
+        "claim and its Signal would strand this generation permanently"
+    )
+
+
+async def check_observe_only_providers_always_grant(
+    backend: StreamBackend, key: StreamKey
+) -> None:
+    """A provider that cannot lease must let every producer signal.
+
+    Duplicate Signals are harmless -- the runtime rechecks every subscription on
+    wakeup regardless -- and lost ones are not, so refusing a claim it cannot
+    police would be strictly worse than granting every one.
+    """
+    if type(backend).supports_leased_claims:
+        return
+
+    await backend.install_park_intent(
+        key, ParkIntent(1, BEGINNING, park_generation=3, run_id="run-a")
+    )
+
+    assert await backend.claim_park_generation(
+        key, 1, 3, claimant="producer-a", lease=SHORT_LEASE
+    )
+    assert await backend.claim_park_generation(
+        key, 1, 3, claimant="producer-b", lease=SHORT_LEASE
+    ), "an observe-only provider must grant every claim so no wake is lost"
+
+
+#: The parking checks, kept as their own list so a provider can adopt the core
+#: contract before the parking extension.
+PARKING_CONFORMANCE_CHECKS: list[Check] = [
+    check_intents_are_keyed_by_stream_and_wait_id,
+    check_an_intent_is_removable_and_removal_is_idempotent,
+    check_a_new_runs_intent_replaces_its_predecessors,
+    check_recheck_sees_an_append_past_the_cursor,
+    check_recheck_of_a_removed_intent_is_false,
+    check_the_current_generation_is_readable,
+    check_a_claim_excludes_a_second_producer,
+    check_a_claim_is_renewable_by_its_holder,
+    check_an_expired_claim_is_taken_over,
+    check_observe_only_providers_always_grant,
+]
 
 
 #: Every check, in the order a provider author most usefully reads them.

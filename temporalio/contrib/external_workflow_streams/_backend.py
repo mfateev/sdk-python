@@ -44,9 +44,36 @@ from temporalio.contrib.external_workflow_streams._record import (
 
 __all__ = [
     "AppendConflictError",
+    "ParkIntent",
     "StreamBackend",
     "StreamKey",
 ]
+
+
+@dataclass(frozen=True)
+class ParkIntent:
+    """One subscription's declaration that it is about to park.
+
+    The key is ``(stream key, wait_id)``; everything here is the value.
+    """
+
+    wait_id: int
+    cursor: Cursor
+    """Where this subscription stopped consuming. What ``recheck`` reads past."""
+    park_generation: int
+    """The quiescence generation being parked. A wake Signal names this."""
+    run_id: str
+    """The Run that installed it -- part of the value so a new Run's intent
+    replaces its predecessor's for the same key rather than accumulating."""
+
+    def __post_init__(self) -> None:
+        if self.park_generation < 1:
+            # 0 is the reserved unparked-wake sentinel, so a real park
+            # generation can never take it.
+            raise ValueError(
+                f"a park generation is a quiescence generation and starts at 1, "
+                f"got {self.park_generation}"
+            )
 
 
 @dataclass(frozen=True)
@@ -185,6 +212,84 @@ class StreamBackend(abc.ABC):
         Synchronous and pure: replay validation calls it once per adjacent pair
         of a range, and an ordering that needed I/O would put backend latency
         inside a validation loop.
+        """
+
+    # --- parking (P2b) ------------------------------------------------------
+
+    supports_leased_claims: ClassVar[bool] = False
+    """Whether :meth:`claim_park_generation` expires claims and permits takeover.
+
+    An unleased claim introduces a failure mode with no recovery: a producer
+    that crashes between claiming a generation and sending its wake Signal
+    strands that generation, and every other producer concludes the wake is
+    already handled -- so the parked Workflow waits forever with data sitting
+    in the stream.
+
+    A provider that cannot lease must declare ``False`` and expose
+    **observe-only** semantics instead: :meth:`claim_park_generation` always
+    grants, and every producer signals idempotently. That costs duplicate
+    Signals, which are harmless, rather than lost ones, which are not.
+    """
+
+    @abc.abstractmethod
+    async def install_park_intent(self, key: StreamKey, intent: ParkIntent) -> None:
+        """Records that one **subscription** intends to park.
+
+        Keyed ``(stream key, wait_id)``, never by stream key alone: two
+        subscriptions in one Workflow to the same stream are two independent
+        waits, and a stream-keyed intent would have one overwrite the other --
+        after which only one of them could ever be woken.
+
+        The current Run ID is part of the intent's *value*, not its key, so a
+        new Run's intent deterministically replaces its predecessor's rather
+        than accumulating beside it.
+        """
+
+    @abc.abstractmethod
+    async def remove_park_intent(self, key: StreamKey, wait_id: int) -> None:
+        """Removes one subscription's intent. Idempotent."""
+
+    @abc.abstractmethod
+    async def park_intent(self, key: StreamKey, wait_id: int) -> ParkIntent | None:
+        """The installed intent, if any."""
+
+    @abc.abstractmethod
+    async def recheck(self, key: StreamKey, wait_id: int) -> bool:
+        """Whether any record now sits past the installed intent's cursor.
+
+        Called after every intent is installed, and it is this recheck -- not
+        the intent -- that closes the append/park race: a producer appends
+        before it observes the park generation, so an append is either seen
+        here or paired with a wake Signal.
+        """
+
+    @abc.abstractmethod
+    async def claim_park_generation(
+        self,
+        key: StreamKey,
+        wait_id: int,
+        park_generation: int,
+        *,
+        claimant: str,
+        lease: timedelta,
+    ) -> bool:
+        """Tries to take responsibility for waking ``park_generation``.
+
+        Returns ``True`` when this caller now holds the claim -- including when
+        it is renewing a claim it already held, so a producer can extend rather
+        than losing it mid-flight.
+
+        A provider that declares ``supports_leased_claims = False`` must always
+        return ``True``: observe-only semantics, where every producer signals.
+        """
+
+    @abc.abstractmethod
+    async def current_park_generation(self, key: StreamKey, wait_id: int) -> int | None:
+        """The generation a producer should name in its wake Signal.
+
+        ``None`` means no confirmed park is installed for this subscription, in
+        which case a producer sends an *unparked* wake -- generation 0 -- rather
+        than staying silent.
         """
 
     # --- provided on top of the required operations -------------------------

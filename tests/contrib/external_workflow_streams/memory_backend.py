@@ -10,11 +10,13 @@ those boundaries are reachable without sleeping.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import timedelta
 
 from temporalio.contrib.external_workflow_streams._backend import (
     DEFAULT_WATCH_BLOCK,
     AppendConflictError,
+    ParkIntent,
     StreamBackend,
     StreamKey,
 )
@@ -46,6 +48,10 @@ class MemoryStreamBackend(StreamBackend):
         self._appended = asyncio.Event()
         #: Every read_range call, for tests that assert replay's call count.
         self.range_reads: list[tuple[Offset, Offset]] = []
+        #: Park intents, keyed `(stream key, wait_id)` -- never by stream alone.
+        self._intents: dict[tuple[StreamKey, int], ParkIntent] = {}
+        #: `(stream key, wait_id) -> (claimant, generation, expires_at)`.
+        self._claims: dict[tuple[StreamKey, int], tuple[str, int, float]] = {}
 
     # --- required operations ------------------------------------------------
 
@@ -109,9 +115,63 @@ class MemoryStreamBackend(StreamBackend):
         a, b = parse(left), parse(right)
         return (a > b) - (a < b)
 
+    # --- parking ------------------------------------------------------------
+
+    supports_leased_claims = True
+
+    async def install_park_intent(self, key: StreamKey, intent: ParkIntent) -> None:
+        self._intents[(key, intent.wait_id)] = intent
+
+    async def remove_park_intent(self, key: StreamKey, wait_id: int) -> None:
+        self._intents.pop((key, wait_id), None)
+        self._claims.pop((key, wait_id), None)
+
+    async def park_intent(self, key: StreamKey, wait_id: int) -> ParkIntent | None:
+        return self._intents.get((key, wait_id))
+
+    async def recheck(self, key: StreamKey, wait_id: int) -> bool:
+        intent = self._intents.get((key, wait_id))
+        if intent is None:
+            return False
+        return bool(self._after(key, intent.cursor))
+
+    async def claim_park_generation(
+        self,
+        key: StreamKey,
+        wait_id: int,
+        park_generation: int,
+        *,
+        claimant: str,
+        lease: timedelta,
+    ) -> bool:
+        now = time.monotonic()
+        held = self._claims.get((key, wait_id))
+        if held is not None:
+            holder, generation, expires_at = held
+            # A live claim held by someone else, for this generation, blocks.
+            # An expired one is taken over -- that is the whole point of a
+            # lease, and without it a producer that crashed here would strand
+            # the generation forever.
+            if (
+                generation == park_generation
+                and holder != claimant
+                and expires_at > now
+            ):
+                return False
+        self._claims[(key, wait_id)] = (
+            claimant,
+            park_generation,
+            now + lease.total_seconds(),
+        )
+        return True
+
+    async def current_park_generation(self, key: StreamKey, wait_id: int) -> int | None:
+        intent = self._intents.get((key, wait_id))
+        return None if intent is None else intent.park_generation
+
     # --- test affordances ---------------------------------------------------
 
-    def delete(self, key: StreamKey, offset: Offset) -> None:
+    async def delete_for_test(self, key: StreamKey, offset: Offset) -> None:
         """Removes a record, standing in for XDEL, trimming, or retention loss.
 
         Deletion is permitted -- what immutability forbids is *rewriting* a

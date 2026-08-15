@@ -5,6 +5,8 @@ Nothing in this module should be considered stable. The API may change.
 
 from __future__ import annotations
 
+import asyncio
+import enum
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import (
@@ -30,6 +32,62 @@ from temporalio.bridge.temporal_sdk_bridge import (
     PollShutdownError,  # type: ignore # noqa: F401
 )
 from temporalio.worker._command_aware_visitor import CommandAwarePayloadVisitor
+
+
+class ExternalStreamReadyResult(enum.Enum):
+    """What Core did with an external stream readiness notification.
+
+    Five values, not two, because a watcher does something different with each
+    and an operator should conclude something different from each.
+
+    ``NO_OPEN_WORKFLOW_TASK`` and ``RUN_NOT_FOUND`` are separate on purpose. A
+    Run cached between Workflow Tasks is the healthy post-completion state;
+    reporting it as a missing Run would both corrupt the metric and tell the
+    watcher to tear itself down while it is still needed.
+    """
+
+    ACCEPTED = "Accepted"
+    """Serialized into an open Workflow Task. Core will activate; do nothing."""
+
+    STALE = "Stale"
+    """The wait moved on. Re-probe; do **not** send a Signal."""
+
+    PARKED = "Parked"
+    """A confirmed park generation exists. Send the reserved wake Signal."""
+
+    NO_OPEN_WORKFLOW_TASK = "NoOpenWorkflowTask"
+    """Cached with waits registered, no task open. Signal, and **keep** the watcher."""
+
+    RUN_NOT_FOUND = "RunNotFound"
+    """Absent from this Worker's cache. Signal, then tear the watcher down."""
+
+    @property
+    def needs_wake_signal(self) -> bool:
+        """Whether local readiness could not be delivered and a Signal is owed."""
+        return self in (
+            ExternalStreamReadyResult.PARKED,
+            ExternalStreamReadyResult.NO_OPEN_WORKFLOW_TASK,
+            ExternalStreamReadyResult.RUN_NOT_FOUND,
+        )
+
+
+class ExternalStreamRunStatus(enum.Enum):
+    """What state a Run's external stream wait set is in.
+
+    The answer to a **read-only** probe. Asking changes nothing.
+    """
+
+    WFT_OPEN = "WftOpen"
+    """A Workflow Task is open, retained by the wait set."""
+
+    PARKED = "Parked"
+    """The complete wait set is parked."""
+
+    NO_OPEN_WORKFLOW_TASK = "NoOpenWorkflowTask"
+    """Cached with active waits, but no Workflow Task open."""
+
+    RUN_NOT_FOUND = "RunNotFound"
+    """Absent from this Worker's cache."""
 
 
 @dataclass
@@ -258,6 +316,64 @@ class Worker:
     ) -> None:
         """Record an activity heartbeat."""
         self._ref.record_activity_heartbeat(comp.SerializeToString())  # type: ignore[reportOptionalMemberAccess]
+
+    def notify_external_stream_ready_sync(
+        self, run_id: str, wait_id: int, wait_generation: int
+    ) -> ExternalStreamReadyResult:
+        """Tell Core a record is **buffered** for one external stream wait.
+
+        Buffered, not merely available: a notification for a record the caller
+        has not yet read into its buffer would produce an activation whose
+        drain must block, which is the deadlock hazard the out-of-thread buffer
+        exists to remove.
+
+        Acknowledged rather than fire-and-forget, because what the caller does
+        next depends entirely on the answer -- see
+        :py:class:`ExternalStreamReadyResult`.
+
+        Blocks while Core answers on its serialized local-input lane. Safe from
+        any thread, and safe to block in -- the lane does no I/O.
+
+        .. warning::
+            Do **not** call this from the event loop running the Worker. That
+            loop is what drives the poll this answer comes from, so blocking it
+            here waits for something only it can produce. Use
+            :py:meth:`notify_external_stream_ready` from a loop.
+        """
+        return ExternalStreamReadyResult(
+            self._ref.notify_external_stream_ready(  # type: ignore[reportOptionalMemberAccess]
+                run_id, wait_id, wait_generation
+            )
+        )
+
+    async def notify_external_stream_ready(
+        self, run_id: str, wait_id: int, wait_generation: int
+    ) -> ExternalStreamReadyResult:
+        """:py:meth:`notify_external_stream_ready_sync`, off the calling loop.
+
+        There is one watcher per subscription and they do not share a loop, so
+        this runs the blocking call in a thread rather than binding a future to
+        whichever loop happened to create it.
+        """
+        return await asyncio.to_thread(
+            self.notify_external_stream_ready_sync, run_id, wait_id, wait_generation
+        )
+
+    def external_stream_run_status_sync(self, run_id: str) -> ExternalStreamRunStatus:
+        """Ask what state a Run's external stream wait set is in, changing nothing.
+
+        A separate call from :py:meth:`notify_external_stream_ready` on purpose:
+        readiness means "a record is buffered", so probing with it would assert
+        something false and manufacture a spurious Workflow Task on the way out
+        of a shutting-down Worker.
+        """
+        return ExternalStreamRunStatus(
+            self._ref.external_stream_run_status(run_id)  # type: ignore[reportOptionalMemberAccess]
+        )
+
+    async def external_stream_run_status(self, run_id: str) -> ExternalStreamRunStatus:
+        """:py:meth:`external_stream_run_status_sync`, off the calling loop."""
+        return await asyncio.to_thread(self.external_stream_run_status_sync, run_id)
 
     def request_workflow_eviction(self, run_id: str) -> None:
         """Request a workflow be evicted."""

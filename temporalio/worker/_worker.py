@@ -8,7 +8,7 @@ import hashlib
 import logging
 import sys
 import warnings
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import (
@@ -152,6 +152,7 @@ class Worker:
         ),
         disable_payload_error_limit: bool = False,
         max_workflow_task_external_storage_concurrency: int = _DEFAULT_WORKFLOW_TASK_EXTERNAL_STORAGE_CONCURRENCY,
+        external_stream_backends: Mapping[str, Any] | None = None,
     ) -> None:
         """Create a worker to process workflows and/or activities.
 
@@ -277,6 +278,14 @@ class Worker:
             graceful_shutdown_timeout: Amount of time after shutdown is called
                 that activities are given to complete before their tasks are
                 cancelled.
+            external_stream_backends: Named External Workflow Stream provider
+                instances, referenced from Workflow code by name only. Every
+                provider must declare ``guarantees_immutability = True``;
+                Worker construction fails otherwise.
+
+                .. warning::
+                    This option is experimental and the feature it configures
+                    is incomplete.
             workflow_failure_exception_types: The types of exceptions that, if a
                 workflow-thrown exception extends, will cause the
                 workflow/update to fail instead of suspending the workflow via
@@ -392,6 +401,7 @@ class Worker:
             nexus_task_poller_behavior=nexus_task_poller_behavior,
             disable_payload_error_limit=disable_payload_error_limit,
             max_workflow_task_external_storage_concurrency=max_workflow_task_external_storage_concurrency,
+            external_stream_backends=external_stream_backends,
         )
 
         plugins_from_client = cast(
@@ -417,6 +427,20 @@ class Worker:
         Client is safe to take separately since it can't be modified by worker plugins.
         """
         self._config = config
+
+        # Named external stream backends. Validated here rather than lazily so
+        # that a provider which cannot guarantee record immutability fails
+        # Worker construction, before any Workflow can name it -- not at
+        # replay, after data has been consumed against it.
+        self._external_stream_backends = None
+        raw_backends = config.get("external_stream_backends")
+        if raw_backends:
+            from temporalio.contrib.external_workflow_streams._registry import (
+                ExternalStreamBackendRegistry,
+            )
+
+            self._external_stream_backends = ExternalStreamBackendRegistry(raw_backends)
+
         if not (
             config.get("activities")
             or config.get("nexus_service_handlers")
@@ -1020,6 +1044,7 @@ class WorkerConfig(TypedDict, total=False):
     nexus_task_poller_behavior: PollerBehavior
     disable_payload_error_limit: bool
     max_workflow_task_external_storage_concurrency: int
+    external_stream_backends: Mapping[str, Any] | None
 
 
 def _warn_if_activity_executor_max_workers_is_inconsistent(
