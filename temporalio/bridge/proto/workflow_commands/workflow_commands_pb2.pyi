@@ -101,6 +101,10 @@ class WorkflowCommand(google.protobuf.message.Message):
     UPDATE_RESPONSE_FIELD_NUMBER: builtins.int
     SCHEDULE_NEXUS_OPERATION_FIELD_NUMBER: builtins.int
     REQUEST_CANCEL_NEXUS_OPERATION_FIELD_NUMBER: builtins.int
+    WORKFLOW_STREAM_PROGRESS_FIELD_NUMBER: builtins.int
+    WORKFLOW_STREAM_QUIESCENT_FIELD_NUMBER: builtins.int
+    EXTERNAL_STREAM_PARK_RESULT_FIELD_NUMBER: builtins.int
+    EXTERNAL_STREAM_FINALIZED_FIELD_NUMBER: builtins.int
     @property
     def user_metadata(self) -> temporalio.api.sdk.v1.user_metadata_pb2.UserMetadata:
         """User metadata that may or may not be persisted into history depending on the command type.
@@ -165,6 +169,14 @@ class WorkflowCommand(google.protobuf.message.Message):
     def request_cancel_nexus_operation(
         self,
     ) -> global___RequestCancelNexusOperation: ...
+    @property
+    def workflow_stream_progress(self) -> global___WorkflowStreamProgress: ...
+    @property
+    def workflow_stream_quiescent(self) -> global___WorkflowStreamQuiescent: ...
+    @property
+    def external_stream_park_result(self) -> global___ExternalStreamParkResult: ...
+    @property
+    def external_stream_finalized(self) -> global___ExternalStreamFinalized: ...
     def __init__(
         self,
         *,
@@ -199,6 +211,10 @@ class WorkflowCommand(google.protobuf.message.Message):
         schedule_nexus_operation: global___ScheduleNexusOperation | None = ...,
         request_cancel_nexus_operation: global___RequestCancelNexusOperation
         | None = ...,
+        workflow_stream_progress: global___WorkflowStreamProgress | None = ...,
+        workflow_stream_quiescent: global___WorkflowStreamQuiescent | None = ...,
+        external_stream_park_result: global___ExternalStreamParkResult | None = ...,
+        external_stream_finalized: global___ExternalStreamFinalized | None = ...,
     ) -> None: ...
     def HasField(
         self,
@@ -215,6 +231,10 @@ class WorkflowCommand(google.protobuf.message.Message):
             b"complete_workflow_execution",
             "continue_as_new_workflow_execution",
             b"continue_as_new_workflow_execution",
+            "external_stream_finalized",
+            b"external_stream_finalized",
+            "external_stream_park_result",
+            b"external_stream_park_result",
             "fail_workflow_execution",
             b"fail_workflow_execution",
             "modify_workflow_properties",
@@ -251,6 +271,10 @@ class WorkflowCommand(google.protobuf.message.Message):
             b"user_metadata",
             "variant",
             b"variant",
+            "workflow_stream_progress",
+            b"workflow_stream_progress",
+            "workflow_stream_quiescent",
+            b"workflow_stream_quiescent",
         ],
     ) -> builtins.bool: ...
     def ClearField(
@@ -268,6 +292,10 @@ class WorkflowCommand(google.protobuf.message.Message):
             b"complete_workflow_execution",
             "continue_as_new_workflow_execution",
             b"continue_as_new_workflow_execution",
+            "external_stream_finalized",
+            b"external_stream_finalized",
+            "external_stream_park_result",
+            b"external_stream_park_result",
             "fail_workflow_execution",
             b"fail_workflow_execution",
             "modify_workflow_properties",
@@ -304,6 +332,10 @@ class WorkflowCommand(google.protobuf.message.Message):
             b"user_metadata",
             "variant",
             b"variant",
+            "workflow_stream_progress",
+            b"workflow_stream_progress",
+            "workflow_stream_quiescent",
+            b"workflow_stream_quiescent",
         ],
     ) -> None: ...
     def WhichOneof(
@@ -332,11 +364,261 @@ class WorkflowCommand(google.protobuf.message.Message):
             "update_response",
             "schedule_nexus_operation",
             "request_cancel_nexus_operation",
+            "workflow_stream_progress",
+            "workflow_stream_quiescent",
+            "external_stream_park_result",
+            "external_stream_finalized",
         ]
         | None
     ): ...
 
 global___WorkflowCommand = WorkflowCommand
+
+class WorkflowStreamProgress(google.protobuf.message.Message):
+    """Commits an observation delta for external streams.
+
+    Emitted on *every* completion path where replay-visible stream state changed -- which includes
+    an activation that observed no records at all -- and independent of whether the Workflow Task
+    is retained. Consuming a record and committing that consumption are separate steps, and the
+    second is not conditional on why the Workflow Task ended.
+
+    Ordering is normative: this command precedes every command whose value could depend on the
+    consumed data. On replay that guarantees integrity validation for a record runs before the
+    command derived from it is matched.
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    OBSERVATION_DELTA_FIELD_NUMBER: builtins.int
+    REQUEST_ROLLOVER_FIELD_NUMBER: builtins.int
+    observation_delta: builtins.bytes
+    """The segments produced since the previous progress report for this Workflow Task. Opaque to
+    Core, which appends it to the accumulated annotation and never parses it.
+    """
+    request_rollover: builtins.bool
+    """Set when the encoder is approaching the annotation byte budget and the runtime wants the
+    Workflow Task rolled over rather than the marker grown further. Core takes the rollover
+    path minus the finalization round trip, because this command already carries the terminal.
+    """
+    def __init__(
+        self,
+        *,
+        observation_delta: builtins.bytes = ...,
+        request_rollover: builtins.bool = ...,
+    ) -> None: ...
+    def ClearField(
+        self,
+        field_name: typing_extensions.Literal[
+            "observation_delta",
+            b"observation_delta",
+            "request_rollover",
+            b"request_rollover",
+        ],
+    ) -> None: ...
+
+global___WorkflowStreamProgress = WorkflowStreamProgress
+
+class WorkflowStreamQuiescent(google.protobuf.message.Message):
+    """Asks Core to retain the open Workflow Task. Carries no annotation data -- retention and
+    progress are separate questions, and a completion may carry either command, both, or neither.
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    QUIESCENCE_GENERATION_FIELD_NUMBER: builtins.int
+    WAITS_FIELD_NUMBER: builtins.int
+    IDLE_TIMEOUT_FIELD_NUMBER: builtins.int
+    quiescence_generation: builtins.int
+    """Identifies this complete blocked snapshot."""
+    @property
+    def waits(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[
+        global___ExternalStreamWait
+    ]:
+        """The *complete* set of waits the Workflow is blocked on. A partial set would let one idle
+        stream park a Workflow Task another stream is still driving.
+        """
+    @property
+    def idle_timeout(self) -> google.protobuf.duration_pb2.Duration:
+        """Already reduced by `min` over the quiescent set in wait_id order. Core rejects a
+        non-positive value as a malformed completion rather than coercing it.
+        """
+    def __init__(
+        self,
+        *,
+        quiescence_generation: builtins.int = ...,
+        waits: collections.abc.Iterable[global___ExternalStreamWait] | None = ...,
+        idle_timeout: google.protobuf.duration_pb2.Duration | None = ...,
+    ) -> None: ...
+    def HasField(
+        self, field_name: typing_extensions.Literal["idle_timeout", b"idle_timeout"]
+    ) -> builtins.bool: ...
+    def ClearField(
+        self,
+        field_name: typing_extensions.Literal[
+            "idle_timeout",
+            b"idle_timeout",
+            "quiescence_generation",
+            b"quiescence_generation",
+            "waits",
+            b"waits",
+        ],
+    ) -> None: ...
+
+global___WorkflowStreamQuiescent = WorkflowStreamQuiescent
+
+class ExternalStreamWait(google.protobuf.message.Message):
+    """One external stream wait. Shared by the commands above and by the activation jobs, so it takes
+    no command tag of its own.
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    WAIT_ID_FIELD_NUMBER: builtins.int
+    GENERATION_FIELD_NUMBER: builtins.int
+    IMMEDIATELY_PARKABLE_FIELD_NUMBER: builtins.int
+    wait_id: builtins.int
+    generation: builtins.int
+    """Increments each time this subscription re-enters the blocked state. Never leaves the
+    Core/lang boundary.
+    """
+    immediately_parkable: builtins.bool
+    """Normally set after a write fence. A single fenced stream does not park the Workflow Task;
+    Core bypasses the idle delay only when *every* active wait in the snapshot is set.
+    """
+    def __init__(
+        self,
+        *,
+        wait_id: builtins.int = ...,
+        generation: builtins.int = ...,
+        immediately_parkable: builtins.bool = ...,
+    ) -> None: ...
+    def ClearField(
+        self,
+        field_name: typing_extensions.Literal[
+            "generation",
+            b"generation",
+            "immediately_parkable",
+            b"immediately_parkable",
+            "wait_id",
+            b"wait_id",
+        ],
+    ) -> None: ...
+
+global___ExternalStreamWait = ExternalStreamWait
+
+class ExternalStreamParkResult(google.protobuf.message.Message):
+    """Lang's answer to PrepareExternalStreamPark."""
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    QUIESCENCE_GENERATION_FIELD_NUMBER: builtins.int
+    CONFIRMED_FIELD_NUMBER: builtins.int
+    BECAME_READY_FIELD_NUMBER: builtins.int
+    FINAL_OBSERVATION_DELTA_FIELD_NUMBER: builtins.int
+    quiescence_generation: builtins.int
+    @property
+    def confirmed(self) -> global___ParkSetConfirmed: ...
+    @property
+    def became_ready(self) -> global___StreamSetBecameReady: ...
+    final_observation_delta: builtins.bytes
+    """Terminal observation delta for the marker Core is about to write. Present on `confirmed`:
+    only lang can encode the boundary, and Core must not write a marker whose annotation has
+    no terminal.
+    """
+    def __init__(
+        self,
+        *,
+        quiescence_generation: builtins.int = ...,
+        confirmed: global___ParkSetConfirmed | None = ...,
+        became_ready: global___StreamSetBecameReady | None = ...,
+        final_observation_delta: builtins.bytes = ...,
+    ) -> None: ...
+    def HasField(
+        self,
+        field_name: typing_extensions.Literal[
+            "became_ready",
+            b"became_ready",
+            "confirmed",
+            b"confirmed",
+            "outcome",
+            b"outcome",
+        ],
+    ) -> builtins.bool: ...
+    def ClearField(
+        self,
+        field_name: typing_extensions.Literal[
+            "became_ready",
+            b"became_ready",
+            "confirmed",
+            b"confirmed",
+            "final_observation_delta",
+            b"final_observation_delta",
+            "outcome",
+            b"outcome",
+            "quiescence_generation",
+            b"quiescence_generation",
+        ],
+    ) -> None: ...
+    def WhichOneof(
+        self, oneof_group: typing_extensions.Literal["outcome", b"outcome"]
+    ) -> typing_extensions.Literal["confirmed", "became_ready"] | None: ...
+
+global___ExternalStreamParkResult = ExternalStreamParkResult
+
+class ParkSetConfirmed(google.protobuf.message.Message):
+    """Every stream was still empty after intents were installed and every stream was rechecked."""
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    def __init__(
+        self,
+    ) -> None: ...
+
+global___ParkSetConfirmed = ParkSetConfirmed
+
+class StreamSetBecameReady(google.protobuf.message.Message):
+    """A recheck found records, so this parking generation is aborted and Core issues a normal
+    resolve activation rather than running user code from inside the park path.
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    def __init__(
+        self,
+    ) -> None: ...
+
+global___StreamSetBecameReady = StreamSetBecameReady
+
+class ExternalStreamFinalized(google.protobuf.message.Message):
+    """Lang's answer to FinalizeExternalStreams, for the paths where Core decides the boundary and no
+    park handshake runs.
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    QUIESCENCE_GENERATION_FIELD_NUMBER: builtins.int
+    FINAL_OBSERVATION_DELTA_FIELD_NUMBER: builtins.int
+    quiescence_generation: builtins.int
+    final_observation_delta: builtins.bytes
+    def __init__(
+        self,
+        *,
+        quiescence_generation: builtins.int = ...,
+        final_observation_delta: builtins.bytes = ...,
+    ) -> None: ...
+    def ClearField(
+        self,
+        field_name: typing_extensions.Literal[
+            "final_observation_delta",
+            b"final_observation_delta",
+            "quiescence_generation",
+            b"quiescence_generation",
+        ],
+    ) -> None: ...
+
+global___ExternalStreamFinalized = ExternalStreamFinalized
 
 class StartTimer(google.protobuf.message.Message):
     DESCRIPTOR: google.protobuf.descriptor.Descriptor

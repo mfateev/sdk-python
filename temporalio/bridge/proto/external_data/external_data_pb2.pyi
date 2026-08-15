@@ -4,19 +4,90 @@ isort:skip_file
 """
 
 import builtins
+import collections.abc
 import sys
+import typing
 
 import google.protobuf.descriptor
 import google.protobuf.duration_pb2
+import google.protobuf.internal.containers
+import google.protobuf.internal.enum_type_wrapper
 import google.protobuf.message
 import google.protobuf.timestamp_pb2
 
-if sys.version_info >= (3, 8):
+if sys.version_info >= (3, 10):
     import typing as typing_extensions
 else:
     import typing_extensions
 
 DESCRIPTOR: google.protobuf.descriptor.FileDescriptor
+
+class _ParkReason:
+    ValueType = typing.NewType("ValueType", builtins.int)
+    V: typing_extensions.TypeAlias = ValueType
+
+class _ParkReasonEnumTypeWrapper(
+    google.protobuf.internal.enum_type_wrapper._EnumTypeWrapper[_ParkReason.ValueType],
+    builtins.type,
+):  # noqa: F821
+    DESCRIPTOR: google.protobuf.descriptor.EnumDescriptor
+    PARK_REASON_UNSPECIFIED: _ParkReason.ValueType  # 0
+    PARK_REASON_IDLE: _ParkReason.ValueType  # 1
+    """The global quiescence timer expired with no record on any active wait."""
+    PARK_REASON_ALL_WRITE_FENCED: _ParkReason.ValueType  # 2
+    """Every active wait in the quiescent snapshot reached a write fence with no later record
+    immediately available, so the idle delay was bypassed.
+    """
+    PARK_REASON_SHUTDOWN: _ParkReason.ValueType  # 3
+    """The Worker is shutting down or the Run is being evicted while a Workflow Task is open."""
+    PARK_REASON_ROLLOVER: _ParkReason.ValueType  # 4
+    """The Workflow Task rollover deadline expired. Core decided this one, so the terminal came
+    back through FinalizeExternalStreams.
+    """
+    PARK_REASON_BUDGET_ROLLOVER: _ParkReason.ValueType  # 5
+    """The annotation reached its byte budget high-water mark and lang asked for a rollover. Unlike
+    PARK_REASON_ROLLOVER this needs no finalization round trip: the triggering
+    WorkflowStreamProgress already carried the terminal.
+    """
+    PARK_REASON_COMMANDS_PRODUCED: _ParkReason.ValueType  # 6
+    """The completion carried server-bound commands (timer, activity, child workflow, signal), so
+    the Workflow Task completed normally with subscriptions left active and unparked.
+    """
+    PARK_REASON_WORKFLOW_COMPLETED: _ParkReason.ValueType  # 7
+    """The completion carried a terminal command -- complete, fail, cancel, or continue-as-new."""
+
+class ParkReason(_ParkReason, metaclass=_ParkReasonEnumTypeWrapper):
+    """Why a Workflow Task holding external stream waits ended. Core knows the reason on every
+    completion path -- it either decided the boundary itself or was told -- which is why this
+    lives here, in the Core-readable marker envelope, and is deliberately *not* duplicated inside
+    the opaque replay annotation where a second copy could disagree with this one.
+    """
+
+PARK_REASON_UNSPECIFIED: ParkReason.ValueType  # 0
+PARK_REASON_IDLE: ParkReason.ValueType  # 1
+"""The global quiescence timer expired with no record on any active wait."""
+PARK_REASON_ALL_WRITE_FENCED: ParkReason.ValueType  # 2
+"""Every active wait in the quiescent snapshot reached a write fence with no later record
+immediately available, so the idle delay was bypassed.
+"""
+PARK_REASON_SHUTDOWN: ParkReason.ValueType  # 3
+"""The Worker is shutting down or the Run is being evicted while a Workflow Task is open."""
+PARK_REASON_ROLLOVER: ParkReason.ValueType  # 4
+"""The Workflow Task rollover deadline expired. Core decided this one, so the terminal came
+back through FinalizeExternalStreams.
+"""
+PARK_REASON_BUDGET_ROLLOVER: ParkReason.ValueType  # 5
+"""The annotation reached its byte budget high-water mark and lang asked for a rollover. Unlike
+PARK_REASON_ROLLOVER this needs no finalization round trip: the triggering
+WorkflowStreamProgress already carried the terminal.
+"""
+PARK_REASON_COMMANDS_PRODUCED: ParkReason.ValueType  # 6
+"""The completion carried server-bound commands (timer, activity, child workflow, signal), so
+the Workflow Task completed normally with subscriptions left active and unparked.
+"""
+PARK_REASON_WORKFLOW_COMPLETED: ParkReason.ValueType  # 7
+"""The completion carried a terminal command -- complete, fail, cancel, or continue-as-new."""
+global___ParkReason = ParkReason
 
 class LocalActivityMarkerData(google.protobuf.message.Message):
     """This file defines data that Core might write externally. The first motivating case being
@@ -122,3 +193,78 @@ class PatchedMarkerData(google.protobuf.message.Message):
     ) -> None: ...
 
 global___PatchedMarkerData = PatchedMarkerData
+
+class ExternalStreamMarkerData(google.protobuf.message.Message):
+    """What Core writes into a marker for a Workflow Task that consumed external streams. Exactly one
+    of these is written per Workflow Task, however many progress reports that task carried.
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    SCHEMA_VERSION_FIELD_NUMBER: builtins.int
+    QUIESCENCE_GENERATION_FIELD_NUMBER: builtins.int
+    WAITS_FIELD_NUMBER: builtins.int
+    REPLAY_ANNOTATION_FIELD_NUMBER: builtins.int
+    TERMINAL_BOUNDARY_FIELD_NUMBER: builtins.int
+    schema_version: builtins.int
+    quiescence_generation: builtins.int
+    """Identifies the complete blocked snapshot this marker closes."""
+    @property
+    def waits(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[
+        global___ExternalWaitMarker
+    ]: ...
+    replay_annotation: builtins.bytes
+    """The accumulated replay annotation, opaque to Core. Core appends each observation delta to
+    this and never parses any of it.
+    """
+    terminal_boundary: global___ParkReason.ValueType
+    def __init__(
+        self,
+        *,
+        schema_version: builtins.int = ...,
+        quiescence_generation: builtins.int = ...,
+        waits: collections.abc.Iterable[global___ExternalWaitMarker] | None = ...,
+        replay_annotation: builtins.bytes = ...,
+        terminal_boundary: global___ParkReason.ValueType = ...,
+    ) -> None: ...
+    def ClearField(
+        self,
+        field_name: typing_extensions.Literal[
+            "quiescence_generation",
+            b"quiescence_generation",
+            "replay_annotation",
+            b"replay_annotation",
+            "schema_version",
+            b"schema_version",
+            "terminal_boundary",
+            b"terminal_boundary",
+            "waits",
+            b"waits",
+        ],
+    ) -> None: ...
+
+global___ExternalStreamMarkerData = ExternalStreamMarkerData
+
+class ExternalWaitMarker(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    WAIT_ID_FIELD_NUMBER: builtins.int
+    GENERATION_FIELD_NUMBER: builtins.int
+    wait_id: builtins.int
+    generation: builtins.int
+    def __init__(
+        self,
+        *,
+        wait_id: builtins.int = ...,
+        generation: builtins.int = ...,
+    ) -> None: ...
+    def ClearField(
+        self,
+        field_name: typing_extensions.Literal[
+            "generation", b"generation", "wait_id", b"wait_id"
+        ],
+    ) -> None: ...
+
+global___ExternalWaitMarker = ExternalWaitMarker

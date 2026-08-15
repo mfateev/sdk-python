@@ -33,6 +33,9 @@ from temporalio.bridge.proto.common import (
 from temporalio.bridge.proto.external_data import (
     external_data_pb2 as temporal_dot_sdk_dot_core_dot_external__data_dot_external__data__pb2,
 )
+from temporalio.bridge.proto.external_stream import (
+    external_stream_pb2 as temporal_dot_sdk_dot_core_dot_external__stream_dot_external__stream__pb2,
+)
 from temporalio.bridge.proto.workflow_activation import (
     workflow_activation_pb2 as temporal_dot_sdk_dot_core_dot_workflow__activation_dot_workflow__activation__pb2,
 )
@@ -44,7 +47,7 @@ from temporalio.bridge.proto.workflow_completion import (
 )
 
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(
-    b'\n&temporal/sdk/core/core_interface.proto\x12\x07\x63oresdk\x1a\x1egoogle/protobuf/duration.proto\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a$temporal/api/common/v1/message.proto\x1a\x37temporal/sdk/core/activity_result/activity_result.proto\x1a\x33temporal/sdk/core/activity_task/activity_task.proto\x1a%temporal/sdk/core/common/common.proto\x1a\x33temporal/sdk/core/external_data/external_data.proto\x1a?temporal/sdk/core/workflow_activation/workflow_activation.proto\x1a;temporal/sdk/core/workflow_commands/workflow_commands.proto\x1a?temporal/sdk/core/workflow_completion/workflow_completion.proto"Y\n\x11\x41\x63tivityHeartbeat\x12\x12\n\ntask_token\x18\x01 \x01(\x0c\x12\x30\n\x07\x64\x65tails\x18\x02 \x03(\x0b\x32\x1f.temporal.api.common.v1.Payload"n\n\x16\x41\x63tivityTaskCompletion\x12\x12\n\ntask_token\x18\x01 \x01(\x0c\x12@\n\x06result\x18\x02 \x01(\x0b\x32\x30.coresdk.activity_result.ActivityExecutionResult"<\n\x10WorkflowSlotInfo\x12\x15\n\rworkflow_type\x18\x01 \x01(\t\x12\x11\n\tis_sticky\x18\x02 \x01(\x08")\n\x10\x41\x63tivitySlotInfo\x12\x15\n\ractivity_type\x18\x01 \x01(\t".\n\x15LocalActivitySlotInfo\x12\x15\n\ractivity_type\x18\x01 \x01(\t"3\n\rNexusSlotInfo\x12\x0f\n\x07service\x18\x01 \x01(\t\x12\x11\n\toperation\x18\x02 \x01(\t"\x86\x01\n\rNamespaceInfo\x12-\n\x06limits\x18\x01 \x01(\x0b\x32\x1d.coresdk.NamespaceInfo.Limits\x1a\x46\n\x06Limits\x12\x1d\n\x15\x62lob_size_limit_error\x18\x01 \x01(\x03\x12\x1d\n\x15memo_size_limit_error\x18\x02 \x01(\x03\x42\x33\xea\x02\x30Temporalio::Internal::Bridge::Api::CoreInterfaceb\x06proto3'
+    b'\n&temporal/sdk/core/core_interface.proto\x12\x07\x63oresdk\x1a\x1egoogle/protobuf/duration.proto\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a$temporal/api/common/v1/message.proto\x1a\x37temporal/sdk/core/activity_result/activity_result.proto\x1a\x33temporal/sdk/core/activity_task/activity_task.proto\x1a%temporal/sdk/core/common/common.proto\x1a\x33temporal/sdk/core/external_data/external_data.proto\x1a\x37temporal/sdk/core/external_stream/external_stream.proto\x1a?temporal/sdk/core/workflow_activation/workflow_activation.proto\x1a;temporal/sdk/core/workflow_commands/workflow_commands.proto\x1a?temporal/sdk/core/workflow_completion/workflow_completion.proto"Y\n\x11\x41\x63tivityHeartbeat\x12\x12\n\ntask_token\x18\x01 \x01(\x0c\x12\x30\n\x07\x64\x65tails\x18\x02 \x03(\x0b\x32\x1f.temporal.api.common.v1.Payload"n\n\x16\x41\x63tivityTaskCompletion\x12\x12\n\ntask_token\x18\x01 \x01(\x0c\x12@\n\x06result\x18\x02 \x01(\x0b\x32\x30.coresdk.activity_result.ActivityExecutionResult"<\n\x10WorkflowSlotInfo\x12\x15\n\rworkflow_type\x18\x01 \x01(\t\x12\x11\n\tis_sticky\x18\x02 \x01(\x08")\n\x10\x41\x63tivitySlotInfo\x12\x15\n\ractivity_type\x18\x01 \x01(\t".\n\x15LocalActivitySlotInfo\x12\x15\n\ractivity_type\x18\x01 \x01(\t"3\n\rNexusSlotInfo\x12\x0f\n\x07service\x18\x01 \x01(\t\x12\x11\n\toperation\x18\x02 \x01(\t"\x86\x01\n\rNamespaceInfo\x12-\n\x06limits\x18\x01 \x01(\x0b\x32\x1d.coresdk.NamespaceInfo.Limits\x1a\x46\n\x06Limits\x12\x1d\n\x15\x62lob_size_limit_error\x18\x01 \x01(\x03\x12\x1d\n\x15memo_size_limit_error\x18\x02 \x01(\x03\x42\x33\xea\x02\x30Temporalio::Internal::Bridge::Api::CoreInterfaceb\x06proto3'
 )
 
 
@@ -148,20 +151,20 @@ if _descriptor._USE_C_DESCRIPTORS == False:
     DESCRIPTOR._serialized_options = (
         b"\352\0020Temporalio::Internal::Bridge::Api::CoreInterface"
     )
-    _ACTIVITYHEARTBEAT._serialized_start = 576
-    _ACTIVITYHEARTBEAT._serialized_end = 665
-    _ACTIVITYTASKCOMPLETION._serialized_start = 667
-    _ACTIVITYTASKCOMPLETION._serialized_end = 777
-    _WORKFLOWSLOTINFO._serialized_start = 779
-    _WORKFLOWSLOTINFO._serialized_end = 839
-    _ACTIVITYSLOTINFO._serialized_start = 841
-    _ACTIVITYSLOTINFO._serialized_end = 882
-    _LOCALACTIVITYSLOTINFO._serialized_start = 884
-    _LOCALACTIVITYSLOTINFO._serialized_end = 930
-    _NEXUSSLOTINFO._serialized_start = 932
-    _NEXUSSLOTINFO._serialized_end = 983
-    _NAMESPACEINFO._serialized_start = 986
-    _NAMESPACEINFO._serialized_end = 1120
-    _NAMESPACEINFO_LIMITS._serialized_start = 1050
-    _NAMESPACEINFO_LIMITS._serialized_end = 1120
+    _ACTIVITYHEARTBEAT._serialized_start = 633
+    _ACTIVITYHEARTBEAT._serialized_end = 722
+    _ACTIVITYTASKCOMPLETION._serialized_start = 724
+    _ACTIVITYTASKCOMPLETION._serialized_end = 834
+    _WORKFLOWSLOTINFO._serialized_start = 836
+    _WORKFLOWSLOTINFO._serialized_end = 896
+    _ACTIVITYSLOTINFO._serialized_start = 898
+    _ACTIVITYSLOTINFO._serialized_end = 939
+    _LOCALACTIVITYSLOTINFO._serialized_start = 941
+    _LOCALACTIVITYSLOTINFO._serialized_end = 987
+    _NEXUSSLOTINFO._serialized_start = 989
+    _NEXUSSLOTINFO._serialized_end = 1040
+    _NAMESPACEINFO._serialized_start = 1043
+    _NAMESPACEINFO._serialized_end = 1177
+    _NAMESPACEINFO_LIMITS._serialized_start = 1107
+    _NAMESPACEINFO_LIMITS._serialized_end = 1177
 # @@protoc_insertion_point(module_scope)
