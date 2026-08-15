@@ -1,3 +1,4 @@
 [submodule "sdk-core"]
 	path = temporalio/bridge/sdk-core
-	url = https://github.com/temporalio/sdk-rust.git
+	url = https://github.com/mfateev/sdk-core.git
+	branch = task/python-sdk-streaming
