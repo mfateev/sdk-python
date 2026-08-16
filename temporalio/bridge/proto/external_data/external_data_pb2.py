@@ -19,7 +19,7 @@ from google.protobuf import duration_pb2 as google_dot_protobuf_dot_duration__pb
 from google.protobuf import timestamp_pb2 as google_dot_protobuf_dot_timestamp__pb2
 
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(
-    b'\n3temporal/sdk/core/external_data/external_data.proto\x12\x15\x63oresdk.external_data\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto"\xfe\x01\n\x17LocalActivityMarkerData\x12\x0b\n\x03seq\x18\x01 \x01(\r\x12\x0f\n\x07\x61ttempt\x18\x02 \x01(\r\x12\x13\n\x0b\x61\x63tivity_id\x18\x03 \x01(\t\x12\x15\n\ractivity_type\x18\x04 \x01(\t\x12\x31\n\rcomplete_time\x18\x05 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x12*\n\x07\x62\x61\x63koff\x18\x06 \x01(\x0b\x32\x19.google.protobuf.Duration\x12:\n\x16original_schedule_time\x18\x07 \x01(\x0b\x32\x1a.google.protobuf.Timestamp"3\n\x11PatchedMarkerData\x12\n\n\x02id\x18\x01 \x01(\t\x12\x12\n\ndeprecated\x18\x02 \x01(\x08"\xe4\x01\n\x18\x45xternalStreamMarkerData\x12\x16\n\x0eschema_version\x18\x01 \x01(\r\x12\x1d\n\x15quiescence_generation\x18\x02 \x01(\x04\x12\x38\n\x05waits\x18\x03 \x03(\x0b\x32).coresdk.external_data.ExternalWaitMarker\x12\x19\n\x11replay_annotation\x18\x04 \x01(\x0c\x12<\n\x11terminal_boundary\x18\x05 \x01(\x0e\x32!.coresdk.external_data.ParkReason"9\n\x12\x45xternalWaitMarker\x12\x0f\n\x07wait_id\x18\x01 \x01(\r\x12\x12\n\ngeneration\x18\x02 \x01(\x04*\xfd\x01\n\nParkReason\x12\x1b\n\x17PARK_REASON_UNSPECIFIED\x10\x00\x12\x14\n\x10PARK_REASON_IDLE\x10\x01\x12 \n\x1cPARK_REASON_ALL_WRITE_FENCED\x10\x02\x12\x18\n\x14PARK_REASON_SHUTDOWN\x10\x03\x12\x18\n\x14PARK_REASON_ROLLOVER\x10\x04\x12\x1f\n\x1bPARK_REASON_BUDGET_ROLLOVER\x10\x05\x12!\n\x1dPARK_REASON_COMMANDS_PRODUCED\x10\x06\x12"\n\x1ePARK_REASON_WORKFLOW_COMPLETED\x10\x07\x42\x32\xea\x02/Temporalio::Internal::Bridge::Api::ExternalDatab\x06proto3'
+    b'\n3temporal/sdk/core/external_data/external_data.proto\x12\x15\x63oresdk.external_data\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto"\xfe\x01\n\x17LocalActivityMarkerData\x12\x0b\n\x03seq\x18\x01 \x01(\r\x12\x0f\n\x07\x61ttempt\x18\x02 \x01(\r\x12\x13\n\x0b\x61\x63tivity_id\x18\x03 \x01(\t\x12\x15\n\ractivity_type\x18\x04 \x01(\t\x12\x31\n\rcomplete_time\x18\x05 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x12*\n\x07\x62\x61\x63koff\x18\x06 \x01(\x0b\x32\x19.google.protobuf.Duration\x12:\n\x16original_schedule_time\x18\x07 \x01(\x0b\x32\x1a.google.protobuf.Timestamp"3\n\x11PatchedMarkerData\x12\n\n\x02id\x18\x01 \x01(\t\x12\x12\n\ndeprecated\x18\x02 \x01(\x08"\xe4\x01\n\x18\x45xternalStreamMarkerData\x12\x16\n\x0eschema_version\x18\x01 \x01(\r\x12\x1d\n\x15quiescence_generation\x18\x02 \x01(\x04\x12\x38\n\x05waits\x18\x03 \x03(\x0b\x32).coresdk.external_data.ExternalWaitMarker\x12\x19\n\x11replay_annotation\x18\x04 \x01(\x0c\x12<\n\x11terminal_boundary\x18\x05 \x01(\x0e\x32!.coresdk.external_data.ParkReason"9\n\x12\x45xternalWaitMarker\x12\x0f\n\x07wait_id\x18\x01 \x01(\r\x12\x12\n\ngeneration\x18\x02 \x01(\x04*\x9d\x02\n\nParkReason\x12\x1b\n\x17PARK_REASON_UNSPECIFIED\x10\x00\x12\x14\n\x10PARK_REASON_IDLE\x10\x01\x12 \n\x1cPARK_REASON_ALL_WRITE_FENCED\x10\x02\x12\x18\n\x14PARK_REASON_SHUTDOWN\x10\x03\x12\x18\n\x14PARK_REASON_ROLLOVER\x10\x04\x12\x1f\n\x1bPARK_REASON_BUDGET_ROLLOVER\x10\x05\x12!\n\x1dPARK_REASON_COMMANDS_PRODUCED\x10\x06\x12"\n\x1ePARK_REASON_WORKFLOW_COMPLETED\x10\x07\x12\x1e\n\x1aPARK_REASON_TASK_COMPLETED\x10\x08\x42\x32\xea\x02/Temporalio::Internal::Bridge::Api::ExternalDatab\x06proto3'
 )
 
 _PARKREASON = DESCRIPTOR.enum_types_by_name["ParkReason"]
@@ -32,6 +32,7 @@ PARK_REASON_ROLLOVER = 4
 PARK_REASON_BUDGET_ROLLOVER = 5
 PARK_REASON_COMMANDS_PRODUCED = 6
 PARK_REASON_WORKFLOW_COMPLETED = 7
+PARK_REASON_TASK_COMPLETED = 8
 
 
 _LOCALACTIVITYMARKERDATA = DESCRIPTOR.message_types_by_name["LocalActivityMarkerData"]
@@ -88,7 +89,7 @@ if _descriptor._USE_C_DESCRIPTORS == False:
         b"\352\002/Temporalio::Internal::Bridge::Api::ExternalData"
     )
     _PARKREASON._serialized_start = 744
-    _PARKREASON._serialized_end = 997
+    _PARKREASON._serialized_end = 1029
     _LOCALACTIVITYMARKERDATA._serialized_start = 144
     _LOCALACTIVITYMARKERDATA._serialized_end = 398
     _PATCHEDMARKERDATA._serialized_start = 400

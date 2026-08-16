@@ -55,6 +55,11 @@ class _ParkReasonEnumTypeWrapper(
     """
     PARK_REASON_WORKFLOW_COMPLETED: _ParkReason.ValueType  # 7
     """The completion carried a terminal command -- complete, fail, cancel, or continue-as-new."""
+    PARK_REASON_TASK_COMPLETED: _ParkReason.ValueType  # 8
+    """The Workflow Task completed normally with nothing else to report: records were consumed and
+    no stream wait remained pending. Distinct from PARK_REASON_COMMANDS_PRODUCED so the marker
+    says which of the two it actually was rather than implying commands that never existed.
+    """
 
 class ParkReason(_ParkReason, metaclass=_ParkReasonEnumTypeWrapper):
     """Why a Workflow Task holding external stream waits ended. Core knows the reason on every
@@ -87,6 +92,11 @@ the Workflow Task completed normally with subscriptions left active and unparked
 """
 PARK_REASON_WORKFLOW_COMPLETED: ParkReason.ValueType  # 7
 """The completion carried a terminal command -- complete, fail, cancel, or continue-as-new."""
+PARK_REASON_TASK_COMPLETED: ParkReason.ValueType  # 8
+"""The Workflow Task completed normally with nothing else to report: records were consumed and
+no stream wait remained pending. Distinct from PARK_REASON_COMMANDS_PRODUCED so the marker
+says which of the two it actually was rather than implying commands that never existed.
+"""
 global___ParkReason = ParkReason
 
 class LocalActivityMarkerData(google.protobuf.message.Message):
