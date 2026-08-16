@@ -317,13 +317,26 @@ class StreamSubscriptionManager:
             delivery_cursor=start_cursor,
             prefetch_cursor=start_cursor,
         )
-        self._runs.setdefault(run_id, {})[wait_id] = subscription
+        replaced = self._runs.setdefault(run_id, {}).get(wait_id)
+        if replaced is not None:
+            # A wait re-registered under a key that already has one. The old
+            # subscription is unreachable from here on, and its watcher would go
+            # on polling the backend for the life of the process -- a leak that
+            # only shows up as a connection that never closes.
+            replaced._cancelled = True
+            self._loop.call_soon_threadsafe(self._cancel_watcher, replaced)
+        self._runs[run_id][wait_id] = subscription
         # `create_task` is not thread-safe, and this runs on the Workflow
         # executor thread. Scheduling the start onto the manager's loop is the
         # difference between a watcher that runs and one that is silently never
         # scheduled -- which looks exactly like a stream that never delivers.
         self._loop.call_soon_threadsafe(self._start_watcher, subscription)
         return subscription
+
+    def _cancel_watcher(self, subscription: Subscription) -> None:
+        watcher = subscription._watcher
+        if watcher is not None and not watcher.done():
+            watcher.cancel()
 
     def _start_watcher(self, subscription: Subscription) -> None:
         """Starts a watcher on the manager's own loop."""

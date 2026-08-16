@@ -588,3 +588,44 @@ def test_the_manager_module_passes_through_the_sandbox() -> None:
         "temporalio.contrib.external_workflow_streams._manager"
         in SandboxRestrictions.default.passthrough_modules
     )
+
+
+@pytest.mark.asyncio
+async def test_re_registering_a_wait_stops_the_watcher_it_replaced(
+    stream_key: StreamKey,
+) -> None:
+    """The replaced subscription is unreachable and must not keep polling.
+
+    Nothing else would notice: the new subscription works, records are
+    delivered, and the only symptom is a backend connection that never closes
+    and a task that outlives its Run -- visible, if at all, as a Worker whose
+    memory grows.
+    """
+    backend = MemoryStreamBackend()
+    notifier = RecordingNotifier()
+    manager = make_manager(backend, notifier)
+    try:
+        first = manager.register(
+            run_id="run-1",
+            wait_id=1,
+            stream_key=stream_key,
+            backend_name="tokens",
+        )
+        await asyncio.sleep(0.05)
+        assert first._watcher is not None and not first._watcher.done()
+
+        second = manager.register(
+            run_id="run-1",
+            wait_id=1,
+            stream_key=stream_key,
+            backend_name="tokens",
+        )
+        await asyncio.sleep(0.05)
+
+        assert first._cancelled, "the replaced subscription must be marked dead"
+        assert first._watcher.done(), "its watcher must be stopped, not orphaned"
+        assert second._watcher is not None and not second._watcher.done(), (
+            "the replacement's own watcher must still be running"
+        )
+    finally:
+        await manager.shutdown()
