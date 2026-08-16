@@ -274,6 +274,17 @@ class RedisStreamBackend(StreamBackend):
             return True
         return False
 
+    async def parked_wait_ids(self, key: StreamKey) -> list[int]:
+        prefix = f"{self.stream_key(key)}:park:"
+        found = []
+        # SCAN rather than KEYS: this runs on the producer's hot path after every
+        # append, and KEYS blocks the whole server for the length of the keyspace.
+        async for name in self._client.scan_iter(match=f"{prefix}*"):
+            suffix = _text(name)[len(prefix) :]
+            if suffix.isdigit():
+                found.append(int(suffix))
+        return sorted(found)
+
     async def current_park_generation(self, key: StreamKey, wait_id: int) -> int | None:
         intent = await self.park_intent(key, wait_id)
         return None if intent is None else intent.park_generation

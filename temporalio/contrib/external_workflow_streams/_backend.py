@@ -284,6 +284,21 @@ class StreamBackend(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def parked_wait_ids(self, key: StreamKey) -> list[int]:
+        """Every subscription with an installed intent on this stream.
+
+        A producer knows the stream it published to and nothing about the
+        Workflow's subscriptions -- ``wait_id`` is allocated by a per-Run counter
+        inside ``subscribe()``, which no producer can see. The other five
+        parking operations all take a ``wait_id``, so without this one a producer
+        that has just appended has no way to address a wake at all.
+
+        Enumeration rather than a new concept: intents are already keyed
+        ``(stream key, wait_id)``, and this is the ``wait_id`` half of that key
+        for one stream.
+        """
+
+    @abc.abstractmethod
     async def current_park_generation(self, key: StreamKey, wait_id: int) -> int | None:
         """The generation a producer should name in its wake Signal.
 

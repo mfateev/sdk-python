@@ -30,6 +30,7 @@ can disagree about the name.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Generic
 
 import temporalio.activity
@@ -44,7 +45,21 @@ from temporalio.contrib.external_workflow_streams._record import (
     RecordKind,
     StreamRecord,
 )
+from temporalio.contrib.external_workflow_streams._wake import (
+    WakeRequest,
+    send_wake_signal,
+    wake_request_for,
+)
 from temporalio.types import AnyType
+
+DEFAULT_WAKE_CLAIM_LEASE = timedelta(seconds=30)
+"""Long enough to cover a Signal round trip, short enough to recover from a crash.
+
+The lease is what makes a claim safe to take: a producer that dies between
+claiming and signaling strands the generation, and every other producer would
+otherwise conclude the wake was already handled and stay silent -- leaving the
+Workflow parked with data sitting in the stream.
+"""
 
 if TYPE_CHECKING:
     import temporalio.client
@@ -52,8 +67,25 @@ if TYPE_CHECKING:
 __all__ = [
     "ExternalStreamProducer",
     "ExternalStreamProducerTopic",
+    "WakeNotAcknowledgedError",
     "WorkflowChainKey",
 ]
+
+
+class WakeNotAcknowledgedError(Exception):
+    """The record is durable but the wake step did not complete.
+
+    Raised rather than swallowed, because the two halves fail differently and the
+    caller can only act on one of them: the append has already succeeded and must
+    not be retried, while the wake must be. Retrying the wake with the same
+    inputs is safe -- it derives the same request ID and the server deduplicates
+    it -- so this is a resumable state, not a lost record.
+    """
+
+    def __init__(self, message: str, *, pending: list[WakeRequest]) -> None:
+        super().__init__(message)
+        self.pending = pending
+        """The wakes still owed, ready to be retried verbatim."""
 
 
 @dataclass(frozen=True)
@@ -133,6 +165,7 @@ class ExternalStreamProducer:
         self._session_id = session_id
         self._client = client
         self._sequence = 0
+        self._wake_counter = 0
 
     @staticmethod
     async def connect(
@@ -194,6 +227,18 @@ class ExternalStreamProducer:
             codec=StreamPayloadCodec(self._data_converter, type),
         )
 
+    def _next_wake_counter(self) -> int:
+        """Distinguishes this sender's unparked wakes from each other.
+
+        An unparked wake names generation 0, which carries no attempt identity,
+        so without a per-sender counter every unparked wake from one sender would
+        derive the same request ID and the server would deduplicate all but the
+        first away. Held fixed across *retries* of one attempt -- it advances per
+        attempt, not per send.
+        """
+        self._wake_counter += 1
+        return self._wake_counter
+
     def _next_sequence(self) -> int:
         """The next sequence number in this producer session.
 
@@ -249,6 +294,127 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
         placed = await self._producer._backend.append(self._stream_key, record)
         assert placed.offset is not None
         return placed.offset
+
+    async def wake(
+        self,
+        *,
+        lease: timedelta = DEFAULT_WAKE_CLAIM_LEASE,
+    ) -> list[str]:
+        """Step 2 and 3 of the send sequence: observe or claim, then Signal.
+
+        Only ever called **after** a successful append -- only successfully
+        appended records may trigger wakeup, since a wake for a record that did
+        not land produces a Workflow Task that finds nothing.
+
+        For each subscription parked on this stream, the current generation is
+        claimed under a renewable lease. Losing the claim means another producer
+        holds it and will send the Signal, so this one stays silent: that is the
+        whole purpose of claiming, and duplicate Signals -- while harmless -- are
+        what it exists to avoid. A provider that cannot lease declares
+        ``supports_leased_claims = False``, always grants, and every producer
+        signals.
+
+        Subscriptions with no installed intent get an *unparked* wake rather than
+        nothing (ADR-023). The Workflow may be cached with no open Workflow Task,
+        or evicted; neither is visible from out here, and staying silent in
+        either case loses the record until something else happens to wake the
+        Workflow.
+
+        Returns:
+            The request ID of each Signal sent, which may be empty when every
+            claim was already held elsewhere.
+
+        Raises:
+            WakeNotAcknowledgedError: A Signal failed. The record is durable;
+                the wake is not. ``.pending`` carries the wakes still owed.
+        """
+        producer = self._producer
+        if producer._client is None:
+            raise RuntimeError(
+                "waking requires a Temporal client, and this producer was built "
+                "without one. Use ExternalStreamProducer.connect(), which "
+                "requires it."
+            )
+
+        backend = producer._backend
+        parked = await backend.parked_wait_ids(self._stream_key)
+        # An unparked wake still needs a wait id for the envelope; 0 is the
+        # "no particular subscription" value, and Python rechecks every active
+        # subscription on wakeup regardless of which one the Signal named.
+        targets: list[tuple[int, int | None]] = [
+            (wait_id, await backend.current_park_generation(self._stream_key, wait_id))
+            for wait_id in parked
+        ]
+        if not targets:
+            targets = [(0, None)]
+
+        requests: list[WakeRequest] = []
+        for wait_id, generation in targets:
+            if generation is not None and not await backend.claim_park_generation(
+                self._stream_key,
+                wait_id,
+                generation,
+                claimant=producer.session_id,
+                lease=lease,
+            ):
+                continue
+            requests.append(
+                wake_request_for(
+                    producer.workflow,
+                    stream_name=self._stream_key.stream_name,
+                    wait_id=wait_id,
+                    park_generation=generation,
+                    sender_identity=producer.session_id,
+                    wake_counter=(
+                        producer._next_wake_counter() if generation is None else 0
+                    ),
+                )
+            )
+
+        sent: list[str] = []
+        for index, request in enumerate(requests):
+            try:
+                sent.append(
+                    await send_wake_signal(
+                        producer._client,
+                        request,
+                        producer_session_id=producer.session_id,
+                    )
+                )
+            except Exception as err:
+                raise WakeNotAcknowledgedError(
+                    f"the record was appended but its wake was not acknowledged: "
+                    f"{err}. Retrying with the same request is safe -- it derives "
+                    "the same request ID and the server deduplicates it.",
+                    pending=requests[index:],
+                ) from err
+        return sent
+
+    async def retry_wake(self, pending: list[WakeRequest]) -> list[str]:
+        """Re-sends the wakes a failed attempt still owed.
+
+        Takes the requests verbatim rather than recomputing them: recomputing
+        would draw a fresh wake counter for an unparked wake, derive a different
+        request ID, and defeat the deduplication that makes the retry safe.
+        """
+        producer = self._producer
+        assert producer._client is not None
+        sent: list[str] = []
+        for index, request in enumerate(pending):
+            try:
+                sent.append(
+                    await send_wake_signal(
+                        producer._client,
+                        request,
+                        producer_session_id=producer.session_id,
+                    )
+                )
+            except Exception as err:
+                raise WakeNotAcknowledgedError(
+                    f"the wake retry did not complete: {err}",
+                    pending=pending[index:],
+                ) from err
+        return sent
 
     async def finish_writing(self) -> Offset:
         """Appends an ordered write fence. **Does not close the stream.**

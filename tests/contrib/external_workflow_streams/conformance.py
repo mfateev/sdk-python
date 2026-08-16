@@ -435,6 +435,46 @@ async def check_intents_are_keyed_by_stream_and_wait_id(
     assert got_first.cursor != got_second.cursor  # type: ignore[union-attr]
 
 
+async def check_every_parked_subscription_is_enumerable(
+    backend: StreamBackend, key: StreamKey
+) -> None:
+    """A producer must be able to find every wait it has to wake.
+
+    ``wait_id`` is allocated by a per-Run counter inside ``subscribe()``, which no
+    producer can see, and the other five parking operations all take one. A
+    provider that enumerates only the most recent intent, or only distinct
+    streams, leaves the subscriptions it omits parked on records already sitting
+    in the stream.
+    """
+    other = StreamKey(
+        key.namespace, key.workflow_id, key.first_execution_run_id, "another-stream"
+    )
+    await backend.install_park_intent(
+        key, ParkIntent(1, BEGINNING, park_generation=4, run_id="run-a")
+    )
+    await backend.install_park_intent(
+        key, ParkIntent(2, AFTER(Offset("100-0")), park_generation=4, run_id="run-a")
+    )
+    await backend.install_park_intent(
+        other, ParkIntent(3, BEGINNING, park_generation=4, run_id="run-a")
+    )
+
+    found = await backend.parked_wait_ids(key)
+
+    assert sorted(found) == [1, 2], (
+        f"expected both parked subscriptions on this stream, got {found!r}"
+    )
+    assert 3 not in found, (
+        "enumeration must be per stream: waking a subscription parked on a "
+        "different stream produces a Workflow Task that finds nothing there"
+    )
+
+    # And a removed intent stops being enumerable, or a producer keeps signaling
+    # a wait that has already been resolved.
+    await backend.remove_park_intent(key, 1)
+    assert await backend.parked_wait_ids(key) == [2]
+
+
 async def check_an_intent_is_removable_and_removal_is_idempotent(
     backend: StreamBackend, key: StreamKey
 ) -> None:
@@ -627,6 +667,7 @@ async def check_observe_only_providers_always_grant(
 #: contract before the parking extension.
 PARKING_CONFORMANCE_CHECKS: list[Check] = [
     check_intents_are_keyed_by_stream_and_wait_id,
+    check_every_parked_subscription_is_enumerable,
     check_an_intent_is_removable_and_removal_is_idempotent,
     check_a_new_runs_intent_replaces_its_predecessors,
     check_recheck_sees_an_append_past_the_cursor,

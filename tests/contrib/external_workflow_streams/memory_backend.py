@@ -132,6 +132,9 @@ class MemoryStreamBackend(StreamBackend):
         self._intents.pop((key, wait_id), None)
         self._claims.pop((key, wait_id), None)
 
+    async def parked_wait_ids(self, key: StreamKey) -> list[int]:
+        return sorted(wait_id for (stored, wait_id) in self._intents if stored == key)
+
     async def park_intent(self, key: StreamKey, wait_id: int) -> ParkIntent | None:
         return self._intents.get((key, wait_id))
 
@@ -176,6 +179,18 @@ class MemoryStreamBackend(StreamBackend):
         return None if intent is None else intent.park_generation
 
     # --- test affordances ---------------------------------------------------
+
+    async def expire_claims_for_test(self) -> None:
+        """Ages every claim past its lease.
+
+        Stands in for a producer that crashed between claiming and signaling --
+        the failure the lease exists for -- without making the test wait out a
+        real lease.
+        """
+        self._claims = {
+            key: (holder, generation, 0.0)
+            for key, (holder, generation, _) in self._claims.items()
+        }
 
     async def delete_for_test(self, key: StreamKey, offset: Offset) -> None:
         """Removes a record, standing in for XDEL, trimming, or retention loss.

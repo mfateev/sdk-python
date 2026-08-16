@@ -116,6 +116,20 @@ class NonExpiringClaimBackend(MemoryStreamBackend):
         return True
 
 
+class LastIntentOnlyBackend(MemoryStreamBackend):
+    """Enumerates only the most recently installed intent.
+
+    A plausible implementation for a provider that tracks "the" park per stream,
+    and it looks correct until a Workflow subscribes to one stream twice: the
+    subscription it omits stays parked on records already sitting in the stream,
+    and nothing ever wakes it because no producer knows it exists.
+    """
+
+    async def parked_wait_ids(self, key: StreamKey) -> list[int]:
+        matching = [wait_id for (stored, wait_id) in self._intents if stored == key]
+        return matching[-1:]
+
+
 class BlindRecheckBackend(MemoryStreamBackend):
     """Rechecks against the stream's state when the intent was installed."""
 
@@ -138,6 +152,12 @@ class BlindRecheckBackend(MemoryStreamBackend):
             conformance.check_an_expired_claim_is_taken_over,
             "expired claim was not taken over",
             id="claim-never-expires",
+        ),
+        pytest.param(
+            LastIntentOnlyBackend,
+            conformance.check_every_parked_subscription_is_enumerable,
+            "expected both parked subscriptions",
+            id="enumerates-only-the-last-intent",
         ),
         pytest.param(
             BlindRecheckBackend,
