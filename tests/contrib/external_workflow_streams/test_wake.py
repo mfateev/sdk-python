@@ -270,7 +270,7 @@ async def test_a_producer_that_finds_a_wakeable_generation_sends_exactly_one_sig
     topic = make_producer(backend, client).topic("tokens", type=str)
     await park(backend, topic.stream_key, wait_id=1, gen=4)
 
-    await topic.publish("a")
+    await topic.publish("a", wake=False)
     sent = await topic.wake()
 
     assert len(sent) == 1
@@ -293,7 +293,7 @@ async def test_a_producer_that_loses_the_claim_stays_silent() -> None:
 
     client = RecordingClient()
     topic = make_producer(backend, client).topic("tokens", type=str)
-    await topic.publish("a")
+    await topic.publish("a", wake=False)
 
     assert await topic.wake() == []
     assert client.sent == []
@@ -317,7 +317,7 @@ async def test_an_expired_claim_is_taken_over_rather_than_stranding_the_wake() -
 
     client = RecordingClient()
     topic = make_producer(backend, client).topic("tokens", type=str)
-    await topic.publish("a")
+    await topic.publish("a", wake=False)
 
     assert len(await topic.wake()) == 1, "an expired claim must be takeable"
 
@@ -333,7 +333,7 @@ async def test_a_stream_with_no_park_intent_gets_an_unparked_wake() -> None:
     client = RecordingClient()
     topic = make_producer(backend, client).topic("tokens", type=str)
 
-    await topic.publish("a")
+    await topic.publish("a", wake=False)
     assert len(await topic.wake()) == 1
 
     envelope = WakeSignal()
@@ -353,7 +353,7 @@ async def test_two_subscriptions_to_one_stream_are_woken_independently() -> None
     await park(backend, topic.stream_key, wait_id=1, gen=4)
     await park(backend, topic.stream_key, wait_id=2, gen=4)
 
-    await topic.publish("a")
+    await topic.publish("a", wake=False)
     await topic.wake()
 
     woken = []
@@ -377,7 +377,7 @@ async def test_a_failed_wake_reports_unacknowledged_and_the_retry_completes_it()
     client = RecordingClient(fail=True)
     topic = make_producer(backend, client).topic("tokens", type=str)
     await park(backend, topic.stream_key, wait_id=1, gen=4)
-    offset = await topic.publish("a")
+    offset = await topic.publish("a", wake=False)
 
     with pytest.raises(WakeNotAcknowledgedError) as caught:
         await topic.wake()
@@ -397,7 +397,7 @@ async def test_a_retried_wake_reuses_the_original_request_id() -> None:
     backend = MemoryStreamBackend()
     client = RecordingClient(fail=True)
     topic = make_producer(backend, client).topic("tokens", type=str)
-    await topic.publish("a")
+    await topic.publish("a", wake=False)
 
     with pytest.raises(WakeNotAcknowledgedError) as caught:
         await topic.wake()
@@ -453,3 +453,105 @@ def test_the_python_constants_match_cores() -> None:
         assert re.search(rf"{name}:\s*\S+\s*=\s*{re.escape(value)}\s*;", source), (
             f"{name} is {value} in Python but Core declares something else"
         )
+
+
+# --- P6b: publish()'s acknowledged-wake contract ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_publish_completes_only_once_its_wake_is_acknowledged() -> None:
+    """Returning means durable *and* signalled, which is the whole contract.
+
+    An append that lands but is never signalled leaves the Workflow parked on
+    data already sitting in the stream -- and a publish() that returned success
+    there would be reporting a delivery that never happened.
+    """
+    backend = MemoryStreamBackend()
+    client = RecordingClient()
+    topic = make_producer(backend, client).topic("tokens", type=str)
+    await park(backend, topic.stream_key, wait_id=1, gen=4)
+
+    offset = await topic.publish("a")
+
+    assert offset is not None
+    assert len(client.sent) == 1, "publish must not return before it has signalled"
+
+
+@pytest.mark.asyncio
+async def test_a_publish_whose_wake_fails_reports_unacknowledged() -> None:
+    """Not success. This is the "durable producer" row of the boundary table."""
+    backend = MemoryStreamBackend()
+    client = RecordingClient(fail=True)
+    topic = make_producer(backend, client).topic("tokens", type=str)
+    await park(backend, topic.stream_key, wait_id=1, gen=4)
+
+    with pytest.raises(WakeNotAcknowledgedError) as caught:
+        await topic.publish("a")
+
+    assert caught.value.offset is not None, (
+        "the caller has no other way to learn that the append it must not retry "
+        "did succeed"
+    )
+    assert caught.value.pending
+
+
+@pytest.mark.asyncio
+async def test_retrying_the_wake_completes_an_unacknowledged_publish() -> None:
+    """And appends nothing: only the half that failed is retried."""
+    backend = MemoryStreamBackend()
+    client = RecordingClient(fail=True)
+    topic = make_producer(backend, client).topic("tokens", type=str)
+    await park(backend, topic.stream_key, wait_id=1, gen=4)
+
+    with pytest.raises(WakeNotAcknowledgedError) as caught:
+        await topic.publish("a")
+    before = await backend.read_after(
+        topic.stream_key, BEGINNING, max_records=100, block=None
+    )
+
+    client.fail = False
+    assert len(await topic.retry_wake(caught.value.pending)) == 1
+
+    after = await backend.read_after(
+        topic.stream_key, BEGINNING, max_records=100, block=None
+    )
+    assert [r.offset for r in after] == [r.offset for r in before], (
+        "the retry must complete the wake without re-appending the record"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_unacknowledged_state_is_explicit_not_hidden() -> None:
+    """``wake=False`` says "durable but un-signalled" in the call itself.
+
+    The point is that a caller cannot end up in that state by accident -- it is
+    reachable only by asking for it, or by a wake that failed loudly.
+    """
+    backend = MemoryStreamBackend()
+    client = RecordingClient()
+    topic = make_producer(backend, client).topic("tokens", type=str)
+    await park(backend, topic.stream_key, wait_id=1, gen=4)
+
+    await topic.publish("a", wake=False)
+    assert client.sent == []
+
+    await topic.wake()
+    assert len(client.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_fence_is_signalled_too() -> None:
+    """It is the record most likely to find the Workflow parked.
+
+    A fence is what a producer appends when it has nothing more to say, so an
+    unsignalled one strands the Workflow for its whole idle timeout at exactly
+    the moment it was waiting to be told.
+    """
+    backend = MemoryStreamBackend()
+    client = RecordingClient()
+    topic = make_producer(backend, client).topic("tokens", type=str)
+    await park(backend, topic.stream_key, wait_id=1, gen=4)
+
+    await topic.finish_writing()
+
+    assert len(client.sent) == 1

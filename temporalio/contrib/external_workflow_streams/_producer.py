@@ -86,6 +86,13 @@ class WakeNotAcknowledgedError(Exception):
         super().__init__(message)
         self.pending = pending
         """The wakes still owed, ready to be retried verbatim."""
+        self.offset: Offset | None = None
+        """Where the record landed, when raised from :meth:`publish`.
+
+        Set because the two halves fail differently and the caller can only act
+        on one of them: the append succeeded and must not be retried, the wake
+        did not and must be.
+        """
 
 
 @dataclass(frozen=True)
@@ -273,17 +280,45 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
     def stream_key(self) -> StreamKey:
         return self._stream_key
 
-    async def publish(self, value: AnyType) -> Offset:
-        """Appends one record and returns where it landed.
+    async def publish(
+        self,
+        value: AnyType,
+        *,
+        wake: bool = True,
+        lease: timedelta = DEFAULT_WAKE_CLAIM_LEASE,
+    ) -> Offset:
+        """Appends one record and completes only once its wake is acknowledged.
 
         Idempotent under Activity retry through ``(session_id, sequence)``:
         re-appending byte-identical content is a no-op returning the original
         offset, and the same key with *different* bytes is an error rather than
         an overwrite.
 
-        This **stops at the append.** It does not provide the acknowledged-wake
-        contract -- ``publish()`` completing here means the record is durable in
-        the backend, not that a parked Workflow has been woken.
+        **Returning means the record is durable and a parked Workflow has been
+        told about it.** That combination is what makes the "durable producer"
+        row of the wakeup-durability boundary true. An append that lands but is
+        never signalled leaves the Workflow parked on data already sitting in the
+        stream, and a ``publish()`` that returned success there would report a
+        delivery that never happened.
+
+        The wake happens after the append and never instead of it: only
+        successfully appended records may trigger wakeup, since a wake for a
+        record that did not land produces a Workflow Task that finds nothing.
+
+        Args:
+            wake: Set ``False`` to append without waking, then call :meth:`wake`
+                once for the batch. The wake is idempotent either way -- the
+                claim holder re-derives the same request ID and the server
+                deduplicates -- so this saves round trips rather than changing
+                the outcome. The record is durable but **un-signalled** until
+                that call completes, which is the un-acknowledged state made
+                explicit rather than hidden.
+
+        Raises:
+            WakeNotAcknowledgedError: The record is durable; the wake is not.
+                ``.offset`` says where the record landed and ``.pending`` carries
+                the wakes still owed, so the caller retries the half that failed
+                rather than re-appending the half that did not.
         """
         record = StreamRecord(
             kind=RecordKind.DATA,
@@ -293,6 +328,14 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
         )
         placed = await self._producer._backend.append(self._stream_key, record)
         assert placed.offset is not None
+        if wake:
+            try:
+                await self.wake(lease=lease)
+            except WakeNotAcknowledgedError as err:
+                # Re-raised carrying the offset: the caller has no other way to
+                # learn that the append it must *not* retry did succeed.
+                err.offset = placed.offset
+                raise
         return placed.offset
 
     async def wake(
@@ -416,7 +459,12 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
                 ) from err
         return sent
 
-    async def finish_writing(self) -> Offset:
+    async def finish_writing(
+        self,
+        *,
+        wake: bool = True,
+        lease: timedelta = DEFAULT_WAKE_CLAIM_LEASE,
+    ) -> Offset:
         """Appends an ordered write fence. **Does not close the stream.**
 
         The fence means only: every write in *this* producer session preceding
@@ -436,6 +484,16 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
         )
         placed = await self._producer._backend.append(self._stream_key, fence)
         assert placed.offset is not None
+        if wake:
+            # A fence is the record most likely to find the Workflow parked --
+            # it is what a producer appends when it has nothing more to say --
+            # so an unsignalled one strands the Workflow for its whole idle
+            # timeout at exactly the moment it was waiting to be told.
+            try:
+                await self.wake(lease=lease)
+            except WakeNotAcknowledgedError as err:
+                err.offset = placed.offset
+                raise
         return placed.offset
 
 

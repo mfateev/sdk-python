@@ -173,8 +173,8 @@ async def test_an_activity_and_a_plain_process_publish_under_one_verified_key(
                     backend=backend, workflow=chain, client=client
                 )
                 tokens = producer.topic("tokens", type=str)
-                await tokens.publish("from-activity")
-                await tokens.finish_writing()
+                await tokens.publish("from-activity", wake=False)
+                await tokens.finish_writing(wake=False)
                 return producer.session_id
 
             env = ActivityEnvironment()
@@ -195,7 +195,7 @@ async def test_an_activity_and_a_plain_process_publish_under_one_verified_key(
                 client=client,
                 session_id="standalone-script",
             )
-            await plain.topic("tokens", type=str).publish("from-script")
+            await plain.topic("tokens", type=str).publish("from-script", wake=False)
 
             records = backend.all_records(chain.stream_key("tokens"))
             assert [r.kind for r in records] == [
@@ -234,7 +234,7 @@ async def test_records_are_appended_in_order(backend: MemoryStreamBackend) -> No
     tokens = _offline_producer(backend).topic("tokens", type=str)
 
     for value in ["a", "b", "c"]:
-        await tokens.publish(value)
+        await tokens.publish(value, wake=False)
 
     records = backend.all_records(StreamKey("ns", "wf", "run-1", "tokens"))
     assert [r.sequence for r in records] == [0, 1, 2]
@@ -246,9 +246,9 @@ async def test_a_fence_takes_its_place_in_the_sequence(
 ) -> None:
     tokens = _offline_producer(backend).topic("tokens", type=str)
 
-    await tokens.publish("a")
-    await tokens.finish_writing()
-    await tokens.publish("b")
+    await tokens.publish("a", wake=False)
+    await tokens.finish_writing(wake=False)
+    await tokens.publish("b", wake=False)
 
     records = backend.all_records(StreamKey("ns", "wf", "run-1", "tokens"))
     assert [r.kind for r in records] == [
@@ -265,14 +265,14 @@ async def test_a_retried_attempt_appends_no_duplicate(
     key = StreamKey("ns", "wf", "run-1", "tokens")
 
     first = _offline_producer(backend, "attempt-stable").topic("tokens", type=str)
-    await first.publish("a")
-    await first.publish("b")
+    await first.publish("a", wake=False)
+    await first.publish("b", wake=False)
 
     # The Activity is retried: a fresh producer, the *same* session id, and the
     # same values published again from the top.
     retried = _offline_producer(backend, "attempt-stable").topic("tokens", type=str)
-    await retried.publish("a")
-    await retried.publish("b")
+    await retried.publish("a", wake=False)
+    await retried.publish("b", wake=False)
 
     assert len(backend.all_records(key)) == 2
 
@@ -282,11 +282,11 @@ async def test_republishing_different_content_under_one_key_is_an_error(
 ) -> None:
     """Silently accepting it would rewrite what a consumer may have delivered."""
     first = _offline_producer(backend, "same-session").topic("tokens", type=str)
-    await first.publish("a")
+    await first.publish("a", wake=False)
 
     retried = _offline_producer(backend, "same-session").topic("tokens", type=str)
     with pytest.raises(AppendConflictError):
-        await retried.publish("changed")
+        await retried.publish("changed", wake=False)
 
 
 async def test_sequences_are_per_connection_not_per_topic(
@@ -297,8 +297,8 @@ async def test_sequences_are_per_connection_not_per_topic(
     tokens = producer.topic("tokens", type=str)
     events = producer.topic("tool-events", type=str)
 
-    await tokens.publish("a")
-    await events.publish("b")
+    await tokens.publish("a", wake=False)
+    await events.publish("b", wake=False)
 
     (token_record,) = backend.all_records(StreamKey("ns", "wf", "run-1", "tokens"))
     (event_record,) = backend.all_records(StreamKey("ns", "wf", "run-1", "tool-events"))
@@ -327,8 +327,8 @@ async def test_a_standalone_read_back_sees_what_was_published(
     """The P6 criterion, without a Temporal server in the picture."""
     tokens = _offline_producer(backend).topic("tokens", type=str)
     for value in ["a", "b", "c"]:
-        await tokens.publish(value)
-    await tokens.finish_writing()
+        await tokens.publish(value, wake=False)
+    await tokens.finish_writing(wake=False)
 
     key = StreamKey("ns", "wf", "run-1", "tokens")
     read_back = await backend.read_after(key, BEGINNING, max_records=100, block=None)
