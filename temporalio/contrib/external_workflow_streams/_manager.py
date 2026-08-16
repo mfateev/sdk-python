@@ -53,6 +53,7 @@ from datetime import timedelta
 from typing import Any
 
 from temporalio.contrib.external_workflow_streams._backend import (
+    ParkIntent,
     StreamBackend,
     StreamKey,
 )
@@ -242,6 +243,10 @@ class StreamSubscriptionManager:
         self._buffer_size = buffer_size
         self._watch_block = watch_block
         self._runs: dict[str, dict[int, Subscription]] = {}
+        # The loop the watchers run on, captured at construction because that is
+        # the Worker's loop. `register` is called from the *Workflow executor
+        # thread*, which has no loop of its own and must never touch this one
+        # directly.
         self._loop = asyncio.get_event_loop()
         self._shutting_down = False
 
@@ -273,8 +278,18 @@ class StreamSubscriptionManager:
             prefetch_cursor=start_cursor,
         )
         self._runs.setdefault(run_id, {})[wait_id] = subscription
-        subscription._watcher = self._loop.create_task(self._watch(subscription))
+        # `create_task` is not thread-safe, and this runs on the Workflow
+        # executor thread. Scheduling the start onto the manager's loop is the
+        # difference between a watcher that runs and one that is silently never
+        # scheduled -- which looks exactly like a stream that never delivers.
+        self._loop.call_soon_threadsafe(self._start_watcher, subscription)
         return subscription
+
+    def _start_watcher(self, subscription: Subscription) -> None:
+        """Starts a watcher on the manager's own loop."""
+        if subscription._cancelled or subscription._watcher is not None:
+            return
+        subscription._watcher = self._loop.create_task(self._watch(subscription))
 
     def subscription(self, run_id: str, wait_id: int) -> Subscription | None:
         return self._runs.get(run_id, {}).get(wait_id)
@@ -384,6 +399,67 @@ class StreamSubscriptionManager:
             self._runs.get(subscription.run_id, {}).pop(subscription.wait_id, None)
         # PARKED and NO_OPEN_WORKFLOW_TASK both *keep* the watcher: the Run is
         # still cached and this is the normal window between Workflow Tasks.
+
+    # --- the runtime-only jobs' backend work (P19) --------------------------
+
+    async def prepare_park(
+        self, run_id: str, park_generation: int, blocked: Mapping[int, Cursor]
+    ) -> bool:
+        """Installs park intents, then rechecks every stream.
+
+        Returns ``True`` if any stream became ready, which abandons this parking
+        generation.
+
+        The order is what closes the append/park race: a producer appends its
+        record *before* it observes the park generation, so an append is either
+        seen by the recheck below or paired with a wake Signal. Rechecking
+        before all the intents were installed would leave a window where it is
+        neither.
+        """
+        subscriptions = self.subscriptions(run_id)
+        for subscription in subscriptions:
+            await subscription.backend.install_park_intent(
+                subscription.stream_key,
+                ParkIntent(
+                    wait_id=subscription.wait_id,
+                    cursor=blocked.get(
+                        subscription.wait_id, subscription.delivery_cursor
+                    ),
+                    park_generation=park_generation,
+                    run_id=run_id,
+                ),
+            )
+
+        became_ready = False
+        for subscription in subscriptions:
+            if await subscription.backend.recheck(
+                subscription.stream_key, subscription.wait_id
+            ):
+                became_ready = True
+                break
+
+        if became_ready:
+            # All-or-nothing: a park confirmed for a set with a ready member
+            # would lose that member's record until a producer happened to
+            # signal, so every intent installed above comes back out.
+            for subscription in subscriptions:
+                await subscription.backend.remove_park_intent(
+                    subscription.stream_key, subscription.wait_id
+                )
+        return became_ready
+
+    async def prepare_replay(self, run_id: str, replay_annotation: bytes) -> None:
+        """Fills and validates the recorded ranges before delivery.
+
+        Left to P13, which owns the read path and the four range checks. The
+        job is still partitioned here rather than in ``_apply`` because that is
+        where the reads must happen whatever they turn out to be -- an inclusive
+        range read over a whole recorded batch is exactly the multi-second
+        operation the deadlock timeout cannot accommodate.
+        """
+        raise NotImplementedError(
+            "the external stream replay read path is not implemented yet (P13)"
+        )
 
     # --- teardown -----------------------------------------------------------
 

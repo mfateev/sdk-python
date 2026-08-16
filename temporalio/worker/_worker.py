@@ -589,6 +589,7 @@ class Worker:
                 encode_headers=client_config["header_codec_behavior"]
                 != HeaderCodecBehavior.NO_CODEC,
                 max_workflow_task_external_storage_concurrency=max_workflow_task_external_storage_concurrency,
+                external_stream_backends=self._external_stream_backends,
             )
 
         tuner = config.get("tuner")

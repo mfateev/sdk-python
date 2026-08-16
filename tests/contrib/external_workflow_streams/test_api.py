@@ -38,6 +38,9 @@ class FakeRuntime:
         self.registered = registered_backends or {"tokens-redis"}
         self.registrations: list[tuple[int, StreamKey, str]] = []
         self.buffers: dict[int, list[StreamRecord]] = {}
+        self.deliveries: list[tuple[int, StreamRecord]] = []
+        self.blocked: list[tuple[int, bool]] = []
+        self.pending: dict[int, asyncio.Future[None]] = {}
 
     def stream_key(self, stream_name: str) -> StreamKey:
         return StreamKey("ns", "wf", "first-run", stream_name)
@@ -61,6 +64,18 @@ class FakeRuntime:
 
     def new_readiness_future(self) -> asyncio.Future[None]:
         return asyncio.get_event_loop().create_future()
+
+    def record_delivery(self, wait_id: int, record: StreamRecord) -> None:
+        self.deliveries.append((wait_id, record))
+
+    def note_blocked(self, wait_id: int, blocked: bool) -> None:
+        self.blocked.append((wait_id, blocked))
+
+    def register_pending(self, wait_id: int, future: asyncio.Future[None]) -> None:
+        self.pending[wait_id] = future
+
+    def discard_pending(self, wait_id: int) -> None:
+        self.pending.pop(wait_id, None)
 
 
 class FakeInstance:

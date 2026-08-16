@@ -89,6 +89,26 @@ class ExternalStreamRuntime(Protocol):
         """
         ...
 
+    def record_delivery(self, wait_id: int, record: StreamRecord) -> None:
+        """Notes one record reaching the Workflow, in observed global order.
+
+        Called for control records too. They are never yielded, but they occupy
+        offsets inside a run, so the annotation has to know about them.
+        """
+        ...
+
+    def note_blocked(self, wait_id: int, blocked: bool) -> None:
+        """Records whether Workflow code is currently waiting on this wait."""
+        ...
+
+    def register_pending(self, wait_id: int, future: asyncio.Future[None]) -> None:
+        """Registers the future the readiness activation will resolve."""
+        ...
+
+    def discard_pending(self, wait_id: int) -> None:
+        """Forgets a future that is no longer being awaited."""
+        ...
+
 
 @dataclass
 class _RunState:
@@ -267,12 +287,18 @@ class ExternalStreamSubscription(Generic[AnyType]):
                 # Drain first, then block. Draining is a buffer pop and never
                 # touches the backend -- the record is already here or it is
                 # not, and if it is not, only Core can say when to look again.
-                self._ready = [
-                    record
-                    for record in self._state.runtime.drain(self._wait_id)  # type: ignore[union-attr]
-                    if not record.is_control
-                ]
+                assert self._state.runtime is not None
+                drained = self._state.runtime.drain(self._wait_id)
+                for record in drained:
+                    # Recorded for *every* record, control ones included: they
+                    # occupy offsets inside a run, so a run's count includes
+                    # them and their positions go in `control_positions`.
+                    # Omitting them would make replay's range read find more
+                    # records than the marker claims.
+                    self._state.runtime.record_delivery(self._wait_id, record)
+                self._ready = [r for r in drained if not r.is_control]
             if self._ready:
+                self._state.runtime.note_blocked(self._wait_id, False)  # type: ignore[union-attr]
                 yield await self._decode(self._ready.pop(0))
                 continue
             await self._await_readiness()
@@ -285,12 +311,16 @@ class ExternalStreamSubscription(Generic[AnyType]):
         arrived.
         """
         assert self._state.runtime is not None
+        # Entering the blocked state is what the wait generation counts, and is
+        # what later makes a readiness notification for *this* block
+        # distinguishable from one for a block already resolved.
+        self._state.runtime.note_blocked(self._wait_id, True)
         future = self._state.runtime.new_readiness_future()
-        self._state.pending[self._wait_id] = future
+        self._state.runtime.register_pending(self._wait_id, future)
         try:
             await future
         finally:
-            self._state.pending.pop(self._wait_id, None)
+            self._state.runtime.discard_pending(self._wait_id)
 
     async def _decode(self, record: StreamRecord) -> AnyType:
         assert self._state.runtime is not None

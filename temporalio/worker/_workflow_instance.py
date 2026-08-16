@@ -172,6 +172,16 @@ class WorkflowInstanceDetails:
     default_workflow_logic_flags: frozenset[_WorkflowLogicFlag] = field(
         default_factory=lambda: _DEFAULT_ENABLED_WORKFLOW_LOGIC_FLAGS
     )
+    external_stream_runtime: Any = None
+    """Opaque per-Run handle to the Worker's External Workflow Stream manager.
+
+    Crosses into the sandbox by reference, like the rest of these details, which
+    is the whole point: the manager owns the Worker's backend connections and
+    watcher tasks, and a copy re-created inside the sandbox would watch nothing.
+    Workflow code only ever sees this handle -- never a provider instance.
+
+    ``None`` when no ``external_stream_backends`` were registered on the Worker.
+    """
 
 
 class WorkflowInstance(ABC):
@@ -286,6 +296,7 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         )
 
         self._extern_functions = det.extern_functions
+        self._external_stream_runtime = det.external_stream_runtime
         self._disable_eager_activity_execution = det.disable_eager_activity_execution
         self._worker_level_failure_exception_types = (
             det.worker_level_failure_exception_types
@@ -520,6 +531,12 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
                     # be checked in patch jobs (first index) or query jobs (last
                     # index).
                     self._run_once(check_conditions=index == 1 or index == 2)
+
+            # Detected *after* the drain, not during it: `_run_once` already
+            # drains `self._ready` until empty, so "no coroutine is runnable" is
+            # its post-condition and quiescence is a registry check rather than
+            # an event-loop change.
+            self._emit_external_stream_commands()
         except Exception as err:
             # We want some errors during activation, like those that can happen
             # during payload conversion, to be able to fail the workflow not the
@@ -616,6 +633,10 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
             self._apply_remove_from_cache(job.remove_from_cache)
         elif job.HasField("resolve_activity"):
             self._apply_resolve_activity(job.resolve_activity)
+        elif job.HasField("resolve_external_stream_waits"):
+            self._apply_resolve_external_stream_waits(job.resolve_external_stream_waits)
+        elif job.HasField("replay_external_streams"):
+            self._apply_replay_external_streams(job.replay_external_streams)
         elif job.HasField("resolve_child_workflow_execution"):
             self._apply_resolve_child_workflow_execution(
                 job.resolve_child_workflow_execution
@@ -786,6 +807,42 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         if handle:
             self._ready.append(handle)
 
+    def _apply_resolve_external_stream_waits(
+        self,
+        job: temporalio.bridge.proto.workflow_activation.ResolveExternalStreamWaits,
+    ) -> None:
+        """Resumes every wait that has something buffered.
+
+        **Performs no I/O.** Everything this touches is already in memory: the
+        manager reported readiness only once a record was buffered, so the drain
+        that follows is bounded and cannot block. Reading the backend here would
+        put a multi-second transaction inside a synchronous activation running
+        under a 2-second deadlock timeout.
+
+        The job's ``ready_hints`` are hints, not an exhaustive availability
+        claim, so *every* active wait is resolved and left to find out for
+        itself whether anything arrived. Resolving only the hinted ones would
+        strand a record whose readiness notification was coalesced away.
+        """
+        del job  # The hints are deliberately unused; see above.
+        if self._external_stream_runtime is not None:
+            self._external_stream_runtime.resolve_all_pending()
+
+    def _apply_replay_external_streams(
+        self,
+        job: temporalio.bridge.proto.workflow_activation.ReplayExternalStreams,
+    ) -> None:
+        """Delivers a recorded marker's observations, from memory only.
+
+        The recorded ranges were read and validated before this activation was
+        handed to the Workflow thread, so by the time this runs the buffers are
+        already filled and this is indistinguishable from a live resolve --
+        which is exactly the point.
+        """
+        del job
+        if self._external_stream_runtime is not None:
+            self._external_stream_runtime.resolve_all_pending()
+
     def _apply_query_workflow(
         self, job: temporalio.bridge.proto.workflow_activation.QueryWorkflow
     ) -> None:
@@ -856,6 +913,12 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         # We consider eviction to be under replay so that certain code like
         # logging that avoids replaying doesn't run during eviction either
         self._is_replaying = True
+        # Drop the stream readiness futures before cancelling tasks. Nothing
+        # will ever resolve them now, and a coroutine cancelled while awaiting
+        # one would otherwise be woken by the cancellation and then find its
+        # future still registered.
+        if self._external_stream_runtime is not None:
+            self._external_stream_runtime.clear_pending()
         # Cancel everything
         for task in self._tasks:
             task.cancel()
@@ -2164,6 +2227,63 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         self._assert_not_read_only("add command")
         return self._current_completion.successful.commands.add()
 
+    def _emit_external_stream_commands(self) -> None:
+        """Answers the two independent questions every activation return poses.
+
+        1. **Did replay-visible stream state change?** If so a
+           ``WorkflowStreamProgress`` carries the observation delta, on *every*
+           completion path. This is what commits the cursor boundary, and it is
+           not conditional on why the Workflow Task ended: if a consumed record
+           influenced a command that lands in History while the consumption
+           itself is never marked, replay re-delivers that record while the
+           command it produced is already durable.
+        2. **Should the Workflow Task be retained?** If so a
+           ``WorkflowStreamQuiescent`` asks Core to hold it open. It carries no
+           annotation data; the two questions are genuinely separate.
+
+        The progress command is emitted **first**, because it must precede every
+        command whose value could depend on the consumed data -- on replay that
+        is what guarantees a record is validated before the command derived from
+        it is matched.
+        """
+        runtime = self._external_stream_runtime
+        if runtime is None or self._deleting:
+            return
+
+        # Ordering: the progress command goes in before anything the workflow
+        # itself produced this activation, so it is inserted at the front rather
+        # than appended.
+        commands = self._current_completion.successful.commands
+        produced_commands = len(commands) > 0
+
+        delta = runtime.take_observation_delta()
+        if delta is not None:
+            progress = temporalio.bridge.proto.workflow_commands.WorkflowCommand()
+            progress.workflow_stream_progress.observation_delta = delta
+            progress.workflow_stream_progress.request_rollover = (
+                runtime.request_rollover
+            )
+            commands.insert(0, progress)
+
+        # Retention is asked for only when nothing server-bound rides along. A
+        # completion carrying a timer, activity, child workflow, or signal must
+        # be reported so the server can act on it; the subscriptions stay
+        # registered and the wake Signal covers the window that leaves.
+        if produced_commands:
+            return
+        snapshot = runtime.quiescent_snapshot()
+        if not snapshot:
+            return
+
+        quiescent = self._add_command().workflow_stream_quiescent
+        quiescent.quiescence_generation = 0
+        quiescent.idle_timeout.FromTimedelta(runtime.effective_idle_timeout())
+        for wait in snapshot:
+            entry = quiescent.waits.add()
+            entry.wait_id = wait.wait_id
+            entry.generation = wait.generation
+            entry.immediately_parkable = wait.immediately_parkable
+
     def _workflow_logic_flag_enabled(self, flag: _WorkflowLogicFlag) -> bool:
         if flag in self._current_internal_flags:
             return True
@@ -2470,6 +2590,17 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
             workflow_instance = self._defn.cls(*self._workflow_input.args)
         else:
             workflow_instance = self._defn.cls()
+
+        # Hand the workflow object its External Stream handle. It goes on the
+        # object rather than in a module global because per-Run state must share
+        # the Run's lifetime exactly -- a global would outlive an evicted Run and
+        # hand its wait ids to the next one.
+        if self._external_stream_runtime is not None:
+            from temporalio.contrib.external_workflow_streams._api import (
+                _install_runtime,
+            )
+
+            _install_runtime(workflow_instance, self._external_stream_runtime)
 
         if self._defn.versioning_behavior:
             self._versioning_behavior = self._defn.versioning_behavior

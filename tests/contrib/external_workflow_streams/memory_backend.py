@@ -103,6 +103,12 @@ class MemoryStreamBackend(StreamBackend):
                 await asyncio.wait_for(waiter, deadline)
             except asyncio.TimeoutError:
                 return []
+            finally:
+                # `wait_for` cancels the outer future but the inner `Event.wait`
+                # task survives it, and a leaked one keeps the event's waiter
+                # list growing for the life of the process.
+                if not waiter.done():
+                    waiter.cancel()
 
     def _after(self, key: StreamKey, after: Cursor) -> list[StreamRecord]:
         stream = self._records.get(key, [])

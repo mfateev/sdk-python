@@ -9,10 +9,11 @@ import logging
 import os
 import sys
 import threading
-from collections.abc import Awaitable, Callable, MutableMapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from datetime import timezone
 from types import TracebackType
+from typing import Any
 
 import temporalio.api.common.v1
 import temporalio.bridge.proto.common
@@ -104,6 +105,7 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         encode_headers: bool,
         max_workflow_task_external_storage_concurrency: int,
         default_workflow_logic_flags: frozenset[_WorkflowLogicFlag] | None = None,
+        external_stream_backends: Mapping[str, Any] | None = None,
     ) -> None:
         # Debug mode is enabled if specified or if the TEMPORAL_DEBUG env var is truthy
         debug_mode = debug_mode or bool(os.environ.get("TEMPORAL_DEBUG"))
@@ -162,6 +164,13 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
                 __temporal_assert_local_activity_valid=assert_local_activity_valid,
             )
         )
+
+        # External Workflow Streams. The manager is per-Worker and owns every
+        # backend connection and watcher task; it is created lazily on the
+        # Worker's own event loop because that is the loop the watchers must run
+        # on, and __init__ is not necessarily called from it.
+        self._external_stream_backends = external_stream_backends
+        self._external_stream_manager: Any = None
 
         self._workflow_failure_exception_types = workflow_failure_exception_types
         self._patch_activation_callback = patch_activation_callback
@@ -277,6 +286,13 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
                 completion.failed.failure.message = "Worker shutting down"
                 await self._bridge_worker().complete_workflow_activation(completion)
             except PollShutdownError:
+                # Every Run has been dealt with, so the manager's watchers have
+                # nothing left to watch. Tearing them down here rather than
+                # leaving it to eviction is necessary because an *idle cached
+                # Run receives no eviction activation at shutdown at all* --
+                # `shutdown_done` treats a Run with no pending work as finished.
+                if self._external_stream_manager is not None:
+                    await self._external_stream_manager.shutdown()
                 return
 
     async def _activate_inline_for_debug(
@@ -395,7 +411,19 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
                 )
                 self._running_workflows[act.run_id] = workflow
 
-            if self._debug_mode:
+            # Two of the four stream jobs are *themselves* backend operations,
+            # and a third has to be prepared by one. Routing them through the
+            # synchronous `activate()` would put a multi-second transaction
+            # inside a call running under a 2-second deadlock timeout -- failing
+            # the Workflow Task for a perfectly healthy backend, and getting
+            # worse the more records replay must validate.
+            #
+            # So they are partitioned here, in the async layer that already
+            # awaits `decode_activation` before handing anything to the executor.
+            handled = await self._handle_external_stream_jobs(act, workflow)
+            if handled is not None:
+                completion = handled
+            elif self._debug_mode:
                 # Inline on the main thread so pdb / breakpoint() can read
                 # stdin. The loop blocks during the activation — that's the
                 # intended single-stepping semantic.
@@ -634,6 +662,14 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         # Remove from map and send completion
         if act.run_id in self._running_workflows:
             del self._running_workflows[act.run_id]
+            # Per-Run stream teardown is driven by `RemoveFromCache` and nothing
+            # else, so a `FinalizeExternalStreams` in flight is always answered
+            # before the manager's state for the Run disappears. It is done here
+            # rather than inside the instance because `disable_safe_eviction`
+            # skips the instance's eviction job entirely, and a Run whose
+            # watchers outlived it would keep a backend connection open forever.
+            if self._external_stream_manager is not None:
+                await self._external_stream_manager.evict_run(act.run_id)
         try:
             await self._bridge_worker().complete_workflow_activation(
                 temporalio.bridge.proto.workflow_completion.WorkflowActivationCompletion(
@@ -740,11 +776,171 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             last_completion_result=init.last_completion_result,
             last_failure=last_failure,
             default_workflow_logic_flags=frozenset(self._default_workflow_logic_flags),
+            external_stream_runtime=self._create_external_stream_runtime(act, init),
         )
         if defn.sandboxed:
             return self._workflow_runner.create_instance(det)
         else:
             return self._unsandboxed_workflow_runner.create_instance(det)
+
+    async def _handle_external_stream_jobs(
+        self,
+        act: temporalio.bridge.proto.workflow_activation.WorkflowActivation,
+        workflow: _RunningWorkflow,
+    ) -> (
+        temporalio.bridge.proto.workflow_completion.WorkflowActivationCompletion | None
+    ):
+        """Answers the runtime-only stream jobs without calling ``activate()``.
+
+        Returns the synthesized completion when this activation was entirely
+        one of those jobs, or ``None`` to let the normal path run.
+
+        ``PrepareExternalStreamPark`` and ``FinalizeExternalStreams`` run no
+        user Workflow code at all -- they cannot resolve futures and their only
+        legal answers are their own result command or an activation failure.
+        ``ReplayExternalStreams`` is *prepared* here rather than handled: its
+        recorded ranges are read and validated into the buffers, then the job
+        passes through so ``_apply`` delivers from memory exactly as it does for
+        a live resolve.
+        """
+        runtime = getattr(workflow.instance, "_external_stream_runtime", None)
+        if runtime is None:
+            return None
+
+        park = next(
+            (
+                j.prepare_external_stream_park
+                for j in act.jobs
+                if j.HasField("prepare_external_stream_park")
+            ),
+            None,
+        )
+        finalize = next(
+            (
+                j.finalize_external_streams
+                for j in act.jobs
+                if j.HasField("finalize_external_streams")
+            ),
+            None,
+        )
+        replay = next(
+            (
+                j.replay_external_streams
+                for j in act.jobs
+                if j.HasField("replay_external_streams")
+            ),
+            None,
+        )
+
+        if replay is not None:
+            # Prepared, not handled: fill and validate every recorded range
+            # before the job reaches the Workflow thread. A transient backend
+            # error or an integrity violation surfaces from here through the
+            # activation-failure path rather than as a deadlock timeout, which
+            # would misattribute a storage problem to the Workflow's own code.
+            await self._stream_manager().prepare_replay(
+                act.run_id, replay.replay_annotation
+            )
+            return None
+
+        if park is None and finalize is None:
+            return None
+
+        completion = (
+            temporalio.bridge.proto.workflow_completion.WorkflowActivationCompletion()
+        )
+        completion.successful.SetInParent()
+
+        if finalize is not None:
+            # **No backend work at all** (ADR-010). The terminal is read from
+            # the runtime's own in-memory blocked snapshot: the boundary is not
+            # "wherever the stream is now", it is where this Workflow Task's
+            # deliveries stopped, which was fixed the moment the last activation
+            # returned. Refreshing it against the backend would be actively
+            # wrong -- it could name a position replay must not reproduce.
+            command = completion.successful.commands.add()
+            command.external_stream_finalized.quiescence_generation = (
+                finalize.quiescence_generation
+            )
+            command.external_stream_finalized.final_observation_delta = (
+                runtime.add_terminal()
+            )
+            return completion
+
+        assert park is not None
+        became_ready = await self._stream_manager().prepare_park(
+            act.run_id,
+            park.quiescence_generation,
+            runtime.blocked_snapshot(),
+        )
+        command = completion.successful.commands.add()
+        command.external_stream_park_result.quiescence_generation = (
+            park.quiescence_generation
+        )
+        if became_ready:
+            # A recheck found records, so this parking generation is abandoned
+            # and Core issues a normal resolve activation next -- rather than
+            # running user code from inside the park path.
+            command.external_stream_park_result.became_ready.SetInParent()
+        else:
+            command.external_stream_park_result.confirmed.SetInParent()
+            command.external_stream_park_result.final_observation_delta = (
+                runtime.add_terminal()
+            )
+        return completion
+
+    def _stream_manager(self) -> Any:
+        """The Worker's subscription manager, created on first use.
+
+        Lazily, because it captures the running event loop -- the one its
+        watcher tasks must run on -- and ``__init__`` is not necessarily called
+        from that loop.
+        """
+        if self._external_stream_manager is None:
+            from temporalio.contrib.external_workflow_streams._manager import (
+                StreamSubscriptionManager,
+            )
+
+            assert self._external_stream_backends is not None
+            self._external_stream_manager = StreamSubscriptionManager(
+                backends=self._external_stream_backends,
+                notify_ready=self._bridge_worker().notify_external_stream_ready,
+            )
+        return self._external_stream_manager
+
+    def _create_external_stream_runtime(
+        self,
+        act: temporalio.bridge.proto.workflow_activation.WorkflowActivation,
+        init: temporalio.bridge.proto.workflow_activation.InitializeWorkflow,
+    ) -> Any:
+        """The per-Run handle Workflow code reaches the manager through.
+
+        ``None`` when no backends are registered, which is what makes
+        ``subscribe()`` fail with a message naming the Worker option rather than
+        with an attribute error deep in the runtime.
+        """
+        if not self._external_stream_backends:
+            return None
+        from temporalio.contrib.external_workflow_streams._api import (
+            DEFAULT_IDLE_TIMEOUT,
+        )
+        from temporalio.contrib.external_workflow_streams._runtime import (
+            WorkflowStreamRuntime,
+        )
+
+        return WorkflowStreamRuntime(
+            manager=self._stream_manager(),
+            backends=self._external_stream_backends,
+            run_id=act.run_id,
+            namespace=self._namespace,
+            workflow_id=init.workflow_id,
+            # The *chain* key, not this Run: the stream spans the whole
+            # Continue-As-New chain, so a new Run continues the same stream
+            # rather than starting a fresh one.
+            first_execution_run_id=init.first_execution_run_id,
+            data_converter=self._data_converter,
+            default_idle_timeout=DEFAULT_IDLE_TIMEOUT,
+        )
 
     def nondeterminism_as_workflow_fail(self) -> bool:
         return any(
