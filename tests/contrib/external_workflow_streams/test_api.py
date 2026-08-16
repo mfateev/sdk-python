@@ -346,3 +346,68 @@ def test_the_package_still_exports_nothing() -> None:
     import temporalio.contrib.external_workflow_streams as package
 
     assert package.__all__ == []
+
+
+@pytest.mark.asyncio
+async def test_a_record_buffered_while_not_iterating_is_still_delivered(
+    runtime: FakeRuntime,
+) -> None:
+    """The readiness for it was reported to nobody, and none is coming.
+
+    A record that arrives while Workflow code is doing something else -- a
+    timer, an activity, another stream -- is buffered and its readiness is
+    reported and consumed immediately. By the time the Workflow comes back and
+    asks for the next value, no further notification will ever be sent: the
+    watcher has moved its prefetch cursor past that record. Blocking without
+    looking at the buffer first strands the Workflow forever on a record that is
+    already sitting in front of it.
+    """
+    codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
+    subscription = external_stream.topic(
+        "tokens", backend="tokens-redis", type=str
+    ).subscribe()
+    runtime.buffers[subscription.wait_id] = [
+        StreamRecord(RecordKind.DATA, await codec.encode("first"), "s", 0)
+    ]
+
+    iterator = subscription.__aiter__()
+    assert await iterator.__anext__() == "first"
+
+    # Arrives while the Workflow is off doing something else. Nothing resolves a
+    # readiness future for it, because nothing was waiting when it landed.
+    runtime.buffers[subscription.wait_id] = [
+        StreamRecord(RecordKind.DATA, await codec.encode("second"), "s", 1)
+    ]
+
+    assert await asyncio.wait_for(iterator.__anext__(), 1) == "second", (
+        "the iterator blocked on a readiness notification that had already been "
+        "spent, with the record buffered in front of it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_record_buffered_after_blocking_begins_still_resolves(
+    runtime: FakeRuntime,
+) -> None:
+    """The other side of the window, which must keep working.
+
+    Looking at the buffer before blocking must not replace the readiness path:
+    a record that genuinely arrives later has no buffered copy to find, and the
+    future is what delivers it.
+    """
+    codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
+    subscription = external_stream.topic(
+        "tokens", backend="tokens-redis", type=str
+    ).subscribe()
+
+    iterator = subscription.__aiter__()
+    pending = asyncio.ensure_future(iterator.__anext__())
+    await asyncio.sleep(0.05)
+    assert not pending.done()
+
+    runtime.buffers[subscription.wait_id] = [
+        StreamRecord(RecordKind.DATA, await codec.encode("late"), "s", 0)
+    ]
+    runtime.pending[subscription.wait_id].set_result(None)
+
+    assert await asyncio.wait_for(pending, 1) == "late"

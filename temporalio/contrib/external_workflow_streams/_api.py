@@ -296,13 +296,14 @@ async def merge(
         if not delivered_any:
             # Nothing anywhere: block on all of them at once. Whichever wait
             # Core resolves first wakes this, and the next pass picks it up.
-            await _await_any_readiness(ordered)
+            if await _await_any_readiness(ordered):
+                continue
 
 
 async def _await_any_readiness(
     subscriptions: Sequence[ExternalStreamSubscription[Any]],
-) -> None:
-    """Blocks until any one of the waits is resolved.
+) -> bool:
+    """Blocks until any one of the waits is resolved. Returns whether it skipped.
 
     Every wait is marked blocked, because the quiescent snapshot must name the
     **complete** set the Workflow is waiting on: a set missing one member would
@@ -317,7 +318,15 @@ async def _await_any_readiness(
         runtime.register_pending(subscription.wait_id, future)
         futures.append(future)
     try:
+        # The same last look the single-subscription path takes, for the same
+        # reason: a record buffered before these waits were registered had its
+        # readiness reported to nobody.
+        for subscription in subscriptions:
+            subscription._fill()
+            if subscription._ready:
+                return True
         await asyncio.wait(futures, return_when=asyncio.FIRST_COMPLETED)
+        return False
     finally:
         for subscription in subscriptions:
             runtime.discard_pending(subscription.wait_id)
@@ -361,12 +370,19 @@ class ExternalStreamSubscription(Generic[AnyType]):
 
     async def _iterate(self) -> AsyncIterator[AnyType]:
         while not self._finished:
+            # Re-filled before *every* record rather than once per batch. A
+            # record buffered while Workflow code was doing something else -- a
+            # timer, an activity, another stream -- has already had its readiness
+            # reported and consumed, so nothing will report it again. Blocking
+            # without looking would wait forever on a record that is already
+            # here. Filling is a buffer pop and costs nothing.
             self._fill()
-            while self._ready:
+            if self._ready:
                 record = self._take()
                 if record.is_control:
                     continue
                 yield await self._decode(record)
+                continue
             await self._await_readiness()
 
     def _fill(self) -> None:
@@ -420,6 +436,16 @@ class ExternalStreamSubscription(Generic[AnyType]):
         future = self._state.runtime.new_readiness_future()
         self._state.runtime.register_pending(self._wait_id, future)
         try:
+            # Look once more, now that this wait is registered. A record buffered
+            # between the last drain and this registration had its readiness
+            # reported while nothing was waiting for it, and no second
+            # notification is coming -- the watcher has already moved its
+            # prefetch cursor past it. Checking after registering is what closes
+            # that window: anything earlier is found here, anything later
+            # resolves the future.
+            self._fill()
+            if self._ready:
+                return
             await future
         finally:
             self._state.runtime.discard_pending(self._wait_id)

@@ -44,6 +44,10 @@ M1_COVERAGE: dict[int, str | tuple[str, ...]] = {
     17: "external_streams.rs::a_core_decided_boundary_asks_for_a_terminal_before_writing_anything",
     18: "external_streams.rs::a_core_decided_boundary_asks_for_a_terminal_before_writing_anything",
     20: "external_streams.rs::the_rollover_deadline_fires_on_a_workflow_only_worker",
+    22: (
+        "test_worker_integration.py::test_an_append_with_no_open_task_wakes_the_workflow",
+        "test_api.py::test_a_record_buffered_while_not_iterating_is_still_delivered",
+    ),
     24: "test_manager.py::test_undeliverable_readiness_owes_a_wake_and_keeps_the_right_watchers",
     25: "external_streams.rs::an_unknown_envelope_version_is_ignored_harmlessly",
     26: (
@@ -109,9 +113,6 @@ M1_GAPS: dict[int, str] = {
     ),
     21: (
         "nothing signals into a retained Workflow Task and measures delivery against the rollover deadline"
-    ),
-    22: (
-        "NoOpenWorkflowTask is a stubbed readiness answer; no real completion carrying server-bound commands followed by an append"
     ),
     23: ("the same wake path after a rollover completion has no test"),
     28: (

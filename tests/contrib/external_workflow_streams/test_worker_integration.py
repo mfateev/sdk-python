@@ -91,18 +91,33 @@ def backend() -> MemoryStreamBackend:
 
 
 async def publish(
-    backend: MemoryStreamBackend, key: StreamKey, values: list[str]
+    backend: MemoryStreamBackend,
+    key: StreamKey,
+    values: list[str],
+    *,
+    session: str = "producer",
 ) -> None:
-    """Appends records the way a producer would, encoded for the topic's type."""
+    """Appends records the way a producer would, encoded for the topic's type.
+
+    The sequence continues across calls within one session, because
+    ``(session_id, sequence)`` is the idempotency key: restarting it would
+    re-use a key with different content, which the contract rejects outright.
+    """
     import temporalio.converter
     from temporalio.contrib.external_workflow_streams._codec import StreamPayloadCodec
 
     codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
-    for i, value in enumerate(values):
+    start = _sequences.get((id(backend), session), 0)
+    for i, value in enumerate(values, start=start):
         await backend.append(
             key,
-            StreamRecord(RecordKind.DATA, await codec.encode(value), "producer", i),
+            StreamRecord(RecordKind.DATA, await codec.encode(value), session, i),
         )
+    _sequences[(id(backend), session)] = start + len(values)
+
+
+#: Per-producer-session sequence, so successive publishes do not collide.
+_sequences: dict[tuple[int, str], int] = {}
 
 
 async def test_a_workflow_consumes_records_it_never_read_itself(
@@ -265,3 +280,84 @@ async def test_a_workflow_without_registered_backends_says_so(
             )
         finally:
             await handle.terminate()
+
+
+@workflow.defn
+class TimerThenConsumeWorkflow:
+    """Consumes one record, sleeps, then consumes another.
+
+    The sleep is the point: a completion carrying a timer is server-bound, so
+    retention is suppressed and the Workflow Task ends. The second record
+    therefore arrives with **no open Workflow Task**, which is the window only
+    the wake Signal covers.
+    """
+
+    @workflow.run
+    async def run(self) -> list[str]:
+        tokens = external_stream.with_options(idle_timeout=timedelta(seconds=30)).topic(
+            "tokens", backend="tokens-memory", type=str
+        )
+        seen: list[str] = []
+        subscription = tokens.subscribe()
+        iterator = subscription.__aiter__()
+
+        seen.append(await iterator.__anext__())
+        # A real timer: the completion that carries it cannot ask for retention.
+        await asyncio.sleep(2)
+        seen.append(await iterator.__anext__())
+        return seen
+
+
+async def test_an_append_with_no_open_task_wakes_the_workflow(
+    client: Client, backend: MemoryStreamBackend
+) -> None:
+    """The wake Signal path, end to end, with nothing else able to explain it.
+
+    The second record is published while the Workflow is sleeping, so no
+    Workflow Task is open to accept local readiness. Nothing else will create
+    one -- the sleep's own timer fires on its own schedule and the Workflow
+    would then find the record only by luck of timing. The watcher observing
+    `NoOpenWorkflowTask` and sending the Signal is what makes the delivery
+    reliable rather than incidental.
+    """
+    task_queue = f"tq-{uuid.uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[TimerThenConsumeWorkflow],
+        external_stream_backends={"tokens-memory": backend},
+    ):
+        handle = await client.start_workflow(
+            TimerThenConsumeWorkflow.run,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=task_queue,
+        )
+        description = await handle.describe()
+        key = StreamKey(
+            client.namespace,
+            handle.id,
+            description.raw_description.workflow_execution_info.first_run_id,
+            "tokens",
+        )
+        await asyncio.sleep(1)
+        await publish(backend, key, ["first"])
+
+        # Let the Workflow consume it and settle into its sleep, so the second
+        # append lands squarely in the no-open-task window.
+        await asyncio.sleep(1)
+        await publish(backend, key, ["second"])
+
+        assert await asyncio.wait_for(handle.result(), 60) == ["first", "second"]
+
+        events = [e async for e in handle.fetch_history_events()]
+        signals = [
+            e
+            for e in events
+            if e.HasField("workflow_execution_signaled_event_attributes")
+            and e.workflow_execution_signaled_event_attributes.signal_name
+            == "__temporal_external_stream_wake"
+        ]
+        assert signals, (
+            "the record was delivered without a wake Signal, so this passed by "
+            "timing rather than by the mechanism under test"
+        )
