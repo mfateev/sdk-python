@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 
 import pytest

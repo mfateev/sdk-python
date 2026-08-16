@@ -835,13 +835,39 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         """Delivers a recorded marker's observations, from memory only.
 
         The recorded ranges were read and validated before this activation was
-        handed to the Workflow thread, so by the time this runs the buffers are
-        already filled and this is indistinguishable from a live resolve --
-        which is exactly the point.
+        handed to the Workflow thread, so this performs no I/O at all.
+
+        The live run's *k* activations become *k* drains inside this one
+        activation. Segments are walked in order with one event-loop drain each,
+        rather than delivered all at once, because reproducing the record order
+        while changing how many drains occurred would make ``wait_condition``
+        predicates fire a different number of times than they did live
+        (ADR-018).
+
+        This is safe with respect to Workflow time: every segment of a marker
+        belongs to one Workflow Task, so ``workflow.now()`` is constant across
+        them in both directions.
         """
         del job
-        if self._external_stream_runtime is not None:
-            self._external_stream_runtime.resolve_all_pending()
+        runtime = self._external_stream_runtime
+        if runtime is None:
+            return
+        plan = runtime.take_replay_plan()
+        if plan is None:
+            # Nothing was prepared -- the job reached the Workflow thread without
+            # its ranges being read, which would mean delivering from a buffer
+            # that live watching filled. Better to deliver nothing than to
+            # deliver something replay did not record.
+            runtime.resolve_all_pending()
+            return
+
+        try:
+            for segment in plan.segments:
+                runtime.begin_replay_segment(list(segment.deliveries))
+                runtime.resolve_all_pending()
+                self._run_once(check_conditions=True)
+        finally:
+            runtime.end_replay()
 
     def _apply_query_workflow(
         self, job: temporalio.bridge.proto.workflow_activation.QueryWorkflow

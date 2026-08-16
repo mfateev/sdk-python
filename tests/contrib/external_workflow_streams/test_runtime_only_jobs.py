@@ -14,7 +14,6 @@ import uuid
 from datetime import timedelta
 
 import pytest
-import pytest_asyncio
 
 import temporalio.converter
 from temporalio.contrib.external_workflow_streams._backend import StreamKey
@@ -23,13 +22,16 @@ from temporalio.contrib.external_workflow_streams._manager import (
     StreamSubscriptionManager,
 )
 from temporalio.contrib.external_workflow_streams._record import (
-    BEGINNING,
     Offset,
     RecordKind,
     StreamRecord,
 )
 from temporalio.contrib.external_workflow_streams._runtime import WorkflowStreamRuntime
 from tests.contrib.external_workflow_streams.memory_backend import MemoryStreamBackend
+from tests.contrib.external_workflow_streams.test_replay import (
+    annotation_for,
+    append_five,
+)
 
 RUN_ID = "run-1"
 DEADLOCK_TIMEOUT_SECONDS = 2
@@ -73,6 +75,19 @@ class SlowParkBackend(MemoryStreamBackend):
     async def install_park_intent(self, key, intent):  # type: ignore[no-untyped-def]
         await asyncio.sleep(DEADLOCK_TIMEOUT_SECONDS + 0.5)
         return await super().install_park_intent(key, intent)
+
+
+class SlowRangeBackend(MemoryStreamBackend):
+    """A recorded-range read that takes longer than the deadlock timeout.
+
+    Not a contrived latency: an inclusive read over a whole recorded batch is
+    the operation that gets *slower* the more records the marker committed, so
+    this is the shape a large, healthy replay actually has.
+    """
+
+    async def read_range(self, key, first, last):  # type: ignore[no-untyped-def]
+        await asyncio.sleep(DEADLOCK_TIMEOUT_SECONDS + 0.5)
+        return await super().read_range(key, first, last)
 
 
 def make_runtime(backend, manager):  # type: ignore[no-untyped-def]
@@ -268,21 +283,62 @@ async def test_intents_are_installed_before_anything_is_rechecked() -> None:
         await manager.shutdown()
 
 
-# --- the replay job's preparation is the read path's, not this deliverable's --
+# --- replay's recorded reads outlive the deadlock timeout too ----------------
 
 
 @pytest.mark.asyncio
-async def test_replay_preparation_is_partitioned_even_though_unimplemented() -> None:
-    """The partition is P19's; what it does once there is P13's.
+async def test_a_replay_read_slower_than_the_deadlock_timeout_is_still_answered() -> (
+    None
+):
+    """The reason the replay job is partitioned rather than answered in `_apply`.
 
-    Asserted so the seam is real rather than notional: the job is routed to the
-    async layer, which is where the recorded range reads must happen whatever
-    they turn out to be.
+    Routing it through ``activate()`` would put the recorded range reads inside
+    a call running under a 2-second deadlock timeout -- failing the Workflow
+    Task for a perfectly healthy backend, and getting worse the more records
+    replay had to validate. Out here the duration is simply irrelevant.
+    """
+    backend = SlowRangeBackend()
+    manager = make_manager(backend)
+    key = StreamKey("ns", "wf", uuid.uuid4().hex, "tokens")
+    try:
+        placed = await append_five(backend, key)
+
+        started = asyncio.get_running_loop().time()
+        plan = await asyncio.wait_for(
+            manager.prepare_replay(RUN_ID, annotation_for(key, placed)), 30
+        )
+        elapsed = asyncio.get_running_loop().time() - started
+
+        assert elapsed > DEADLOCK_TIMEOUT_SECONDS, (
+            "this test is only meaningful if the read really did outlast the "
+            f"deadlock timeout, took {elapsed:.2f}s"
+        )
+        assert plan.total_records == len(placed)
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_the_delivering_activation_reads_nothing_itself() -> None:
+    """Everything a replay activation needs is in memory before it starts.
+
+    Preparation and delivery are two different moments, and the second one must
+    perform no I/O at all -- which is asserted here by taking the prepared plan
+    from a provider that refuses every call.
     """
     backend = MemoryStreamBackend()
     manager = make_manager(backend)
+    key = StreamKey("ns", "wf", uuid.uuid4().hex, "tokens")
     try:
-        with pytest.raises(NotImplementedError, match="P13"):
-            await manager.prepare_replay(RUN_ID, b"")
+        placed = await append_five(backend, key)
+        await manager.prepare_replay(RUN_ID, annotation_for(key, placed))
+
+        # From here on the provider is hostile. Delivery still has to work.
+        manager._backends["tokens"] = HostileBackend()
+
+        plan = manager.take_replay_plan(RUN_ID)
+
+        assert plan is not None
+        assert plan.total_records == len(placed)
     finally:
         await manager.shutdown()

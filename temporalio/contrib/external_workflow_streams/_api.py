@@ -30,7 +30,6 @@ import temporalio.workflow
 from temporalio.contrib.external_workflow_streams._backend import StreamKey
 from temporalio.contrib.external_workflow_streams._codec import StreamPayloadCodec
 from temporalio.contrib.external_workflow_streams._record import (
-    Cursor,
     StreamRecord,
 )
 from temporalio.types import AnyType

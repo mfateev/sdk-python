@@ -26,14 +26,14 @@ Two rules here are easy to get subtly wrong:
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Mapping
 
 import temporalio.converter
 from temporalio.contrib.external_workflow_streams._annotation import (
     MAX_ANNOTATION_BYTES,
-    ROLLOVER_HIGH_WATER,
     AnnotationAccumulator,
     AnnotationHeader,
     Run,
@@ -55,6 +55,7 @@ from temporalio.contrib.external_workflow_streams._record import (
     Cursor,
     StreamRecord,
 )
+from temporalio.contrib.external_workflow_streams._replay import ReplayPlan
 
 __all__ = ["QuiescentWait", "WorkflowStreamRuntime"]
 
@@ -146,6 +147,8 @@ class WorkflowStreamRuntime:
         #: because the two halves are in different modules and a second map
         #: would mean the side that resolves is never the side that registered.
         self._pending: dict[int, asyncio.Future[None]] = {}
+        #: Non-``None`` only while a recorded segment is being delivered.
+        self._replay_ready: list[tuple[int, StreamRecord]] | None = None
 
     # --- the ExternalStreamRuntime protocol ---------------------------------
 
@@ -196,8 +199,51 @@ class WorkflowStreamRuntime:
         self._observed_this_activation = True
 
     def drain(self, wait_id: int, max_records: int | None = None) -> list[StreamRecord]:
-        """Pops buffered records. Performs no I/O and never blocks."""
+        """Pops buffered records. Performs no I/O and never blocks.
+
+        During replay the records come from the segment currently being
+        delivered rather than from the live buffer. ``_apply`` cannot tell the
+        difference, which is the point: replay and live delivery run the same
+        Workflow code down the same path.
+        """
+        if self._replay_ready is not None:
+            # Deliberately *not* the live buffer, even if the manager happens to
+            # hold something: a watcher that ran before the Run was evicted may
+            # have prefetched past where the marker stops, and delivering that
+            # would replay records this Workflow Task never saw.
+            taken: list[StreamRecord] = []
+            remaining: list[tuple[int, StreamRecord]] = []
+            for entry_wait_id, record in self._replay_ready:
+                if entry_wait_id == wait_id and (
+                    max_records is None or len(taken) < max_records
+                ):
+                    taken.append(record)
+                else:
+                    remaining.append((entry_wait_id, record))
+            self._replay_ready = remaining
+            return taken
         return self._manager.drain(self._run_id, wait_id, max_records)
+
+    # --- replay delivery ----------------------------------------------------
+
+    def take_replay_plan(self) -> ReplayPlan | None:
+        """The plan prepared for this Run, if a replay job is being delivered."""
+        return self._manager.take_replay_plan(self._run_id)
+
+    def begin_replay_segment(
+        self, deliveries: Sequence[tuple[int, StreamRecord]]
+    ) -> None:
+        """Makes one recorded segment the only thing a drain can see."""
+        self._replay_ready = list(deliveries)
+
+    def end_replay(self) -> None:
+        """Hands drains back to the live buffer.
+
+        Called from a ``finally``: a partial replay that left this set would
+        make every later drain on this Run return nothing at all, turning one
+        marker's failure into a Workflow that silently never receives again.
+        """
+        self._replay_ready = None
 
     def codec_for(self, value_type: type | None) -> StreamPayloadCodec[Any]:
         return StreamPayloadCodec(self._data_converter, value_type)

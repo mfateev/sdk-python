@@ -57,6 +57,10 @@ from temporalio.contrib.external_workflow_streams._backend import (
     StreamBackend,
     StreamKey,
 )
+from temporalio.contrib.external_workflow_streams._replay import (
+    ReplayPlan,
+    build_replay_plan,
+)
 from temporalio.contrib.external_workflow_streams._record import (
     AFTER,
     BEGINNING,
@@ -243,6 +247,8 @@ class StreamSubscriptionManager:
         self._buffer_size = buffer_size
         self._watch_block = watch_block
         self._runs: dict[str, dict[int, Subscription]] = {}
+        #: Replay plans read and validated ahead of the delivering activation.
+        self._replay_plans: dict[str, ReplayPlan] = {}
         # The loop the watchers run on, captured at construction because that is
         # the Worker's loop. `register` is called from the *Workflow executor
         # thread*, which has no loop of its own and must never touch this one
@@ -448,18 +454,45 @@ class StreamSubscriptionManager:
                 )
         return became_ready
 
-    async def prepare_replay(self, run_id: str, replay_annotation: bytes) -> None:
-        """Fills and validates the recorded ranges before delivery.
+    async def prepare_replay(self, run_id: str, replay_annotation: bytes) -> ReplayPlan:
+        """Reads and validates every recorded range, before any delivery.
 
-        Left to P13, which owns the read path and the four range checks. The
-        job is still partitioned here rather than in ``_apply`` because that is
-        where the reads must happen whatever they turn out to be -- an inclusive
-        range read over a whole recorded batch is exactly the multi-second
-        operation the deadlock timeout cannot accommodate.
+        Runs here rather than in ``_apply`` because an inclusive range read over
+        a whole recorded batch is exactly the multi-second operation the
+        Workflow thread's deadlock timeout cannot accommodate -- and it gets
+        worse the more records the marker recorded.
+
+        Subscriptions may not exist yet: on replay the Workflow has not run far
+        enough to call ``subscribe()``. The annotation's own header carries the
+        stream key and provider for each wait, which is why it records them.
         """
-        raise NotImplementedError(
-            "the external stream replay read path is not implemented yet (P13)"
+        from temporalio.contrib.external_workflow_streams._annotation import (
+            decode_annotation,
         )
+
+        annotation = decode_annotation(replay_annotation)
+        backends: dict[int, StreamBackend] = {}
+        stream_keys: dict[int, StreamKey] = {}
+        for wait_id, binding in annotation.header.streams.items():
+            stream_keys[wait_id] = binding.stream_key
+            existing = self.subscription(run_id, wait_id)
+            if existing is not None:
+                backends[wait_id] = existing.backend
+            else:
+                # Matched by declared provider id, since the annotation names a
+                # provider rather than a Worker-local backend name.
+                for backend in self._backends.values():
+                    if type(backend).provider_id == annotation.header.provider_id:
+                        backends[wait_id] = backend
+                        break
+
+        plan = await build_replay_plan(replay_annotation, backends, stream_keys)
+        self._replay_plans[run_id] = plan
+        return plan
+
+    def take_replay_plan(self, run_id: str) -> ReplayPlan | None:
+        """The prepared plan, consumed once by the delivering activation."""
+        return self._replay_plans.pop(run_id, None)
 
     # --- teardown -----------------------------------------------------------
 
@@ -477,6 +510,7 @@ class StreamSubscriptionManager:
         shutdown, because all three leave exactly the same thing behind:
         speculative reads that were never committed.
         """
+        self._replay_plans.pop(run_id, None)
         for subscription in self._runs.pop(run_id, {}).values():
             await self._stop(subscription)
 
