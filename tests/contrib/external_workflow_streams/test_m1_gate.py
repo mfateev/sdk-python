@@ -31,6 +31,10 @@ M1_COVERAGE: dict[int, str | tuple[str, ...]] = {
     6: "test_runtime.py::test_a_first_subscription_to_an_empty_stream_still_emits",
     7: "test_runtime.py::test_an_activation_that_drained_nothing_emits_an_empty_segment",
     9: "test_annotation.py::test_a_large_single_stream_batch_encodes_as_one_run",
+    10: (
+        "test_annotation.py::test_encoded_size_stays_flat_with_sparse_control_records",
+        "test_annotation.py::test_encoded_size_grows_only_with_the_number_of_control_records",
+    ),
     11: "external_streams.rs::readiness_before_the_idle_timer_expires_cancels_it",
     12: "external_streams.rs::a_confirmed_idle_park_writes_one_marker_and_completes_the_task",
     13: "test_runtime_only_jobs.py::test_a_recheck_that_finds_records_abandons_the_whole_park",
@@ -42,6 +46,15 @@ M1_COVERAGE: dict[int, str | tuple[str, ...]] = {
     20: "external_streams.rs::the_rollover_deadline_fires_on_a_workflow_only_worker",
     24: "test_manager.py::test_undeliverable_readiness_owes_a_wake_and_keeps_the_right_watchers",
     25: "external_streams.rs::an_unknown_envelope_version_is_ignored_harmlessly",
+    26: (
+        "test_wake.py::test_two_producers_retrying_one_wake_derive_the_identical_request_id",
+        "test_wake.py::test_two_producers_retrying_one_wake_are_deduplicated_by_the_server",
+    ),
+    27: (
+        "test_wake.py::test_two_unparked_wakes_from_different_senders_differ",
+        "test_wake.py::test_two_workers_unparked_wakes_are_both_delivered",
+        "test_wake.py::test_one_senders_retry_stays_a_single_wake",
+    ),
     32: (
         "test_shutdown_sweep.py::test_a_momentarily_failing_wake_is_retried_and_succeeds",
         "test_shutdown_sweep.py::test_the_retry_is_bounded_and_then_reported",
@@ -91,9 +104,6 @@ M1_GAPS: dict[int, str] = {
     8: (
         "two markers reassemble at the byte level in Core, but nothing feeds the concatenation through prepare_replay, and the split is deadline- not budget-driven"
     ),
-    10: (
-        "the flat-bytes assertion carries no control records; sparseness is asserted only as a position count"
-    ),
     19: (
         "no long-running test feeds a stream across a rollover under the Workflow Task timeout"
     ),
@@ -104,10 +114,6 @@ M1_GAPS: dict[int, str] = {
         "NoOpenWorkflowTask is a stubbed readiness answer; no real completion carrying server-bound commands followed by an append"
     ),
     23: ("the same wake path after a rollover completion has no test"),
-    26: (
-        "request-ID equality is asserted; server-side deduplication of the two Signals is not"
-    ),
-    27: ("differing request IDs asserted; that both wakes are delivered is not"),
     28: (
         "BLOCKED on C15b: ParkReason::Shutdown is never constructed, so FinalizeExternalStreams{SHUTDOWN} cannot be issued"
     ),

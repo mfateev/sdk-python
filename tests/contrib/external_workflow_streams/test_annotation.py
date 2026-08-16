@@ -457,3 +457,94 @@ def test_golden_bytes_are_unchanged() -> None:
 
 def test_golden_bytes_decode_to_the_golden_annotation() -> None:
     assert decode_annotation(GOLDEN_BYTES) == GOLDEN_ANNOTATION
+
+
+def test_encoded_size_stays_flat_with_sparse_control_records() -> None:
+    """The realistic shape, and the one where a per-record cost could hide.
+
+    ``control_positions`` is the only field that carries per-record information
+    at all, which makes it the natural place for the encoding to start scaling
+    with record count. It stays sparse -- a handful of fence positions in a batch
+    of any size -- so the marker's cost must track the number of *control*
+    records, not the number of records.
+
+    Measured in bytes rather than by inspecting the field, because what matters
+    is what reaches History.
+    """
+
+    def encoded_size(count: int) -> int:
+        # A fence every ~10,000 records: what a few long-running producers
+        # finishing at intervals actually looks like.
+        controls = tuple(range(0, count, max(1, count // 10)))
+        return len(
+            encode_annotation(
+                Annotation(
+                    header(),
+                    segments=(
+                        Segment(
+                            (
+                                Run(
+                                    1,
+                                    offset(1),
+                                    offset(count),
+                                    count,
+                                    control_positions=controls,
+                                ),
+                            ),
+                            SegmentEndReason.NO_DATA_AVAILABLE,
+                        ),
+                    ),
+                    terminal={1: AFTER(offset(count))},
+                )
+            )
+        )
+
+    small, large = encoded_size(100), encoded_size(100_000)
+
+    # Both carry ten control positions; only the positions themselves grow, and
+    # only as varints.
+    assert large - small <= 32, (
+        f"{small} bytes for 100 records but {large} for 100,000, both with ten "
+        "control records -- the control encoding is scaling with record count "
+        "rather than with control count"
+    )
+
+
+def test_encoded_size_grows_only_with_the_number_of_control_records() -> None:
+    """The other half: a marker *may* grow with fences, and only with them.
+
+    Stated as a bound rather than left implicit, because "sparse" is a claim
+    about the producer's behaviour and this is what makes the encoding's side of
+    it checkable.
+    """
+
+    def encoded_size(controls: int) -> int:
+        return len(
+            encode_annotation(
+                Annotation(
+                    header(),
+                    segments=(
+                        Segment(
+                            (
+                                Run(
+                                    1,
+                                    offset(1),
+                                    offset(1000),
+                                    1000,
+                                    control_positions=tuple(range(controls)),
+                                ),
+                            ),
+                            SegmentEndReason.NO_DATA_AVAILABLE,
+                        ),
+                    ),
+                    terminal={1: AFTER(offset(1000))},
+                )
+            )
+        )
+
+    per_control = encoded_size(101) - encoded_size(1)
+
+    assert 100 <= per_control <= 300, (
+        f"100 extra control records cost {per_control} bytes; a sparse position "
+        "list should cost a small constant each"
+    )

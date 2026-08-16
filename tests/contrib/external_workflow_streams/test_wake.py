@@ -8,8 +8,10 @@ are asserted here rather than assumed: the envelope bypasses the user's
 
 from __future__ import annotations
 
+import asyncio
 import pathlib
 import re
+import uuid
 from datetime import timedelta
 
 import pytest
@@ -17,6 +19,9 @@ import pytest
 import temporalio.api.common.v1
 import temporalio.bridge
 import temporalio.converter
+from temporalio import workflow
+from temporalio.client import Client
+from temporalio.worker import Worker
 from temporalio.bridge.proto.external_stream.external_stream_pb2 import WakeSignal
 from temporalio.contrib.external_workflow_streams._backend import ParkIntent, StreamKey
 from temporalio.contrib.external_workflow_streams._producer import (
@@ -27,6 +32,7 @@ from temporalio.contrib.external_workflow_streams._producer import (
 from temporalio.contrib.external_workflow_streams._record import BEGINNING
 from temporalio.contrib.external_workflow_streams._wake import (
     UNPARKED_WAKE_GENERATION,
+    send_wake_signal,
     WAKE_SIGNAL_ENCODING,
     WAKE_SIGNAL_ENVELOPE_VERSION,
     WAKE_SIGNAL_MESSAGE_TYPE,
@@ -555,3 +561,130 @@ async def test_a_fence_is_signalled_too() -> None:
     await topic.finish_writing()
 
     assert len(client.sent) == 1
+
+
+# --- deduplication, against a real server -------------------------------------
+
+
+@workflow.defn
+class WaitForeverWorkflow:
+    """Exists to receive Signals. Never completes on its own."""
+
+    @workflow.run
+    async def run(self) -> None:
+        await asyncio.Future()
+
+
+async def _signalled_events(handle) -> int:  # type: ignore[no-untyped-def]
+    return len(
+        [
+            e
+            async for e in handle.fetch_history_events()
+            if e.HasField("workflow_execution_signaled_event_attributes")
+        ]
+    )
+
+
+async def _start_waiter(client: Client, task_queue: str):  # type: ignore[no-untyped-def]
+    handle = await client.start_workflow(
+        WaitForeverWorkflow.run,
+        id=f"wf-{uuid.uuid4()}",
+        task_queue=task_queue,
+    )
+    description = await handle.describe()
+    return handle, description.raw_description.workflow_execution_info.first_run_id
+
+
+async def test_two_producers_retrying_one_wake_are_deduplicated_by_the_server(
+    client: Client,
+) -> None:
+    """ID equality is only half the claim; this is the half that matters.
+
+    Two producers racing to wake one generation must cost one Workflow Task, not
+    two. Asserting that they derive the same string proves nothing about what
+    the server does with it -- and the server is the component that has to
+    collapse them.
+    """
+    task_queue = f"tq-{uuid.uuid4()}"
+    async with Worker(client, task_queue=task_queue, workflows=[WaitForeverWorkflow]):
+        handle, first_run = await _start_waiter(client, task_queue)
+        try:
+            wake = request(
+                namespace=client.namespace,
+                workflow_id=handle.id,
+                first_execution_run_id=first_run,
+                park_generation=4,
+            )
+
+            # Two producers, one generation, sent independently.
+            for _ in range(2):
+                await send_wake_signal(client, wake)
+
+            assert await _signalled_events(handle) == 1, (
+                "the server recorded both wakes; a producer retrying after an "
+                "ambiguous failure would then cost a second Workflow Task"
+            )
+        finally:
+            await handle.terminate()
+
+
+async def test_two_workers_unparked_wakes_are_both_delivered(
+    client: Client,
+) -> None:
+    """The opposite requirement, and why the counter exists.
+
+    Two Workers shutting down at different times are two separate asks. If their
+    request IDs collided the server would deduplicate the second away -- turning
+    a correct retry mechanism into silent loss, which is the failure the sender
+    identity and counter are there to prevent.
+    """
+    task_queue = f"tq-{uuid.uuid4()}"
+    async with Worker(client, task_queue=task_queue, workflows=[WaitForeverWorkflow]):
+        handle, first_run = await _start_waiter(client, task_queue)
+        try:
+            for identity in ("worker-a", "worker-b"):
+                await send_wake_signal(
+                    client,
+                    request(
+                        namespace=client.namespace,
+                        workflow_id=handle.id,
+                        first_execution_run_id=first_run,
+                        park_generation=0,
+                        sender_identity=identity,
+                        wake_counter=1,
+                    ),
+                )
+
+            assert await _signalled_events(handle) == 2, (
+                "one of the two Workers' wakes was deduplicated away; both are "
+                "separate asks and both must reach the Workflow"
+            )
+        finally:
+            await handle.terminate()
+
+
+async def test_one_senders_retry_stays_a_single_wake(client: Client) -> None:
+    """The unparked case still deduplicates a genuine retry.
+
+    The counter distinguishes *attempts*, not sends, so re-sending one attempt
+    must collapse exactly as a parked wake does -- otherwise the shutdown
+    sweep's retry would wake the Workflow twice.
+    """
+    task_queue = f"tq-{uuid.uuid4()}"
+    async with Worker(client, task_queue=task_queue, workflows=[WaitForeverWorkflow]):
+        handle, first_run = await _start_waiter(client, task_queue)
+        try:
+            attempt = request(
+                namespace=client.namespace,
+                workflow_id=handle.id,
+                first_execution_run_id=first_run,
+                park_generation=0,
+                sender_identity="worker-a",
+                wake_counter=7,
+            )
+            await send_wake_signal(client, attempt)
+            await send_wake_signal(client, attempt)
+
+            assert await _signalled_events(handle) == 1
+        finally:
+            await handle.terminate()
