@@ -97,6 +97,32 @@ class ReadinessResult:
     RUN_NOT_FOUND = "RunNotFound"
 
 
+class RunStatus:
+    """The read-only answer to "what state is this Run's wait set in?".
+
+    Mirrors :py:class:`temporalio.bridge.worker.ExternalStreamRunStatus` and is
+    matched structurally for the same reason :class:`ReadinessResult` is.
+    """
+
+    WFT_OPEN = "WftOpen"
+    PARKED = "Parked"
+    NO_OPEN_WORKFLOW_TASK = "NoOpenWorkflowTask"
+    RUN_NOT_FOUND = "RunNotFound"
+
+
+DEFAULT_SHUTDOWN_GRACE = timedelta(seconds=10)
+"""How long the sweep may hold shutdown open.
+
+Bounded on purpose: a Worker that could not reach the server would otherwise
+hang on the way out, and a wake that has not been acknowledged by now is better
+reported than waited on indefinitely.
+"""
+
+
+def _status_value(status: Any) -> str:
+    return getattr(status, "value", status)
+
+
 #: What the manager calls to tell Core a record is buffered. Returns one of the
 #: five readiness results as a plain value (or an enum whose ``value`` is one).
 ReadinessNotifier = Callable[[str, int, int], Awaitable[Any]]
@@ -238,12 +264,20 @@ class StreamSubscriptionManager:
         backends: Mapping[str, StreamBackend],
         notify_ready: ReadinessNotifier,
         send_wake: WakeSender | None = None,
+        run_status: Callable[[str], Awaitable[Any]] | None = None,
+        shutdown_wake_failed_metric: Callable[[Any], None] | None = None,
         buffer_size: int = DEFAULT_BUFFER_SIZE,
         watch_block: timedelta = DEFAULT_WATCH_BLOCK,
     ) -> None:
         self._backends = backends
         self._notify_ready = notify_ready
         self._send_wake = send_wake
+        self._run_status = run_status
+        self._metric = shutdown_wake_failed_metric
+        #: Wakes the shutdown sweep could not get acknowledged. Reported through
+        #: `external_stream_shutdown_wake_failed`; kept here so a test can tell
+        #: "no wake was needed" from "a wake was needed and lost".
+        self.shutdown_wake_failures = 0
         self._buffer_size = buffer_size
         self._watch_block = watch_block
         self._runs: dict[str, dict[int, Subscription]] = {}
@@ -514,15 +548,101 @@ class StreamSubscriptionManager:
         for subscription in self._runs.pop(run_id, {}).values():
             await self._stop(subscription)
 
-    async def shutdown(self) -> None:
-        """Tears down every Run. Per-Run teardown is normally eviction's job.
+    async def shutdown(self, *, grace: timedelta = DEFAULT_SHUTDOWN_GRACE) -> None:
+        """Sweeps every Run that still holds subscriptions, then tears down.
 
-        This is the backstop for Runs eviction never reaches -- an idle cached
-        Run gets no eviction activation at shutdown at all.
+        Per-Run teardown is normally eviction's job, and this is the backstop for
+        Runs eviction never reaches -- an idle cached Run gets no eviction
+        activation at shutdown at all, which is exactly the Run that most needs
+        the sweep: its records are buffered in a process that is about to exit,
+        and nothing else will ever tell the Workflow they arrived.
+
+        Shutdown is never blocked past ``grace``. A wake that could not be
+        acknowledged in time is reported rather than dropped, and never counted
+        as delivered.
         """
         self._shutting_down = True
+        try:
+            await asyncio.wait_for(self._sweep(), grace.total_seconds())
+        except asyncio.TimeoutError:
+            logger.warning(
+                "External stream shutdown sweep did not finish within %s; "
+                "tearing down anyway",
+                grace,
+            )
         for run_id in list(self._runs):
             await self.evict_run(run_id)
+
+    async def _sweep(self) -> None:
+        """Asks each Run's state and owes a wake only where one is owed.
+
+        The probe is deliberately **not** the readiness call. Readiness means "a
+        record is buffered", so probing with it would assert something false and
+        manufacture a spurious Workflow Task on the way out of a Worker that is
+        shutting down.
+        """
+        if self._run_status is None:
+            return
+        for run_id in list(self._runs):
+            subscriptions = list(self._runs.get(run_id, {}).values())
+            if not subscriptions:
+                continue
+            try:
+                status = _status_value(await self._run_status(run_id))
+            except Exception:
+                logger.exception(
+                    "External stream shutdown probe failed for run %s", run_id
+                )
+                continue
+
+            if status == RunStatus.WFT_OPEN:
+                # A Workflow Task is open and Core owns what happens to it
+                # (C15b). A wake here would race that transition and produce a
+                # second task for a Run already being attended to.
+                continue
+            if status == RunStatus.PARKED:
+                # Already parked, so a producer's append will wake it through the
+                # ordinary path. Nothing is owed.
+                continue
+
+            # NoOpenWorkflowTask and RunNotFound both mean local readiness has
+            # nowhere to go. They differ in what happens to the Run afterwards,
+            # not in what is owed now.
+            for subscription in subscriptions:
+                await self._sweep_wake(subscription)
+
+    async def _sweep_wake(self, subscription: Subscription) -> None:
+        """Sends one unparked wake and waits for the acknowledgement.
+
+        Awaited rather than fired: an unacknowledged wake is the case this whole
+        sweep exists to prevent, and reporting shutdown as clean while a record
+        sits unannounced in a stream would make the wakeup-durability boundary
+        false.
+        """
+        subscription.wakes_owed += 1
+        if self._send_wake is None:
+            self._record_shutdown_wake_failure(subscription)
+            return
+        try:
+            await self._send_wake(subscription)
+        except Exception:
+            logger.exception(
+                "External stream shutdown wake failed for %s wait %s",
+                subscription.stream_key,
+                subscription.wait_id,
+            )
+            self._record_shutdown_wake_failure(subscription)
+
+    def _record_shutdown_wake_failure(self, subscription: Subscription) -> None:
+        """Surfaces the wake that could not be acknowledged.
+
+        Counted rather than only logged: a dropped wake is silent by nature --
+        the Workflow simply waits, and nothing distinguishes that from a producer
+        having nothing to say.
+        """
+        self.shutdown_wake_failures += 1
+        if self._metric is not None:
+            self._metric(subscription)
 
     async def _stop(self, subscription: Subscription) -> None:
         subscription._cancelled = True

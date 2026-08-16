@@ -175,6 +175,10 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         #: call rather than anything the bridge can do -- Core cannot signal a
         #: Workflow on this Worker's behalf.
         self._client = client
+        self._shutdown_wake_failed_counter = metric_meter.create_counter(
+            "external_stream_shutdown_wake_failed",
+            "Wake Signals owed at Worker shutdown that could not be acknowledged",
+        )
         self._external_stream_manager: Any = None
 
         self._workflow_failure_exception_types = workflow_failure_exception_types
@@ -926,8 +930,30 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
                 # parked, cached-with-no-open-task, and evicted all look the
                 # same from here, and all three are answered the same way.
                 send_wake=self._send_external_stream_wake,
+                # Read-only, and deliberately not the readiness call: readiness
+                # asserts a buffered record, so probing with it on the way out
+                # would manufacture a Workflow Task for a Run that had nothing
+                # waiting.
+                run_status=self._bridge_worker().external_stream_run_status,
+                shutdown_wake_failed_metric=self._record_shutdown_wake_failed,
             )
         return self._external_stream_manager
+
+    def _record_shutdown_wake_failed(self, subscription: Any) -> None:
+        """Counts a shutdown wake that could not be acknowledged.
+
+        A dropped wake is silent by nature -- the Workflow simply waits, and
+        nothing distinguishes that from a producer having nothing to say -- so it
+        gets a metric rather than only a log line.
+        """
+        self._shutdown_wake_failed_counter.add(
+            1,
+            {
+                "namespace": self._namespace,
+                "task_queue": self._task_queue,
+                "stream_name": subscription.stream_key.stream_name,
+            },
+        )
 
     async def _send_external_stream_wake(self, subscription: Any) -> None:
         """Sends the reserved wake Signal for a subscription that owes one.
