@@ -117,19 +117,19 @@ async def stream_key_for(client: Client, handle, name: str) -> StreamKey:  # typ
     )
 
 
-CORE_MARKER_LOOKAHEAD_BUG = pytest.mark.xfail(
+CONDITION_ALONGSIDE_SUBSCRIPTION_SPINS = pytest.mark.xfail(
     strict=True,
     reason=(
-        "C10's replay lookahead does not claim an external stream marker that is "
-        "followed by one of lang's own commands in the same Workflow Task, so the "
-        "marker event reaches the next machine instead: 'Timer machine does not "
-        "handle this event: HistoryEvent(MarkerRecorded)'. Strict, so this turns "
-        "red the moment Core is fixed and the marker can be removed."
+        "A `wait_condition` evaluated alongside a subscription iteration livelocks: "
+        "the Workflow never completes and the server accumulates tens of thousands "
+        "of events. The pattern is an ordinary one, so this is a defect rather than "
+        "a limitation -- marked rather than deleted so it is not lost. Strict, so "
+        "it turns red once fixed."
     ),
 )
 
 
-@CORE_MARKER_LOOKAHEAD_BUG
+@CONDITION_ALONGSIDE_SUBSCRIPTION_SPINS
 async def test_replaying_a_stream_history_reproduces_the_same_observations(
     client: Client, backend: MemoryStreamBackend
 ) -> None:
@@ -214,7 +214,6 @@ async def test_a_history_with_stream_markers_needs_its_backends_to_replay(
     )
 
 
-@CORE_MARKER_LOOKAHEAD_BUG
 async def test_an_empty_stream_replays_from_its_recorded_boundary(
     client: Client, backend: MemoryStreamBackend
 ) -> None:
