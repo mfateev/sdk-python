@@ -585,6 +585,23 @@ async def _signalled_events(handle) -> int:  # type: ignore[no-untyped-def]
     )
 
 
+async def _settled_signal_count(handle, expected: int) -> int:  # type: ignore[no-untyped-def]
+    """Waits for the count to reach ``expected`` and then stay there.
+
+    Counting once races persistence in both directions: too early and a wake
+    that *was* recorded is missed, too eager and a duplicate that is about to
+    appear is not. Waiting for the count to reach the expected value and hold
+    across a further interval distinguishes "the server collapsed them" from
+    "the second one has not landed yet".
+    """
+    for _ in range(40):
+        if await _signalled_events(handle) >= expected:
+            break
+        await asyncio.sleep(0.1)
+    await asyncio.sleep(1)
+    return await _signalled_events(handle)
+
+
 async def _start_waiter(client: Client, task_queue: str):  # type: ignore[no-untyped-def]
     handle = await client.start_workflow(
         WaitForeverWorkflow.run,
@@ -620,7 +637,7 @@ async def test_two_producers_retrying_one_wake_are_deduplicated_by_the_server(
             for _ in range(2):
                 await send_wake_signal(client, wake)
 
-            assert await _signalled_events(handle) == 1, (
+            assert await _settled_signal_count(handle, 1) == 1, (
                 "the server recorded both wakes; a producer retrying after an "
                 "ambiguous failure would then cost a second Workflow Task"
             )
@@ -655,7 +672,7 @@ async def test_two_workers_unparked_wakes_are_both_delivered(
                     ),
                 )
 
-            assert await _signalled_events(handle) == 2, (
+            assert await _settled_signal_count(handle, 2) == 2, (
                 "one of the two Workers' wakes was deduplicated away; both are "
                 "separate asks and both must reach the Workflow"
             )
@@ -685,6 +702,6 @@ async def test_one_senders_retry_stays_a_single_wake(client: Client) -> None:
             await send_wake_signal(client, attempt)
             await send_wake_signal(client, attempt)
 
-            assert await _signalled_events(handle) == 1
+            assert await _settled_signal_count(handle, 1) == 1
         finally:
             await handle.terminate()

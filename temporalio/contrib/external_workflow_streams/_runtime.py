@@ -323,6 +323,16 @@ class WorkflowStreamRuntime:
 
         state.delivery_cursor = AFTER(record.offset)
         state.fence_reached = record.is_control
+
+        if self._replay_ready is not None:
+            # Replay re-delivers records the marker already recorded. Advancing
+            # the cursors is right -- the runtime has to end up in the state the
+            # live run was in -- but accumulating them into a *new* annotation is
+            # not: Core would be asked to write a second marker for observations
+            # already in History, and the command would be matched against the
+            # very event it was read from.
+            return
+
         self._observed_this_activation = True
 
         # Extend the open run when this is another consecutive delivery from the
@@ -392,8 +402,12 @@ class WorkflowStreamRuntime:
         """The bytes to put on this completion's `WorkflowStreamProgress`.
 
         ``None`` means nothing replay-visible changed, which is the only case
-        where a completion legitimately carries no progress command.
+        where a completion legitimately carries no progress command -- and a
+        replay delivery is exactly that case, since everything it delivered is
+        already recorded in the marker being replayed.
         """
+        if self._replay_ready is not None:
+            return None
         self.close_segment()
         if not self._pending_deltas:
             return None

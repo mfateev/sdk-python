@@ -2302,6 +2302,22 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         if runtime is None or self._deleting:
             return
 
+        if self._is_replaying:
+            # Every marker for a replayed Workflow Task is already in History,
+            # so there is nothing here for Core to write. Re-deriving the
+            # annotation is not merely redundant: the command would be matched
+            # against the very event it was read from, and Core would see a
+            # marker arriving for a machine already resolved from lookahead.
+            #
+            # What lang accumulated while replaying is dropped rather than
+            # carried, because otherwise it rides the *next* completion -- which
+            # is live, and would write a second marker for observations the
+            # first one already recorded. A registration alone is enough to
+            # trigger that, so it happens even for a stream that never delivered
+            # anything.
+            runtime.start_new_annotation()
+            return
+
         # Ordering: the progress command goes in before anything the workflow
         # itself produced this activation, so it is inserted at the front rather
         # than appended.
