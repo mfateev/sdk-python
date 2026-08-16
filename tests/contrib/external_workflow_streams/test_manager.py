@@ -629,3 +629,45 @@ async def test_re_registering_a_wait_stops_the_watcher_it_replaced(
         )
     finally:
         await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_an_evicted_run_re_delivers_the_records_it_had_already_seen(
+    stream_key: StreamKey,
+) -> None:
+    """Discarding prefetch state is only half of it; the records must come back.
+
+    Cursors reset to the committed boundary is the mechanism, but what makes it
+    correct is the outcome: a Run that consumed records without committing a
+    marker must see those same records again, or eviction would silently drop
+    everything between the last marker and the eviction.
+    """
+    backend = MemoryStreamBackend()
+    notifier = RecordingNotifier()
+    manager = make_manager(backend, notifier)
+    manager.register(
+        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+    )
+    await append(backend, stream_key, b"a", b"b", b"c")
+    await asyncio.wait_for(notifier.notified.wait(), 2)
+    first_pass = [r.offset for r in manager.drain(RUN_ID, 1)]
+    assert len(first_pass) == 3
+
+    # Evicted with no marker committed: nothing it saw was ever a claim.
+    await manager.evict_run(RUN_ID)
+
+    notifier.notified.clear()
+    manager.register(
+        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+    )
+    await asyncio.wait_for(notifier.notified.wait(), 2)
+    second_pass = [r.offset for r in manager.drain(RUN_ID, 1)]
+
+    try:
+        assert second_pass == first_pass, (
+            "the restarted subscription must re-read the same offsets; resuming "
+            "past them would drop every record between the last marker and the "
+            "eviction"
+        )
+    finally:
+        await manager.shutdown()

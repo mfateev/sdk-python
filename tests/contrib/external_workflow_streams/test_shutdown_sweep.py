@@ -18,9 +18,14 @@ import pytest_asyncio
 from temporalio.contrib.external_workflow_streams._backend import StreamKey
 from temporalio.contrib.external_workflow_streams._manager import (
     BEGINNING,
+    SHUTDOWN_WAKE_ATTEMPTS,
     ReadinessResult,
     RunStatus,
     StreamSubscriptionManager,
+)
+from temporalio.contrib.external_workflow_streams._wake import (
+    WakeRequest,
+    wake_request_id,
 )
 from temporalio.contrib.external_workflow_streams._record import (
     RecordKind,
@@ -400,3 +405,106 @@ async def test_eviction_remains_the_normal_teardown_path(harness_factory) -> Non
         "ask Core about a Run this Worker has finished with"
     )
     assert harness.wakes == []
+
+
+# --- the retry within the grace period ----------------------------------------
+
+
+class FlakyWakeHarness(Harness):
+    """Fails a fixed number of attempts, then succeeds."""
+
+    def __init__(self, backend: MemoryStreamBackend, failures: int) -> None:
+        super().__init__(backend, RunStatus.NO_OPEN_WORKFLOW_TASK)
+        self.remaining_failures = failures
+        self.attempts = 0
+
+    async def _wake(self, subscription) -> None:  # type: ignore[no-untyped-def]
+        self.attempts += 1
+        if self.remaining_failures > 0:
+            self.remaining_failures -= 1
+            raise ConnectionError("service unavailable")
+        self.wakes.append((subscription.run_id, subscription.wait_id))
+
+
+@pytest.mark.asyncio
+async def test_a_momentarily_failing_wake_is_retried_and_succeeds(
+    backend: MemoryStreamBackend,
+) -> None:
+    """A Worker shutting down is often shutting down because something is unhealthy.
+
+    That makes the first attempt the one most likely to land in the middle of
+    it, and giving up there would report a clean shutdown that lost a record.
+    """
+    harness = FlakyWakeHarness(backend, failures=1)
+    harness.register()
+
+    await harness.manager.shutdown()
+
+    assert harness.attempts == 2, f"expected one retry, got {harness.attempts} attempts"
+    assert harness.wakes == [(RUN_ID, 1)]
+    assert harness.metric == [], "a wake that eventually succeeded is not a failure"
+
+
+@pytest.mark.asyncio
+async def test_the_retry_is_bounded_and_then_reported(
+    backend: MemoryStreamBackend,
+) -> None:
+    """Retrying forever would trade a lost record for a Worker that never exits.
+
+    The metric is what makes giving up visible, which is the only reason giving
+    up is acceptable.
+    """
+    harness = FlakyWakeHarness(backend, failures=99)
+    harness.register()
+
+    await harness.manager.shutdown()
+
+    assert harness.attempts == SHUTDOWN_WAKE_ATTEMPTS
+    assert harness.metric == ["tokens"]
+    assert harness.wakes == []
+
+
+@pytest.mark.asyncio
+async def test_the_retry_is_the_same_wake_not_a_second_one(
+    backend: MemoryStreamBackend,
+) -> None:
+    """Derived from the wake's identity, so the server deduplicates it.
+
+    This is what makes retrying safe at all: without a stable request ID the
+    retry would ask for a second Workflow Task, and an attempt that had in fact
+    arrived would be duplicated rather than resolved.
+    """
+    harness = FlakyWakeHarness(backend, failures=1)
+    subscription = harness.register()
+    del subscription
+
+    seen: list[str] = []
+
+    async def recording_wake(sub) -> None:  # type: ignore[no-untyped-def]
+        # What the Worker's real sender derives, for this subscription.
+        seen.append(
+            wake_request_id(
+                WakeRequest(
+                    namespace=sub.stream_key.namespace,
+                    workflow_id=sub.stream_key.workflow_id,
+                    first_execution_run_id=sub.stream_key.first_execution_run_id,
+                    stream_name=sub.stream_key.stream_name,
+                    wait_id=sub.wait_id,
+                    park_generation=0,
+                    sender_identity="worker-a",
+                    wake_counter=sub.wakes_owed,
+                )
+            )
+        )
+        if len(seen) == 1:
+            raise ConnectionError("service unavailable")
+
+    harness.manager._send_wake = recording_wake
+
+    await harness.manager.shutdown()
+
+    assert len(seen) == 2
+    assert seen[0] == seen[1], (
+        "the retry must derive the same request ID; a fresh one would ask for a "
+        "second Workflow Task rather than resolve the first attempt"
+    )

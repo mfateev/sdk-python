@@ -28,12 +28,18 @@ by one of the four:
 4. ``control_positions`` match.
 
 A first, middle, or last deletion each fails a different one of them.
+
+What these checks are **not** for is a marker that names a subscription this
+Workflow never created. That is row four of the taxonomy -- ordinary
+nondeterminism -- because nothing is wrong with the backend: the ranges are
+exactly where they were written and the Workflow code changed underneath them.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import temporalio.workflow
 from temporalio.contrib.external_workflow_streams._annotation import (
     Annotation,
     Run,
@@ -166,14 +172,21 @@ async def build_replay_plan(
             backend = backends.get(run.wait_id)
             key = stream_keys.get(run.wait_id)
             if backend is None or key is None:
-                # Row four of the failure taxonomy: the marker names a wait
-                # Workflow code never created. Reported as what it is rather
-                # than skipped, because skipping would silently deliver a
-                # different stream result.
-                raise StreamIntegrityError(
-                    f"the marker records wait {run.wait_id}, which this Workflow "
-                    "did not create; the Workflow code has changed in a way that "
-                    "renumbered or removed a subscription"
+                # Row four of the failure taxonomy, and **not** integrity loss.
+                # Nothing is wrong with the backend: the recorded ranges are
+                # exactly where they were written, and the Workflow code has
+                # changed underneath them. Reporting this as integrity loss
+                # would send an operator to repair a backend that is fine, when
+                # the fix is to version the Workflow code.
+                #
+                # Reported rather than skipped either way, because skipping
+                # would silently deliver a different stream result.
+                raise temporalio.workflow.NondeterminismError(
+                    f"the marker records external stream wait {run.wait_id}, "
+                    "which this Workflow did not create. A subscribe() call was "
+                    "inserted, removed, or reordered, which renumbers every "
+                    "later wait; gate the change behind workflow.patched() "
+                    "exactly as an inserted timer would be."
                 )
             records = await _read_range(backend, key, run)
             validate_run(run, records, backend)

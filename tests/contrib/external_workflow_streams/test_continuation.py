@@ -30,7 +30,6 @@ from temporalio.contrib.external_workflow_streams._continuation import (
     read_continuation_header,
     write_continuation_header,
 )
-from temporalio.contrib.external_workflow_streams._errors import StreamIntegrityError
 from temporalio.contrib.external_workflow_streams._manager import (
     ReadinessResult,
 )
@@ -258,13 +257,17 @@ def test_a_renumbered_subscription_is_caught_rather_than_resumed_wrong(
     """Restoring a cursor onto a differently-numbered wait resumes the wrong stream.
 
     The backend would accept the offset and no later check would catch it, so
-    this is reported here -- with the same remedy an inserted timer needs.
+    this is reported here -- as nondeterminism, with the same remedy an inserted
+    timer needs. Not as integrity loss: the cursor is exactly what the
+    predecessor committed, and it is the Workflow code that moved.
     """
     runtime = make_runtime(
         manager, backend, Continuation({1: AFTER(Offset("100-0"))}, {1: "tokens"})
     )
 
-    with pytest.raises(StreamIntegrityError, match="workflow.patched"):
+    with pytest.raises(
+        temporalio.workflow.NondeterminismError, match="workflow.patched"
+    ):
         runtime.register(
             wait_id=1,
             stream_key=runtime.stream_key("tool-events"),

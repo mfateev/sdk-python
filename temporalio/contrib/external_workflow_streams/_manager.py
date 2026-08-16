@@ -110,6 +110,18 @@ class RunStatus:
     RUN_NOT_FOUND = "RunNotFound"
 
 
+SHUTDOWN_WAKE_ATTEMPTS = 3
+"""How many times one owed wake is attempted before it is reported.
+
+More than one because a Worker shutting down is often shutting down *because*
+something is unhealthy, so the first attempt is the one most likely to land in
+the middle of it. Bounded because the alternative to giving up is holding
+shutdown open, and the metric exists precisely so that giving up is visible.
+"""
+
+SHUTDOWN_WAKE_RETRY_DELAY = timedelta(milliseconds=200)
+"""Short enough that three attempts fit comfortably inside the grace period."""
+
 DEFAULT_SHUTDOWN_GRACE = timedelta(seconds=10)
 """How long the sweep may hold shutdown open.
 
@@ -625,26 +637,42 @@ class StreamSubscriptionManager:
                 await self._sweep_wake(subscription)
 
     async def _sweep_wake(self, subscription: Subscription) -> None:
-        """Sends one unparked wake and waits for the acknowledgement.
+        """Sends one unparked wake, retrying within the grace period.
 
         Awaited rather than fired: an unacknowledged wake is the case this whole
         sweep exists to prevent, and reporting shutdown as clean while a record
         sits unannounced in a stream would make the wakeup-durability boundary
         false.
+
+        Retried because the common failure here is a momentary one -- a Worker
+        shutting down is often shutting down *because* something is unhealthy,
+        and the first attempt lands in the middle of it. The retry is safe and is
+        not a second wake: the request ID is derived from the wake's identity, so
+        the server deduplicates it against the attempt that may in fact have
+        arrived. The grace period bounds the whole sweep, so this cannot extend
+        shutdown past it.
         """
         subscription.wakes_owed += 1
         if self._send_wake is None:
             self._record_shutdown_wake_failure(subscription)
             return
-        try:
-            await self._send_wake(subscription)
-        except Exception:
-            logger.exception(
-                "External stream shutdown wake failed for %s wait %s",
-                subscription.stream_key,
-                subscription.wait_id,
-            )
-            self._record_shutdown_wake_failure(subscription)
+
+        for attempt in range(SHUTDOWN_WAKE_ATTEMPTS):
+            try:
+                await self._send_wake(subscription)
+                return
+            except Exception:
+                logger.warning(
+                    "External stream shutdown wake attempt %s/%s failed for %s wait %s",
+                    attempt + 1,
+                    SHUTDOWN_WAKE_ATTEMPTS,
+                    subscription.stream_key,
+                    subscription.wait_id,
+                    exc_info=True,
+                )
+                if attempt + 1 < SHUTDOWN_WAKE_ATTEMPTS:
+                    await asyncio.sleep(SHUTDOWN_WAKE_RETRY_DELAY.total_seconds())
+        self._record_shutdown_wake_failure(subscription)
 
     def _record_shutdown_wake_failure(self, subscription: Subscription) -> None:
         """Surfaces the wake that could not be acknowledged.

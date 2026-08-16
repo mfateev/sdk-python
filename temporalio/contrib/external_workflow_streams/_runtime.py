@@ -32,6 +32,7 @@ from datetime import timedelta
 from typing import Any, Mapping
 
 import temporalio.converter
+import temporalio.workflow
 from temporalio.contrib.external_workflow_streams._annotation import (
     MAX_ANNOTATION_BYTES,
     AnnotationAccumulator,
@@ -47,7 +48,6 @@ from temporalio.contrib.external_workflow_streams._backend import (
 )
 from temporalio.contrib.external_workflow_streams._codec import StreamPayloadCodec
 from temporalio.contrib.external_workflow_streams._continuation import Continuation
-from temporalio.contrib.external_workflow_streams._errors import StreamIntegrityError
 from temporalio.contrib.external_workflow_streams._manager import (
     StreamSubscriptionManager,
 )
@@ -502,12 +502,15 @@ class WorkflowStreamRuntime:
             return BEGINNING
         recorded = self._continuation.stream_names.get(wait_id, "")
         if recorded and recorded != stream_name:
-            raise StreamIntegrityError(
-                f"the predecessor Run recorded wait {wait_id} on stream "
-                f"{recorded!r}, but this Run subscribes it to {stream_name!r}. "
-                "A subscribe() call was inserted, removed, or reordered, which "
-                "renumbers every later wait; gate the change behind "
-                "workflow.patched() exactly as an inserted timer would be."
+            # Row four of the taxonomy, not integrity loss: the cursor is
+            # exactly what the predecessor committed, and it is the Workflow
+            # code that moved.
+            raise temporalio.workflow.NondeterminismError(
+                f"the predecessor Run recorded external stream wait {wait_id} "
+                f"on stream {recorded!r}, but this Run subscribes it to "
+                f"{stream_name!r}. A subscribe() call was inserted, removed, or "
+                "reordered, which renumbers every later wait; gate the change "
+                "behind workflow.patched() exactly as an inserted timer would be."
             )
         return restored
 

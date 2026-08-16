@@ -16,6 +16,7 @@ import pytest
 import pytest_asyncio
 
 import temporalio.converter
+import temporalio.workflow
 from temporalio.contrib.external_workflow_streams._annotation import (
     Annotation,
     AnnotationHeader,
@@ -288,13 +289,19 @@ async def test_out_of_order_records_fail_validation(
 
 
 @pytest.mark.asyncio
-async def test_a_marker_naming_an_unknown_wait_is_reported_not_skipped(
+async def test_a_marker_naming_an_unknown_wait_is_nondeterminism_not_integrity_loss(
     manager: StreamSubscriptionManager, backend: MemoryStreamBackend, key: StreamKey
 ) -> None:
-    """Row four of the taxonomy: the Workflow code renumbered a subscription.
+    """Row four of the taxonomy, and the row it must not be confused with.
 
-    Skipping it would silently deliver a different stream result, which is the
-    one outcome integrity loss must never produce.
+    Nothing is wrong with the backend here: the recorded ranges are exactly
+    where they were written, and the Workflow code changed underneath them.
+    Reporting it as integrity loss would send an operator to repair a backend
+    that is fine, when the fix is to version the Workflow code -- the same
+    mistake in the opposite direction from calling an outage integrity loss.
+
+    Reported rather than skipped either way, since skipping would silently
+    deliver a different stream result.
     """
     placed = await append_five(backend, key)
     annotation = encode_annotation(
@@ -310,8 +317,18 @@ async def test_a_marker_naming_an_unknown_wait_is_reported_not_skipped(
         )
     )
 
-    with pytest.raises(StreamIntegrityError, match="did not create"):
+    with pytest.raises(
+        temporalio.workflow.NondeterminismError, match="did not create"
+    ) as caught:
         await manager.prepare_replay(RUN_ID, annotation)
+
+    assert not isinstance(caught.value, StreamIntegrityError), (
+        "this row must not be reachable through the storage-failure taxonomy"
+    )
+    assert "workflow.patched" in str(caught.value), (
+        "the message must name the remedy, which is versioning the Workflow "
+        "code rather than touching the backend"
+    )
 
 
 # --- storage failure is not integrity loss -----------------------------------

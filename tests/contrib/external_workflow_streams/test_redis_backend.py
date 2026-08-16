@@ -209,3 +209,93 @@ async def test_offsets_compare_numerically_not_lexically(
         < 0
     )
     assert redis_backend.compare_offsets(Offset("100-0"), Offset("100-0")) == 0
+
+
+# --- retention loss against real Redis ---------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_trimmed_range_is_integrity_loss_not_a_storage_failure(
+    redis_backend: RedisStreamBackend, stream_key: StreamKey
+) -> None:
+    """`XTRIM MAXLEN` is how a recorded range actually disappears in production.
+
+    Not a hypothetical: a stream with a retention policy trims its own head
+    while a Workflow is still parked against it. That must read as integrity
+    loss -- an operator has to restore or terminate -- and never as a transient
+    storage failure, which would clear on its own and so would be retried
+    forever against data that is not coming back.
+    """
+    from temporalio.contrib.external_workflow_streams._annotation import Run
+    from temporalio.contrib.external_workflow_streams._errors import (
+        StreamIntegrityError,
+    )
+    from temporalio.contrib.external_workflow_streams._replay import validate_run
+
+    placed = []
+    for i in range(5):
+        placed.append(
+            await redis_backend.append(
+                stream_key, StreamRecord(RecordKind.DATA, b"x", "producer", i)
+            )
+        )
+    run = Run(1, placed[0].offset, placed[-1].offset, 5)  # type: ignore[arg-type]
+
+    # The head of the recorded range is trimmed away, exactly as a retention
+    # policy would do it.
+    await redis_backend._client.xtrim(
+        redis_backend.stream_key(stream_key), maxlen=2, approximate=False
+    )
+    survivors = await redis_backend.read_range(
+        stream_key,
+        placed[0].offset,  # type: ignore[arg-type]
+        placed[-1].offset,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(StreamIntegrityError) as caught:
+        validate_run(run, survivors, redis_backend)
+
+    assert "missing from the stream" in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_write_fence_is_integrity_loss(
+    redis_backend: RedisStreamBackend, stream_key: StreamKey
+) -> None:
+    """A control record occupies an offset inside a run, so losing one is loss.
+
+    It is never yielded to Workflow code, which is exactly why it could be
+    dismissed as harmless -- but the run's count includes it and its position is
+    recorded, so a range missing it no longer reads back as written. Letting it
+    pass would also shift every later control position by one.
+    """
+    from temporalio.contrib.external_workflow_streams._annotation import Run
+    from temporalio.contrib.external_workflow_streams._errors import (
+        StreamIntegrityError,
+    )
+    from temporalio.contrib.external_workflow_streams._replay import validate_run
+
+    first = await redis_backend.append(
+        stream_key, StreamRecord(RecordKind.DATA, b"a", "producer", 0)
+    )
+    fence = await redis_backend.append(
+        stream_key, StreamRecord(RecordKind.WRITE_FENCE, b"", "producer", 1)
+    )
+    last = await redis_backend.append(
+        stream_key, StreamRecord(RecordKind.DATA, b"b", "producer", 2)
+    )
+    run = Run(1, first.offset, last.offset, 3, control_positions=(1,))  # type: ignore[arg-type]
+
+    await redis_backend.delete_for_test(stream_key, fence.offset)  # type: ignore[arg-type]
+    survivors = await redis_backend.read_range(
+        stream_key,
+        first.offset,  # type: ignore[arg-type]
+        last.offset,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(StreamIntegrityError) as caught:
+        validate_run(run, survivors, redis_backend)
+
+    assert "contains 2 record(s)" in str(caught.value), (
+        f"a deleted fence must fail the count check, got: {caught.value}"
+    )
