@@ -46,6 +46,8 @@ from temporalio.contrib.external_workflow_streams._backend import (
     StreamKey,
 )
 from temporalio.contrib.external_workflow_streams._codec import StreamPayloadCodec
+from temporalio.contrib.external_workflow_streams._continuation import Continuation
+from temporalio.contrib.external_workflow_streams._errors import StreamIntegrityError
 from temporalio.contrib.external_workflow_streams._manager import (
     StreamSubscriptionManager,
 )
@@ -80,6 +82,17 @@ class _SubscriptionState:
     idle_timeout: timedelta
 
     delivery_cursor: Cursor = BEGINNING
+    """How far records have been handed to the *subscription's* buffer.
+
+    What the annotation records, and what replay must reproduce.
+    """
+    consumption_cursor: Cursor = BEGINNING
+    """How far Workflow code has actually taken records.
+
+    Trails :attr:`delivery_cursor` by whatever is still sitting unread in the
+    buffer. That buffer dies with the Run, so this -- not delivery -- is what a
+    successor Run must resume from.
+    """
     generation: int = 0
     """Increments each time this wait re-enters the blocked state."""
 
@@ -117,6 +130,7 @@ class WorkflowStreamRuntime:
         data_converter: temporalio.converter.DataConverter,
         default_idle_timeout: timedelta,
         max_annotation_bytes: int = MAX_ANNOTATION_BYTES,
+        continuation: Continuation | None = None,
     ) -> None:
         self._manager = manager
         self._backends = backends
@@ -127,6 +141,11 @@ class WorkflowStreamRuntime:
         self._data_converter = data_converter
         self._default_idle_timeout = default_idle_timeout
         self._max_annotation_bytes = max_annotation_bytes
+        #: What the predecessor Run committed, or None on a first execution.
+        #: Restored from History before any subscription is established, never
+        #: read from the backend -- a cursor derived from mutable backend state
+        #: would give replay whatever the stream holds now (ADR-022).
+        self._continuation = continuation
 
         self._subscriptions: dict[int, _SubscriptionState] = {}
         #: Where the *current* annotation begins, per wait. Captured when the
@@ -167,9 +186,17 @@ class WorkflowStreamRuntime:
         stream_key: StreamKey,
         backend_name: str,
         idle_timeout: timedelta | None = None,
-        start_cursor: Cursor = BEGINNING,
+        start_cursor: Cursor | None = None,
     ) -> None:
-        """Registers a wait with the Worker's manager. Non-blocking, no I/O."""
+        """Registers a wait with the Worker's manager. Non-blocking, no I/O.
+
+        The start cursor defaults to what the predecessor Run committed for this
+        ``wait_id``, so a chain resumes where it left off without the Workflow
+        code saying anything about it -- and a first execution gets ``BEGINNING``
+        from the same path.
+        """
+        if start_cursor is None:
+            start_cursor = self.restored_start(wait_id, stream_key.stream_name)
         if backend_name not in self._backends:
             known = ", ".join(sorted(self._backends)) or "<none>"
             raise KeyError(
@@ -182,6 +209,7 @@ class WorkflowStreamRuntime:
             backend_name=backend_name,
             start_cursor=start_cursor,
             delivery_cursor=start_cursor,
+            consumption_cursor=start_cursor,
             idle_timeout=idle_timeout or self._default_idle_timeout,
         )
         # A subscription created part-way through an annotation begins at its
@@ -383,12 +411,25 @@ class WorkflowStreamRuntime:
         backend could name a position replay must not reproduce.
         """
         accumulator = self._ensure_accumulator()
-        return accumulator.add_terminal(
+        terminal = accumulator.add_terminal(
             {
                 wait_id: state.delivery_cursor
                 for wait_id, state in sorted(self._subscriptions.items())
             }
         )
+        # Anything still pending goes out with the terminal. Usually there is
+        # nothing -- each activation flushes its own delta -- but a Workflow Task
+        # that observed *nothing* creates its accumulator right here, and the
+        # header rides that creation. Returning the terminal alone would produce
+        # an annotation that begins at a terminal frame and cannot be decoded.
+        delta = b"".join([*self._pending_deltas, terminal])
+
+        # The annotation ends at the terminal. A later activation on this Run --
+        # the Continue-As-New's own, say -- opens a fresh annotation rather than
+        # appending past it: Core writes one marker per finalized annotation, and
+        # a segment recorded after the terminal could never be read back.
+        self.start_new_annotation()
+        return delta
 
     @property
     def request_rollover(self) -> bool:
@@ -410,6 +451,65 @@ class WorkflowStreamRuntime:
             wait_id: state.delivery_cursor
             for wait_id, state in self._subscriptions.items()
         }
+
+    def record_consumption(self, wait_id: int, record: StreamRecord) -> None:
+        """Notes that Workflow code has been handed this record.
+
+        Distinct from delivery, which advances by whole drained batches. The
+        difference is exactly the records sitting in a subscription's buffer that
+        the Workflow never asked for -- which die with the Run, and which a
+        successor must therefore still receive.
+        """
+        state = self._subscriptions.get(wait_id)
+        if state is None or record.offset is None:
+            return
+        state.consumption_cursor = AFTER(record.offset)
+
+    def continuation(self) -> Continuation:
+        """Where each subscription had got to, for the successor Run.
+
+        The **delivery** cursor, not the prefetch cursor: prefetch is
+        speculative, and starting the new Run past records this one never handed
+        to Workflow code would drop them silently. Not the committed cursor
+        either -- by the time this is read the terminal command is being built,
+        and the observation delta covering these deliveries is committed on that
+        same path (C14b). A continuation taken from the last *marker* would
+        restart the successor at a stale cursor, losing the final segment.
+        """
+        return Continuation(
+            cursors={
+                wait_id: state.consumption_cursor
+                for wait_id, state in self._subscriptions.items()
+            },
+            stream_names={
+                wait_id: state.stream_key.stream_name
+                for wait_id, state in self._subscriptions.items()
+            },
+        )
+
+    def restored_start(self, wait_id: int, stream_name: str) -> Cursor:
+        """The start cursor for a subscription, from the predecessor Run if any.
+
+        ``BEGINNING`` on a first execution -- the same field, filled the same
+        way, so replay reads an explicit boundary in either case.
+        """
+        if self._continuation is None:
+            return BEGINNING
+        restored = self._continuation.cursors.get(wait_id)
+        if restored is None:
+            # A subscription the predecessor did not have. Safe: adding one on a
+            # path the chain has not reached yet is the supported change.
+            return BEGINNING
+        recorded = self._continuation.stream_names.get(wait_id, "")
+        if recorded and recorded != stream_name:
+            raise StreamIntegrityError(
+                f"the predecessor Run recorded wait {wait_id} on stream "
+                f"{recorded!r}, but this Run subscribes it to {stream_name!r}. "
+                "A subscribe() call was inserted, removed, or reordered, which "
+                "renumbers every later wait; gate the change behind "
+                "workflow.patched() exactly as an inserted timer would be."
+            )
+        return restored
 
     def _ensure_accumulator(self) -> AnnotationAccumulator:
         if self._accumulator is None:

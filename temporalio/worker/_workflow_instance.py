@@ -2253,6 +2253,32 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         self._assert_not_read_only("add command")
         return self._current_completion.successful.commands.add()
 
+    def _attach_external_stream_continuation(self, command: Any) -> None:
+        """Puts each subscription's position on the Continue-As-New command.
+
+        The successor Run restores it from its own ``WorkflowExecutionStarted``
+        rather than reading the backend, so replay sees the boundary the Run
+        actually started from instead of wherever the stream has since got to
+        (ADR-022).
+
+        Nothing is attached when the Run held no subscriptions -- an empty header
+        on every Continue-As-New in every Workflow would be pure overhead.
+        """
+        runtime = self._external_stream_runtime
+        if runtime is None:
+            return
+        continuation = runtime.continuation()
+        if not continuation.cursors:
+            return
+        from temporalio.contrib.external_workflow_streams._continuation import (
+            CONTINUATION_HEADER,
+            write_continuation_header,
+        )
+
+        command.headers[CONTINUATION_HEADER].CopyFrom(
+            write_continuation_header(continuation)
+        )
+
     def _emit_external_stream_commands(self) -> None:
         """Answers the two independent questions every activation return poses.
 
@@ -3835,6 +3861,7 @@ class _ContinueAsNewError(temporalio.workflow.ContinueAsNewError):
             v.backoff_start_interval.FromTimedelta(self._input.backoff_start_interval)
         if self._input.headers:
             temporalio.common._apply_headers(self._input.headers, v.headers)
+        self._instance._attach_external_stream_continuation(v)
         if self._input.retry_policy:
             self._input.retry_policy.apply_to_proto(v.retry_policy)
         if memo_payloads:

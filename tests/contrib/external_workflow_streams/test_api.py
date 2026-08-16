@@ -39,6 +39,7 @@ class FakeRuntime:
         self.registrations: list[tuple[int, StreamKey, str]] = []
         self.buffers: dict[int, list[StreamRecord]] = {}
         self.deliveries: list[tuple[int, StreamRecord]] = []
+        self.consumed: list[tuple[int, StreamRecord]] = []
         self.blocked: list[tuple[int, bool]] = []
         self.pending: dict[int, asyncio.Future[None]] = {}
 
@@ -67,6 +68,9 @@ class FakeRuntime:
 
     def record_delivery(self, wait_id: int, record: StreamRecord) -> None:
         self.deliveries.append((wait_id, record))
+
+    def record_consumption(self, wait_id: int, record: StreamRecord) -> None:
+        self.consumed.append((wait_id, record))
 
     def note_blocked(self, wait_id: int, blocked: bool) -> None:
         self.blocked.append((wait_id, blocked))

@@ -106,6 +106,7 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         max_workflow_task_external_storage_concurrency: int,
         default_workflow_logic_flags: frozenset[_WorkflowLogicFlag] | None = None,
         external_stream_backends: Mapping[str, Any] | None = None,
+        client: Any = None,
     ) -> None:
         # Debug mode is enabled if specified or if the TEMPORAL_DEBUG env var is truthy
         debug_mode = debug_mode or bool(os.environ.get("TEMPORAL_DEBUG"))
@@ -170,11 +171,21 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         # Worker's own event loop because that is the loop the watchers must run
         # on, and __init__ is not necessarily called from it.
         self._external_stream_backends = external_stream_backends
+        #: Held only to send the reserved wake Signal, which is a raw service
+        #: call rather than anything the bridge can do -- Core cannot signal a
+        #: Workflow on this Worker's behalf.
+        self._client = client
         self._external_stream_manager: Any = None
 
         self._workflow_failure_exception_types = workflow_failure_exception_types
         self._patch_activation_callback = patch_activation_callback
         self._running_workflows: dict[str, _RunningWorkflow] = {}
+        #: Per-Run stream runtimes, held here rather than read off the instance.
+        #: A sandboxed Workflow's `instance` is a proxy that exposes only the
+        #: `WorkflowInstance` protocol, so reaching through it for the runtime
+        #: silently found nothing -- and the jobs that must never reach
+        #: `activate()` quietly went to `_apply` instead.
+        self._external_stream_runtimes: dict[str, Any] = {}
         self._disable_eager_activity_execution = disable_eager_activity_execution
         self._on_eviction_hook = on_eviction_hook
         self._disable_safe_eviction = disable_safe_eviction
@@ -668,6 +679,7 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             # rather than inside the instance because `disable_safe_eviction`
             # skips the instance's eviction job entirely, and a Run whose
             # watchers outlived it would keep a backend connection open forever.
+            self._external_stream_runtimes.pop(act.run_id, None)
             if self._external_stream_manager is not None:
                 await self._external_stream_manager.evict_run(act.run_id)
         try:
@@ -762,6 +774,9 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         )
 
         # Create instance from details
+        runtime = self._create_external_stream_runtime(act, init)
+        if runtime is not None:
+            self._external_stream_runtimes[act.run_id] = runtime
         det = WorkflowInstanceDetails(
             payload_converter_factory=self._data_converter._new_payload_converter,
             failure_converter_class=self._data_converter.failure_converter_class,
@@ -776,7 +791,7 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             last_completion_result=init.last_completion_result,
             last_failure=last_failure,
             default_workflow_logic_flags=frozenset(self._default_workflow_logic_flags),
-            external_stream_runtime=self._create_external_stream_runtime(act, init),
+            external_stream_runtime=runtime,
         )
         if defn.sandboxed:
             return self._workflow_runner.create_instance(det)
@@ -803,7 +818,7 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         passes through so ``_apply`` delivers from memory exactly as it does for
         a live resolve.
         """
-        runtime = getattr(workflow.instance, "_external_stream_runtime", None)
+        runtime = self._external_stream_runtimes.get(act.run_id)
         if runtime is None:
             return None
 
@@ -905,8 +920,74 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             self._external_stream_manager = StreamSubscriptionManager(
                 backends=self._external_stream_backends,
                 notify_ready=self._bridge_worker().notify_external_stream_ready,
+                # A Worker whose Run cannot take local readiness owes the same
+                # Signal a producer owes. Without this the record sits buffered
+                # while the Workflow waits for a task that nothing will create:
+                # parked, cached-with-no-open-task, and evicted all look the
+                # same from here, and all three are answered the same way.
+                send_wake=self._send_external_stream_wake,
             )
         return self._external_stream_manager
+
+    async def _send_external_stream_wake(self, subscription: Any) -> None:
+        """Sends the reserved wake Signal for a subscription that owes one.
+
+        Addressed to the Workflow ID with no Run ID, so it lands on the current
+        Run of the chain -- which may already be a successor by the time this
+        runs.
+
+        Failures are logged and left owed rather than raised: this runs on the
+        Worker's own loop with no Workflow Task to fail, and the watcher retries
+        on its next pass. The request ID is derived from the wake's identity, so
+        the retry is the same wake rather than a second one.
+        """
+        from temporalio.contrib.external_workflow_streams._wake import (
+            WakeRequest,
+            send_wake_signal,
+        )
+
+        if self._client is None:
+            logger.warning(
+                "An external stream wake Signal is owed but this Worker has no "
+                "client to send it with; the Workflow will wait out its idle "
+                "timeout instead"
+            )
+            return
+
+        key = subscription.stream_key
+        # Read rather than remembered: the park this wake must name is whatever
+        # is installed *now*, and a generation cached when the watcher started
+        # would name a park that has since been abandoned and resolved.
+        generation = (
+            await subscription.backend.current_park_generation(
+                key, subscription.wait_id
+            )
+            or 0
+        )
+        try:
+            await send_wake_signal(
+                self._client,
+                WakeRequest(
+                    namespace=key.namespace,
+                    workflow_id=key.workflow_id,
+                    first_execution_run_id=key.first_execution_run_id,
+                    stream_name=key.stream_name,
+                    wait_id=subscription.wait_id,
+                    park_generation=generation,
+                    sender_identity=self._client.service_client.config.identity,
+                    # Each owed wake is a separate ask, not a retry of the last
+                    # one: two records arriving in two different windows both
+                    # need a Workflow Task, and a shared request ID would let
+                    # the server deduplicate the second away.
+                    wake_counter=subscription.wakes_owed,
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Failed sending external stream wake Signal for %s wait %s",
+                key,
+                subscription.wait_id,
+            )
 
     def _create_external_stream_runtime(
         self,
@@ -924,6 +1005,9 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         from temporalio.contrib.external_workflow_streams._api import (
             DEFAULT_IDLE_TIMEOUT,
         )
+        from temporalio.contrib.external_workflow_streams._continuation import (
+            read_continuation_header,
+        )
         from temporalio.contrib.external_workflow_streams._runtime import (
             WorkflowStreamRuntime,
         )
@@ -940,6 +1024,11 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             first_execution_run_id=init.first_execution_run_id,
             data_converter=self._data_converter,
             default_idle_timeout=DEFAULT_IDLE_TIMEOUT,
+            # Read here, before the Workflow object exists and therefore before
+            # any subscribe() call: a start cursor restored after a subscription
+            # was established would already have been overwritten by BEGINNING
+            # (ADR-022).
+            continuation=read_continuation_header(dict(init.headers)),
         )
 
     def nondeterminism_as_workflow_fail(self) -> bool:

@@ -295,11 +295,24 @@ class ExternalStreamSubscription(Generic[AnyType]):
                     # Omitting them would make replay's range read find more
                     # records than the marker claims.
                     self._state.runtime.record_delivery(self._wait_id, record)
-                self._ready = [r for r in drained if not r.is_control]
-            if self._ready:
+                # Control records stay in the buffer rather than being filtered
+                # out here, so that consumption advances past them in order. A
+                # filtered control record would be neither consumed nor left
+                # behind, and the continuation cursor would step over it.
+                self._ready = list(drained)
+            while self._ready:
                 self._state.runtime.note_blocked(self._wait_id, False)  # type: ignore[union-attr]
-                yield await self._decode(self._ready.pop(0))
-                continue
+                record = self._ready.pop(0)
+                # Recorded *before* the yield: the record has been handed to
+                # Workflow code by the time it can act on it. Consumption is not
+                # delivery -- a batch is delivered whole, but a Workflow that
+                # stops iterating part-way through has consumed only its prefix,
+                # and a successor Run resuming from the delivery cursor would
+                # step over the rest.
+                self._state.runtime.record_consumption(self._wait_id, record)
+                if record.is_control:
+                    continue
+                yield await self._decode(record)
             await self._await_readiness()
 
     async def _await_readiness(self) -> None:
