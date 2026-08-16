@@ -21,7 +21,7 @@ it, so no name may collide -- and in particular no name here may begin with
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import Any, Generic, Protocol
@@ -35,6 +35,7 @@ from temporalio.contrib.external_workflow_streams._record import (
 from temporalio.types import AnyType
 
 __all__ = [
+    "merge",
     "ExternalStreamOptions",
     "ExternalStreamSubscription",
     "ExternalStreamTopic",
@@ -247,6 +248,84 @@ class ExternalStreamTopic(Generic[AnyType]):
         )
 
 
+async def merge(
+    *subscriptions: ExternalStreamSubscription[Any],
+) -> AsyncIterator[tuple[ExternalStreamSubscription[Any], Any]]:
+    """Iterates several subscriptions as one wait, in delivery order.
+
+    Yields ``(subscription, value)`` rather than bare values: the streams may
+    carry different types, and a merged value whose origin had to be guessed
+    from its shape would be unusable for anything but logging.
+
+    The subscriptions are already one wait set -- every subscription a Run holds
+    is -- so this adds no coordination of its own. What it adds is the ability to
+    *wait on all of them at once*: iterating them one at a time would block on
+    the first while records piled up on the second, and the idle timer covering
+    the set would then fire against a Workflow that was not actually idle.
+
+    Draining goes in ``wait_id`` order on every pass, which is what makes the
+    interleaving reproduce. Records that arrived in one batch across two streams
+    have no inherent order between them, so an order that depended on dict
+    iteration or on which watcher happened to run first would replay differently
+    than it ran.
+
+    The recorded delivery schedule follows: alternating records across two
+    streams encode as one run per delivery, because a run is a maximal
+    consecutive stretch from a single wait.
+    """
+    ordered = sorted(subscriptions, key=lambda s: s.wait_id)
+    if not ordered:
+        raise ValueError("merge() needs at least one subscription")
+    if len({s.wait_id for s in ordered}) != len(ordered):
+        raise ValueError(
+            "merge() was given the same subscription twice; each one is a "
+            "separate wait with its own cursor, and merging one with itself "
+            "would deliver every record to it twice"
+        )
+
+    while True:
+        delivered_any = False
+        for subscription in ordered:
+            subscription._fill()
+            while subscription._ready:
+                record = subscription._take()
+                delivered_any = True
+                if record.is_control:
+                    continue
+                yield subscription, await subscription._decode(record)
+        if not delivered_any:
+            # Nothing anywhere: block on all of them at once. Whichever wait
+            # Core resolves first wakes this, and the next pass picks it up.
+            await _await_any_readiness(ordered)
+
+
+async def _await_any_readiness(
+    subscriptions: Sequence[ExternalStreamSubscription[Any]],
+) -> None:
+    """Blocks until any one of the waits is resolved.
+
+    Every wait is marked blocked, because the quiescent snapshot must name the
+    **complete** set the Workflow is waiting on: a set missing one member would
+    let Core park the Workflow Task while that member was still live.
+    """
+    runtime = subscriptions[0]._state.runtime
+    assert runtime is not None
+    futures = []
+    for subscription in subscriptions:
+        runtime.note_blocked(subscription.wait_id, True)
+        future = runtime.new_readiness_future()
+        runtime.register_pending(subscription.wait_id, future)
+        futures.append(future)
+    try:
+        await asyncio.wait(futures, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for subscription in subscriptions:
+            runtime.discard_pending(subscription.wait_id)
+        for future in futures:
+            if not future.done():
+                future.cancel()
+
+
 class ExternalStreamSubscription(Generic[AnyType]):
     """One subscription's async iterator over decoded values."""
 
@@ -282,38 +361,49 @@ class ExternalStreamSubscription(Generic[AnyType]):
 
     async def _iterate(self) -> AsyncIterator[AnyType]:
         while not self._finished:
-            if not self._ready:
-                # Drain first, then block. Draining is a buffer pop and never
-                # touches the backend -- the record is already here or it is
-                # not, and if it is not, only Core can say when to look again.
-                assert self._state.runtime is not None
-                drained = self._state.runtime.drain(self._wait_id)
-                for record in drained:
-                    # Recorded for *every* record, control ones included: they
-                    # occupy offsets inside a run, so a run's count includes
-                    # them and their positions go in `control_positions`.
-                    # Omitting them would make replay's range read find more
-                    # records than the marker claims.
-                    self._state.runtime.record_delivery(self._wait_id, record)
-                # Control records stay in the buffer rather than being filtered
-                # out here, so that consumption advances past them in order. A
-                # filtered control record would be neither consumed nor left
-                # behind, and the continuation cursor would step over it.
-                self._ready = list(drained)
+            self._fill()
             while self._ready:
-                self._state.runtime.note_blocked(self._wait_id, False)  # type: ignore[union-attr]
-                record = self._ready.pop(0)
-                # Recorded *before* the yield: the record has been handed to
-                # Workflow code by the time it can act on it. Consumption is not
-                # delivery -- a batch is delivered whole, but a Workflow that
-                # stops iterating part-way through has consumed only its prefix,
-                # and a successor Run resuming from the delivery cursor would
-                # step over the rest.
-                self._state.runtime.record_consumption(self._wait_id, record)
+                record = self._take()
                 if record.is_control:
                     continue
                 yield await self._decode(record)
             await self._await_readiness()
+
+    def _fill(self) -> None:
+        """Moves whatever is buffered into this subscription's ready list.
+
+        Draining is a buffer pop and never touches the backend -- the record is
+        already here or it is not, and if it is not, only Core can say when to
+        look again.
+        """
+        if self._ready:
+            return
+        assert self._state.runtime is not None
+        drained = self._state.runtime.drain(self._wait_id)
+        for record in drained:
+            # Recorded for *every* record, control ones included: they occupy
+            # offsets inside a run, so a run's count includes them and their
+            # positions go in `control_positions`. Omitting them would make
+            # replay's range read find more records than the marker claims.
+            self._state.runtime.record_delivery(self._wait_id, record)
+        # Control records stay in the list rather than being filtered out here,
+        # so that consumption advances past them in order. A filtered control
+        # record would be neither consumed nor left behind, and the continuation
+        # cursor would step over it.
+        self._ready = list(drained)
+
+    def _take(self) -> StreamRecord:
+        """Pops the next record, recording that Workflow code now has it."""
+        assert self._state.runtime is not None
+        self._state.runtime.note_blocked(self._wait_id, False)
+        record = self._ready.pop(0)
+        # Recorded *before* the record is handed over: consumption is not
+        # delivery. A batch is delivered whole, but a Workflow that stops
+        # iterating part-way through has consumed only its prefix, and a
+        # successor Run resuming from the delivery cursor would step over the
+        # rest.
+        self._state.runtime.record_consumption(self._wait_id, record)
+        return record
 
     async def _await_readiness(self) -> None:
         """Blocks until the readiness activation resolves this wait.
