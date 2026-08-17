@@ -98,13 +98,22 @@ def backend() -> MemoryStreamBackend:
     return MemoryStreamBackend()
 
 
+#: Per-stream sequence, so successive publishes do not collide. `(session_id,
+#: sequence)` is the idempotency key: restarting the count re-uses a key with
+#: different content, which the backend contract rejects outright -- correctly,
+#: and it is the test that is wrong when it happens.
+_sequences: dict[StreamKey, int] = {}
+
+
 async def publish(backend: MemoryStreamBackend, key: StreamKey, values: list[str]):
     codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
-    for i, value in enumerate(values):
+    start = _sequences.get(key, 0)
+    for i, value in enumerate(values, start=start):
         await backend.append(
             key,
             StreamRecord(RecordKind.DATA, await codec.encode(value), "producer", i),
         )
+    _sequences[key] = start + len(values)
 
 
 async def stream_key_for(client: Client, handle, name: str) -> StreamKey:  # type: ignore[no-untyped-def]
@@ -117,19 +126,6 @@ async def stream_key_for(client: Client, handle, name: str) -> StreamKey:  # typ
     )
 
 
-CONDITION_ALONGSIDE_SUBSCRIPTION_SPINS = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "A `wait_condition` evaluated alongside a subscription iteration livelocks: "
-        "the Workflow never completes and the server accumulates tens of thousands "
-        "of events. The pattern is an ordinary one, so this is a defect rather than "
-        "a limitation -- marked rather than deleted so it is not lost. Strict, so "
-        "it turns red once fixed."
-    ),
-)
-
-
-@CONDITION_ALONGSIDE_SUBSCRIPTION_SPINS
 async def test_replaying_a_stream_history_reproduces_the_same_observations(
     client: Client, backend: MemoryStreamBackend
 ) -> None:
