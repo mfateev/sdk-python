@@ -27,9 +27,23 @@ from tests.contrib.external_workflow_streams.m1_gate import (
 #: claim coverage the suite does not have.
 #: Numbers follow `tests-m1.md` in document order.
 M1_COVERAGE: dict[int, str | tuple[str, ...]] = {
+    1: "external_streams.rs::a_normal_completion_commits_its_marker",
+    2: (
+        "external_streams.rs::an_activity_command_writes_its_marker_ordered_before_it",
+        "external_streams.rs::replaying_a_marker_before_an_activity_delivers_its_record_exactly_once",
+    ),
+    3: (
+        "external_streams.rs::a_failed_workflow_writes_its_marker_ordered_before_the_failure",
+        "external_streams.rs::a_continue_as_new_writes_its_marker_ordered_before_it",
+    ),
     4: "external_streams.rs::several_progress_reports_collapse_into_one_marker",
+    5: "external_streams.rs::every_completion_path_writes_exactly_one_marker_ending_in_a_terminal",
     6: "test_runtime.py::test_a_first_subscription_to_an_empty_stream_still_emits",
     7: "test_runtime.py::test_an_activation_that_drained_nothing_emits_an_empty_segment",
+    8: (
+        "external_streams.rs::a_budget_driven_split_writes_two_markers_rather_than_one_oversized_one",
+        "test_replay.py::test_two_markers_reassemble_in_workflow_task_order",
+    ),
     9: "test_annotation.py::test_a_large_single_stream_batch_encodes_as_one_run",
     10: (
         "test_annotation.py::test_encoded_size_stays_flat_with_sparse_control_records",
@@ -38,16 +52,22 @@ M1_COVERAGE: dict[int, str | tuple[str, ...]] = {
     11: "external_streams.rs::readiness_before_the_idle_timer_expires_cancels_it",
     12: "external_streams.rs::a_confirmed_idle_park_writes_one_marker_and_completes_the_task",
     13: "test_runtime_only_jobs.py::test_a_recheck_that_finds_records_abandons_the_whole_park",
-    14: "test_wake.py::test_a_producer_that_finds_a_wakeable_generation_sends_exactly_one_signal",
+    14: (
+        "test_wake.py::test_a_producer_that_finds_a_wakeable_generation_sends_exactly_one_signal",
+        "test_runtime.py::test_readiness_after_a_re_block_names_the_current_generation",
+    ),
     15: "external_streams.rs::a_stale_generation_produces_no_activation",
     16: "external_streams.rs::an_all_fenced_snapshot_parks_without_waiting_out_the_idle_timeout",
     17: "external_streams.rs::a_core_decided_boundary_asks_for_a_terminal_before_writing_anything",
     18: "external_streams.rs::a_core_decided_boundary_asks_for_a_terminal_before_writing_anything",
+    19: "test_rollover_integration.py::test_a_continuously_fed_stream_survives_a_rollover",
     20: "external_streams.rs::the_rollover_deadline_fires_on_a_workflow_only_worker",
+    21: "test_rollover_integration.py::test_a_signal_into_a_retained_task_lands_by_the_rollover_deadline",
     22: (
         "test_worker_integration.py::test_an_append_with_no_open_task_wakes_the_workflow",
         "test_api.py::test_a_record_buffered_while_not_iterating_is_still_delivered",
     ),
+    23: "test_rollover_integration.py::test_an_append_after_a_rollover_completion_wakes_the_subscription",
     24: "test_manager.py::test_undeliverable_readiness_owes_a_wake_and_keeps_the_right_watchers",
     25: "external_streams.rs::an_unknown_envelope_version_is_ignored_harmlessly",
     26: (
@@ -59,6 +79,9 @@ M1_COVERAGE: dict[int, str | tuple[str, ...]] = {
         "test_wake.py::test_two_workers_unparked_wakes_are_both_delivered",
         "test_wake.py::test_one_senders_retry_stays_a_single_wake",
     ),
+    28: "external_streams.rs::a_second_worker_reconstructs_the_subscription_from_the_shutdown_marker",
+    30: "test_worker_handoff.py::test_a_finalization_that_cannot_be_answered_writes_no_marker",
+    31: "external_streams.rs::an_unwritten_annotation_exists_only_while_a_workflow_task_is_open",
     32: (
         "test_shutdown_sweep.py::test_a_momentarily_failing_wake_is_retried_and_succeeds",
         "test_shutdown_sweep.py::test_the_retry_is_bounded_and_then_reported",
@@ -67,11 +90,14 @@ M1_COVERAGE: dict[int, str | tuple[str, ...]] = {
     ),
     33: "test_runtime_only_jobs.py::test_finalization_touches_no_provider_at_all",
     34: "test_replay.py::test_replay_performs_no_live_waiting",
+    35: "test_replay_end_to_end.py::test_replaying_a_stream_history_reproduces_the_same_observations",
     37: "test_replay.py::test_an_unreachable_backend_fails_as_transient_storage",
     38: "test_replay.py::test_each_deletion_position_fails_a_different_check",
     39: "test_replay.py::test_an_intact_but_undecodable_record_is_a_decode_error",
     40: "test_replay.py::test_a_marker_naming_an_unknown_wait_is_nondeterminism_not_integrity_loss",
+    41: "test_worker_crash.py::test_a_crash_before_the_marker_makes_the_next_worker_re_read",
     42: "test_continuation.py::test_a_first_execution_starts_at_the_beginning",
+    43: "external_streams.rs::a_pending_timer_suppresses_retention_but_its_subscriptions_survive_it",
     44: "test_backend_conformance.py::test_a_broken_backend_fails_for_the_right_reason",
     45: "test_backend_conformance.py::test_a_backend_needing_a_nameable_cursor_fails_the_tail_check",
     46: "test_redis_backend.py::test_offsets_compare_numerically_not_lexically",
@@ -93,49 +119,11 @@ M1_COVERAGE: dict[int, str | tuple[str, ...]] = {
 #: cover. A case is in exactly one of the two maps: claiming a partially covered
 #: case as covered is how a gate stops meaning anything.
 M1_GAPS: dict[int, str] = {
-    1: (
-        "only the command-producing completion is tested; a completion carrying nothing but WorkflowStreamProgress is not (Core)"
-    ),
-    2: (
-        "marker-before-command ordering proven only against a terminal command; no Activity command, no replay-delivers-once assertion (Core)"
-    ),
-    3: (
-        "only CompleteWorkflowExecution; fail and continue-as-new orderings untested (Core)"
-    ),
-    5: (
-        "BLOCKED on C15b: two of the eight rows are shutdown paths that cannot be produced yet, and this case demands the table as a whole"
-    ),
-    8: (
-        "two markers reassemble at the byte level in Core, but nothing feeds the concatenation through prepare_replay, and the split is deadline- not budget-driven"
-    ),
-    19: (
-        "no long-running test feeds a stream across a rollover under the Workflow Task timeout"
-    ),
-    21: (
-        "nothing signals into a retained Workflow Task and measures delivery against the rollover deadline"
-    ),
-    23: ("the same wake path after a rollover completion has no test"),
-    28: (
-        "BLOCKED on C15b: ParkReason::Shutdown is never constructed, so FinalizeExternalStreams{SHUTDOWN} cannot be issued"
-    ),
     29: (
-        "no second Worker: the replacement task and reconstruction from the marker are unasserted, as is that no marker was written"
+        "the sweep runs and an unparked wake reaches History, but the second Worker does not pick the Run up; under re-diagnosis, previous reasons having gone stale three times"
     ),
-    30: (
-        "failure is induced by an omitted terminal rather than the manager's Run entry vanishing; retry-replays-from-previous-marker is absent"
-    ),
-    31: (
-        "BLOCKED on C15b: the eviction transition and the unwritten-annotation invariant across both eviction states are its deliverable"
-    ),
-    35: (
-        "segmentation is asserted against a stub driver; no real wait_condition registered mid-stream, no live-versus-replay comparison"
-    ),
-    36: ("empty stream subscribe, park, evict, replay has no end-to-end test"),
-    41: (
-        "manager-level cursor reset only; no Worker crash and restart re-reading the same offsets"
-    ),
-    43: (
-        "retention suppression is asserted; that the wait set survives to the next Workflow Task is not"
+    36: (
+        "an empty stream that parks, is evicted, and replays has no end-to-end test. test_replay_end_to_end.py::test_an_empty_stream_replays_from_its_recorded_boundary covers subscribe-and-replay but neither the park nor the eviction"
     ),
 }
 
