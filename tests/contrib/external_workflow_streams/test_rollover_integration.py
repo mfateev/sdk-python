@@ -30,6 +30,7 @@ import pytest
 from temporalio import workflow
 from temporalio.client import Client
 from temporalio.contrib.external_workflow_streams._backend import StreamKey
+from temporalio.service import RPCError, RPCStatusCode
 from temporalio.worker import Worker
 from tests.contrib.external_workflow_streams.memory_backend import MemoryStreamBackend
 from tests.contrib.external_workflow_streams.test_worker_integration import publish
@@ -70,37 +71,11 @@ lands at about 10s and still fails the assertion, and telling that apart from a
 rollover is the only thing the assertion is for.
 """
 
-STALLS_AFTER_A_STREAM_WORKFLOW_TASK = (
-    "A Workflow Task whose activation Core builds with an empty job list is "
-    "flagged as a replay, and the task a stream's wake Signal creates -- which "
-    "is also the replacement task after a rollover -- is built exactly that "
-    "way. get_wf_activation computes all_query as jobs.iter().all(is_query) "
-    "(machines/workflow_machines.rs:458), which is vacuously true for an empty "
-    "list, and is_replaying is then `self.replaying || all_query` (:464). The "
-    "wake Signal is intercepted and produces no job, and ManagedRun appends "
-    "ResolveExternalStreamWaits only *after* the activation has been built "
-    "(managed_run.rs:294-303) -- so the list is empty at the moment the flag is "
-    "computed. Activations for readiness arriving on an already-open task queue "
-    "their job first and are correctly flagged live, which is why this shows up "
-    "only at a task boundary. Python's completion path returns early "
-    "while replaying (_workflow_instance.py:2339), so that task emits neither "
-    "WorkflowStreamProgress nor WorkflowStreamQuiescent: what it consumed is "
-    "never marked, and Core is left holding the wait generation from the "
-    "previous task. Every readiness report after it answers Stale, the watcher "
-    "treats Stale as 'probe again later' while its prefetch cursor is already "
-    "past those records, and the subscription never receives anything again. "
-    "Shown minimally by parking a subscription and then creating the second "
-    "Workflow Task two ways: an ordinary user Signal activates with "
-    "is_replaying=False, the reserved wake Signal activates with "
-    "is_replaying=True, over identical History. "
-)
-"""The one defect behind both remaining expected failures, stated once.
+POST_ROLLOVER_PAUSE = timedelta(seconds=10)
+"""How long the post-rollover Workflow Task boundary is held open for.
 
-It is *not* the rollover anchor the previous reason described: rollover itself
-works. Core completes the retained task at 80% of the Workflow Task timeout,
-writes its marker, and asks for a replacement -- which is exactly what
-``test_a_signal_into_a_retained_task_lands_by_the_rollover_deadline`` now
-passes on. What fails is everything after that replacement task.
+Long enough for an append and the wake it owes to be observed in History
+without waiting on anything else, short enough that the test finishes.
 """
 
 
@@ -165,6 +140,44 @@ class SignalledStreamWorkflow:
         self._signalled = workflow.now().timestamp()
 
 
+@workflow.defn
+class RolloverThenPauseWorkflow:
+    """Consumes across a rollover, then pauses on a Timer and consumes once more.
+
+    The pause is what makes the post-rollover window addressable. A completion
+    carrying a server-bound command cannot ask for retention, so the Workflow
+    Task ends there with the subscription still active and still unparked --
+    which is the state a rollover leaves behind, held still. The rollover's own
+    window is not addressable from outside the process: Core completes a
+    rollover with ``force_new_wft``, and the server has a replacement Workflow
+    Task started within a millisecond of it.
+    """
+
+    def __init__(self) -> None:
+        self._seen = 0
+
+    @workflow.run
+    async def run(self, before_pause: int) -> int:
+        tokens = external_stream.topic("tokens", backend="tokens-memory", type=str)
+        subscription = tokens.subscribe()
+        iterator = subscription.__aiter__()
+
+        while self._seen < before_pause:
+            await iterator.__anext__()
+            self._seen += 1
+
+        # A real Timer: the completion that carries it cannot be retained.
+        await asyncio.sleep(POST_ROLLOVER_PAUSE.total_seconds())
+
+        # Whatever was appended into that window. That it arrives at all proves
+        # only that it was not lost -- the Timer creates a Workflow Task of its
+        # own when it fires, and that task would find a buffered record anyway.
+        # What proves the wake is the Signal in History, which the test asserts.
+        await iterator.__anext__()
+        self._seen += 1
+        return self._seen
+
+
 @pytest.fixture
 def backend() -> MemoryStreamBackend:
     return MemoryStreamBackend()
@@ -192,6 +205,60 @@ def timed_out_tasks(events: list[Any]) -> list[Any]:
     return [e for e in events if e.HasField("workflow_task_timed_out_event_attributes")]
 
 
+async def stop_if_running(handle: Any) -> None:
+    """Terminates the Workflow, unless it has already finished on its own.
+
+    Every test here terminates in a ``finally``, because a Workflow left running
+    keeps a Worker's Run alive past the test that owns it. A test whose whole
+    point is that the Workflow *finishes* has nothing left to terminate, though,
+    and the server answers that with ``NOT_FOUND`` -- an error about the
+    cleanup, raised after the assertions have all passed, which reads exactly
+    like the feature having failed. Only that one status is swallowed: anything
+    else is a real failure of the teardown and is left to surface.
+    """
+    try:
+        await handle.terminate()
+    except RPCError as err:
+        if err.status is not RPCStatusCode.NOT_FOUND:
+            raise
+
+
+def timers_started(events: list[Any]) -> list[Any]:
+    return [e for e in events if e.HasField("timer_started_event_attributes")]
+
+
+def held_for(events: list[Any], completed: Any) -> timedelta:
+    """How long the Workflow Task that ``completed`` closes was held open."""
+    started = {
+        e.event_id: e
+        for e in events
+        if e.HasField("workflow_task_started_event_attributes")
+    }
+    start = started[completed.workflow_task_completed_event_attributes.started_event_id]
+    return completed.event_time.ToDatetime() - start.event_time.ToDatetime()
+
+
+def rollover_completion(events: list[Any]) -> Any | None:
+    """The first Workflow Task completion that can only be a rollover.
+
+    Identified by how long the task it closes was held: an idle park closes one
+    an idle timeout after its last record, and a command-carrying completion
+    closes one as soon as the activation returns. Only rollover holds a task
+    open for the whole deadline, so a completion at the deadline is the
+    mechanism itself rather than a task that happened to take a while.
+
+    The window is the deadline itself, less :data:`ROLLOVER_DELIVERY_TOLERANCE`
+    and up to the Workflow Task timeout. The same margin applies in this
+    direction for the same reason: what is measured is the distance between two
+    server event times, and Core arms its deadline from neither of them.
+    """
+    for completed in completed_tasks(events):
+        held = held_for(events, completed)
+        if ROLLOVER_DEADLINE - ROLLOVER_DELIVERY_TOLERANCE <= held < TASK_TIMEOUT:
+            return completed
+    return None
+
+
 def wake_signals(events: list[Any]) -> list[Any]:
     """The reserved wake Signals in a Workflow's own History.
 
@@ -206,6 +273,24 @@ def wake_signals(events: list[Any]) -> list[Any]:
         and e.workflow_execution_signaled_event_attributes.signal_name
         == WAKE_SIGNAL_NAME
     ]
+
+
+async def wait_for_history(
+    handle: Any,
+    predicate: Any,
+    *,
+    timeout: float,
+    message: str,
+) -> list[Any]:
+    """Polls the Workflow's History until ``predicate`` holds, or fails saying why."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        events = await history(handle)
+        if predicate(events):
+            return events
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(message)
+        await asyncio.sleep(0.2)
 
 
 async def feed(
@@ -233,15 +318,6 @@ async def feed(
 # --- case 19 ------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=STALLS_AFTER_A_STREAM_WORKFLOW_TASK
-    + "Here that is the replacement task itself: it activates with "
-    "is_replaying=True, completes carrying no command at all, and the Run goes "
-    "quiet with the remaining records buffered in the Worker and never "
-    "delivered. The first assertion below passes -- a task did complete inside "
-    "the deadline, so rollover fired -- and the Workflow then never finishes",
-)
 @pytest.mark.timeout(180)
 async def test_a_continuously_fed_stream_survives_a_rollover(
     client: Client, backend: MemoryStreamBackend
@@ -307,24 +383,21 @@ async def test_a_continuously_fed_stream_survives_a_rollover(
                 "a Workflow Task was held past the server's timeout, so "
                 "rollover did not bound it"
             )
-            started = {
-                e.event_id: e
-                for e in events
-                if e.HasField("workflow_task_started_event_attributes")
-            }
             for event in completed_tasks(events):
-                start = started[
-                    event.workflow_task_completed_event_attributes.started_event_id
-                ]
-                held = event.event_time.ToDatetime() - start.event_time.ToDatetime()
+                held = held_for(events, event)
                 assert held < TASK_TIMEOUT, (
                     f"a Workflow Task was held for {held}, past the "
                     f"{TASK_TIMEOUT} it must stay inside"
                 )
+            assert rollover_completion(events) is not None, (
+                "no Workflow Task was held to the rollover deadline, so the "
+                f"{total} records were consumed without one -- and this test "
+                "asserts nothing about rollover unless one fired"
+            )
         finally:
             stop.set()
             feeder.cancel()
-            await handle.terminate()
+            await stop_if_running(handle)
 
 
 # --- case 21 ------------------------------------------------------------------
@@ -414,74 +487,95 @@ async def test_a_signal_into_a_retained_task_lands_by_the_rollover_deadline(
         finally:
             stop.set()
             feeder.cancel()
-            try:
-                await handle.terminate()
-            except Exception:
-                pass
+            await stop_if_running(handle)
 
 
 # --- case 23 ------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=STALLS_AFTER_A_STREAM_WORKFLOW_TASK
-    + "Here that removes the wake this test looks for. The append below is "
-    "answered Stale rather than NoOpenWorkflowTask, and the watcher owes a "
-    "Signal only on the three answers that mean local readiness could not be "
-    "delivered -- Stale is not one of them, so nothing is sent and no "
-    "__temporal_external_stream_wake ever reaches History. The watcher is right "
-    "to trust the answer; the answer is wrong",
-)
 @pytest.mark.timeout(180)
 async def test_an_append_after_a_rollover_completion_wakes_the_subscription(
     client: Client, backend: MemoryStreamBackend
 ) -> None:
-    """A rollover leaves subscriptions active but unparked, like a command does.
+    """A subscription that has been through a rollover is still woken by a Signal.
 
-    There is no retained task to notify locally and no park generation for a
+    A rollover ends a Workflow Task with the subscription active and unparked:
+    there is no retained task to notify locally and no park generation for a
     producer to observe, so the consumer's own watcher is what covers the
-    window: it observes ``NoOpenWorkflowTask`` and sends the reserved wake
+    window -- it observes ``NoOpenWorkflowTask`` and sends the reserved wake
     Signal itself.
 
-    The Signal is looked for in the Workflow's own History rather than inferred
-    from the record eventually arriving -- after a rollover the server has
-    already scheduled a replacement task, so a record that turned up could just
-    as well have been picked up by that.
+    That window cannot be appended into directly. Core completes a rollover with
+    ``force_new_wft``, so the server starts the replacement Workflow Task within
+    a millisecond, and an append made from a test lands on the replacement task
+    instead: readiness is answered ``Accepted``, the record is delivered live,
+    and no wake is owed or sent -- which is correct behaviour and not the
+    mechanism this case is about. The Workflow therefore *holds* the same state
+    open on the far side of the rollover with a Timer, whose completion is
+    server-bound and equally cannot be retained, and the append goes in there.
+
+    Both halves are asserted, since either alone is satisfiable without the
+    other: that a rollover really happened, by a Workflow Task held to the
+    deadline and closed inside the timeout; and that the append was answered by
+    a wake, by ``__temporal_external_stream_wake`` reaching the Workflow's own
+    History *after* the completion that opened the window. The record arriving
+    proves nothing on its own -- the Timer creates a Workflow Task when it
+    fires, which would have picked the record up anyway.
     """
+    before_pause = 30  # 30 * 0.3s = 9s of feeding, past a deadline at 8s.
     task_queue = f"tq-{uuid.uuid4()}"
     session = f"rollover-{uuid.uuid4()}"
     async with Worker(
         client,
         task_queue=task_queue,
-        workflows=[SteadyStreamWorkflow],
+        workflows=[RolloverThenPauseWorkflow],
         external_stream_backends={"tokens-memory": backend},
     ):
         handle = await client.start_workflow(
-            SteadyStreamWorkflow.run,
-            40,
+            RolloverThenPauseWorkflow.run,
+            before_pause,
             id=f"wf-{uuid.uuid4()}",
             task_queue=task_queue,
             task_timeout=TASK_TIMEOUT,
         )
         key = await stream_key_for(client, handle)
         stop = asyncio.Event()
-        feeder = asyncio.ensure_future(feed(backend, key, session, count=30, stop=stop))
+        feeder = asyncio.ensure_future(
+            feed(backend, key, session, count=before_pause, stop=stop)
+        )
         try:
-            await asyncio.sleep(ROLLOVER_DEADLINE.total_seconds() + 1)
+            # The Timer is started only once every fed record has been consumed,
+            # which takes longer than the deadline -- so its appearance is also
+            # the point past which the rollover has already happened.
+            events = await wait_for_history(
+                handle,
+                timers_started,
+                timeout=60,
+                message=(
+                    f"the Workflow never consumed the {before_pause} records fed "
+                    "to it and reached its pause, so there is no unparked "
+                    "Workflow Task boundary to append into"
+                ),
+            )
             stop.set()
             feeder.cancel()
 
-            events = await history(handle)
-            assert completed_tasks(events), (
-                "no Workflow Task completed while the stream was being fed, so "
-                "no rollover happened and there is no post-rollover window to "
-                "append into"
+            rollover = rollover_completion(events)
+            assert rollover is not None, (
+                "no Workflow Task was held to the rollover deadline of "
+                f"{ROLLOVER_DEADLINE}, so the subscription this appends to has "
+                "not been through a rollover and the case is untested"
             )
             assert not timed_out_tasks(events), (
                 "the task was released by the server's timeout rather than by a "
                 "rollover"
             )
+            pause = timers_started(events)[0]
+            assert pause.event_id > rollover.event_id, (
+                "the pause began before the rollover, so the window appended "
+                "into below is not a post-rollover one"
+            )
+
             # Counted by name, and by the *same* name the check below uses: a
             # baseline that counted every Signal would be compared against a
             # total that counts only wake Signals, and any unrelated Signal in
@@ -491,23 +585,32 @@ async def test_an_append_after_a_rollover_completion_wakes_the_subscription(
 
             await publish(backend, key, ["after-rollover"], session=session)
 
-            async def a_wake_arrived() -> bool:
-                return len(wake_signals(await history(handle))) > before
+            def woken(events: list[Any]) -> bool:
+                wakes = wake_signals(events)
+                # Position as well as count: a Signal sent while a Workflow Task
+                # was open reaches History only when that task completes, so
+                # counting alone would accept one that was owed long before this
+                # append and merely landed late.
+                return len(wakes) > before and wakes[-1].event_id > pause.event_id
 
-            deadline = asyncio.get_running_loop().time() + 20
-            while asyncio.get_running_loop().time() < deadline:
-                if await a_wake_arrived():
-                    return
-                await asyncio.sleep(0.2)
-            raise AssertionError(
-                "no wake Signal followed the append: after a rollover "
-                "completion there is no retained task to notify and no park "
-                "generation to observe, so the watcher owes one"
+            await wait_for_history(
+                handle,
+                woken,
+                timeout=POST_ROLLOVER_PAUSE.total_seconds(),
+                message=(
+                    "no wake Signal followed the append: the Workflow Task that "
+                    "carried the pause left the subscription active and "
+                    "unparked, so there was no retained task to notify and no "
+                    "park generation to observe, and the watcher owes one"
+                ),
+            )
+
+            assert await asyncio.wait_for(handle.result(), 60) == before_pause + 1, (
+                "the record appended into the unparked window never reached the "
+                "Workflow, so the wake Signal did not carry the subscription "
+                "over the boundary"
             )
         finally:
             stop.set()
             feeder.cancel()
-            try:
-                await handle.terminate()
-            except Exception:
-                pass
+            await stop_if_running(handle)
