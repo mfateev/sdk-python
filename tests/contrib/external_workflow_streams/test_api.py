@@ -13,6 +13,7 @@ import temporalio.workflow
 from temporalio.contrib.external_workflow_streams import _api
 from temporalio.contrib.external_workflow_streams._api import (
     DEFAULT_IDLE_TIMEOUT,
+    MAX_RECORDS_PER_ACTIVATION,
     ExternalStreamOptions,
     ExternalStreamSubscription,
     ExternalStreamTopic,
@@ -42,6 +43,7 @@ class FakeRuntime:
         self.consumed: list[tuple[int, StreamRecord]] = []
         self.blocked: list[tuple[int, bool]] = []
         self.pending: dict[int, asyncio.Future[None]] = {}
+        self.budget = MAX_RECORDS_PER_ACTIVATION
 
     def stream_key(self, stream_name: str) -> StreamKey:
         return StreamKey("ns", "wf", "first-run", stream_name)
@@ -55,8 +57,21 @@ class FakeRuntime:
 
     def drain(self, wait_id: int, max_records: int | None = None) -> list[StreamRecord]:
         buffered = self.buffers.get(wait_id, [])
-        self.buffers[wait_id] = []
+        if max_records is not None:
+            buffered, self.buffers[wait_id] = (
+                buffered[:max_records],
+                buffered[max_records:],
+            )
+        else:
+            self.buffers[wait_id] = []
         return buffered
+
+    def delivery_budget_remaining(self) -> int:
+        return self.budget
+
+    def record_consumption(self, wait_id: int, record: StreamRecord) -> None:
+        self.consumed.append((wait_id, record))
+        self.budget = max(0, self.budget - 1)
 
     def codec_for(self, value_type: type | None) -> StreamPayloadCodec[Any]:
         return StreamPayloadCodec(
@@ -68,9 +83,6 @@ class FakeRuntime:
 
     def record_delivery(self, wait_id: int, record: StreamRecord) -> None:
         self.deliveries.append((wait_id, record))
-
-    def record_consumption(self, wait_id: int, record: StreamRecord) -> None:
-        self.consumed.append((wait_id, record))
 
     def note_blocked(self, wait_id: int, blocked: bool) -> None:
         self.blocked.append((wait_id, blocked))

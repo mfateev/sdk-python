@@ -361,3 +361,80 @@ async def test_an_append_with_no_open_task_wakes_the_workflow(
             "the record was delivered without a wake Signal, so this passed by "
             "timing rather than by the mechanism under test"
         )
+
+
+@workflow.defn
+class FloodedCountWorkflow:
+    """Consumes far more records than one activation is allowed to deliver."""
+
+    def __init__(self) -> None:
+        self._seen = 0
+
+    @workflow.run
+    async def run(self, expected: int) -> int:
+        tokens = external_stream.with_options(idle_timeout=timedelta(seconds=30)).topic(
+            "tokens", backend="tokens-memory", type=str
+        )
+        async for _ in tokens.subscribe():
+            self._seen += 1
+            if self._seen >= expected:
+                break
+        return self._seen
+
+    @workflow.query
+    def seen(self) -> int:
+        return self._seen
+
+
+async def test_a_flood_larger_than_one_activations_budget_is_delivered_in_full(
+    client: Client, backend: MemoryStreamBackend
+) -> None:
+    """The whole budget mechanism, end to end, on a real Workflow Task loop.
+
+    Three things have to be connected for this to finish, and each of them hangs
+    the Workflow permanently on its own:
+
+    - the per-activation budget, or the first ``activate()`` never returns and
+      the Workflow Task dies on the 2-second deadlock timeout -- on every retry,
+      because the records are still there;
+    - the reset at the start of each activation, or delivery stops for good once
+      the first budget is spent;
+    - the readiness re-arm, or the records the budget left buffered are never
+      announced again, because the watcher moved its prefetch cursor past them
+      when it buffered them.
+
+    So a plain "did it finish" assertion is not a weak one here: nothing about
+    this Workflow completes if any part of the mechanism is missing.
+    """
+    from temporalio.contrib.external_workflow_streams._api import (
+        MAX_RECORDS_PER_ACTIVATION,
+    )
+
+    total = 3 * MAX_RECORDS_PER_ACTIVATION
+    task_queue = f"tq-{uuid.uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[FloodedCountWorkflow],
+        external_stream_backends={"tokens-memory": backend},
+    ):
+        handle = await client.start_workflow(
+            FloodedCountWorkflow.run,
+            total,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=task_queue,
+        )
+        description = await handle.describe()
+        key = StreamKey(
+            client.namespace,
+            handle.id,
+            description.raw_description.workflow_execution_info.first_run_id,
+            "tokens",
+        )
+        await asyncio.sleep(1)
+        # One session, one continuous sequence: `(session_id, sequence)` is the
+        # idempotency key, so restarting the numbering would re-use a key with
+        # different content and the backend would reject the append.
+        await publish(backend, key, [f"t{i}" for i in range(total)])
+
+        assert await asyncio.wait_for(handle.result(), 60) == total

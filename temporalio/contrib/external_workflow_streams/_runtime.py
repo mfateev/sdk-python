@@ -42,6 +42,9 @@ from temporalio.contrib.external_workflow_streams._annotation import (
     SegmentEndReason,
     StreamBinding,
 )
+from temporalio.contrib.external_workflow_streams._api import (
+    MAX_RECORDS_PER_ACTIVATION,
+)
 from temporalio.contrib.external_workflow_streams._backend import (
     StreamBackend,
     StreamKey,
@@ -60,6 +63,14 @@ from temporalio.contrib.external_workflow_streams._record import (
 from temporalio.contrib.external_workflow_streams._replay import ReplayPlan
 
 __all__ = ["QuiescentWait", "WorkflowStreamRuntime"]
+
+_REPLAY_UNBOUNDED = 2**63 - 1
+"""The budget reported while a recorded segment is being delivered.
+
+A number rather than ``None`` so that every caller keeps one code path: a
+segment is finite and already recorded, so "as many as the segment holds" and
+"no limit" are the same answer.
+"""
 
 
 @dataclass(frozen=True)
@@ -168,6 +179,58 @@ class WorkflowStreamRuntime:
         self._pending: dict[int, asyncio.Future[None]] = {}
         #: Non-``None`` only while a recorded segment is being delivered.
         self._replay_ready: list[tuple[int, StreamRecord]] | None = None
+        #: Records handed to Workflow code since this activation began. Counted
+        #: here rather than per subscription because the cap is an *activation*
+        #: budget: `merge()` consumes from several subscriptions inside one
+        #: activation, and a per-subscription counter would let n streams run n
+        #: times as long.
+        self._delivered_this_activation = 0
+
+    # --- the per-activation delivery budget ---------------------------------
+
+    def begin_activation(self) -> None:
+        """Resets the delivery budget. Called once per activation.
+
+        The budget is per activation because that is the unit the deadlock
+        timeout applies to: what must be bounded is how long one ``activate()``
+        call can run, not how much a Run receives over its life.
+        """
+        self._delivered_this_activation = 0
+
+    def delivery_budget_remaining(self) -> int:
+        """How many more records this activation may hand to Workflow code.
+
+        Unbounded during replay. Delivery then comes from the recorded segments
+        rather than a live producer, so it is already finite, and the recorded
+        boundaries already say how many records each activation received --
+        re-cutting them here would deliver a different schedule than the one in
+        History.
+        """
+        if self._replay_ready is not None:
+            return _REPLAY_UNBOUNDED
+        return max(0, MAX_RECORDS_PER_ACTIVATION - self._delivered_this_activation)
+
+    def delivery_budget_exhausted(self) -> bool:
+        """Whether this activation stopped delivering because of the budget.
+
+        The completion path asks, because records left buffered by the budget
+        have no readiness notification coming: the watcher moved its prefetch
+        cursor past them when it buffered them. Their readiness has to be
+        re-reported or the Workflow waits forever on records already in front of
+        it.
+        """
+        return (
+            self._replay_ready is None
+            and self._delivered_this_activation >= MAX_RECORDS_PER_ACTIVATION
+        )
+
+    def rearm_readiness(self) -> None:
+        """Re-reports readiness for every buffer this Run left non-empty.
+
+        Called on the Workflow thread, so the hop onto the manager's loop happens
+        inside the manager -- the same reason ``register`` hops.
+        """
+        self._manager.rearm_ready(self._run_id)
 
     # --- the ExternalStreamRuntime protocol ---------------------------------
 
@@ -386,17 +449,34 @@ class WorkflowStreamRuntime:
         if not self._observed_this_activation:
             return
         if reason is None:
-            reason = (
-                SegmentEndReason.FENCE_REACHED
-                if self._subscriptions
-                and all(s.fence_reached for s in self._subscriptions.values())
-                else SegmentEndReason.NO_DATA_AVAILABLE
-            )
+            reason = self._segment_end_reason()
         accumulator = self._ensure_accumulator()
         self._pending_deltas.append(
             accumulator.add_segment(Segment(tuple(self._runs), reason))
         )
         self._runs = []
+
+    def _segment_end_reason(self) -> SegmentEndReason:
+        """Why this activation stopped delivering.
+
+        Decided here rather than passed in, because the reason has to be right
+        whether the caller remembered it or not: it is durable, and a reader of
+        the annotation has nothing else to tell it why the activation ended.
+
+        ``BATCH_LIMIT`` outranks the other two. Both of them assert that nothing
+        more was available -- ``FENCE_REACHED`` additionally that the set is
+        immediately parkable -- and both are simply false when the runtime
+        stopped with records still sitting in the buffer. Recording
+        ``NO_DATA_AVAILABLE`` for a budget cut-off would put a claim in History
+        that the stream ran dry when it did not.
+        """
+        if self.delivery_budget_exhausted():
+            return SegmentEndReason.BATCH_LIMIT
+        if self._subscriptions and all(
+            s.fence_reached for s in self._subscriptions.values()
+        ):
+            return SegmentEndReason.FENCE_REACHED
+        return SegmentEndReason.NO_DATA_AVAILABLE
 
     def take_observation_delta(self) -> bytes | None:
         """The bytes to put on this completion's `WorkflowStreamProgress`.
@@ -473,7 +553,20 @@ class WorkflowStreamRuntime:
         difference is exactly the records sitting in a subscription's buffer that
         the Workflow never asked for -- which die with the Run, and which a
         successor must therefore still receive.
+
+        Also where the activation's delivery budget is spent, because this is
+        called exactly once per record actually handed over -- unlike delivery,
+        which moves in whole batches, and unlike decoding, which control records
+        skip. Counted before the guards below so that a record whose subscription
+        has already gone still costs its budget: the cap has to bound the
+        activation whatever the bookkeeping says.
         """
+        if self._replay_ready is None:
+            # Replayed records are deliberately not counted, not merely not
+            # capped. Counting them would leave the budget spent for any live
+            # delivery later in the same activation, and would make the
+            # completion re-arm readiness on a purely replayed Workflow Task.
+            self._delivered_this_activation += 1
         state = self._subscriptions.get(wait_id)
         if state is None or record.offset is None:
             return
@@ -577,11 +670,17 @@ class WorkflowStreamRuntime:
         blocked = [s for s in self._subscriptions.values() if s.blocked]
         if not blocked:
             return None
+        # A set the delivery budget stopped is blocked but not quiescent: records
+        # are still sitting in the local buffer, and the only reason nobody is
+        # reading them is that this activation ran out of budget. Calling any of
+        # it immediately parkable would ask Core to park a Workflow Task whose
+        # data has already arrived at the Worker.
+        exhausted = self.delivery_budget_exhausted()
         return [
             QuiescentWait(
                 wait_id=s.wait_id,
                 generation=s.generation,
-                immediately_parkable=s.fence_reached,
+                immediately_parkable=s.fence_reached and not exhausted,
             )
             for s in sorted(blocked, key=lambda s: s.wait_id)
         ]

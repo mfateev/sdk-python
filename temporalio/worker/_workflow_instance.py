@@ -473,6 +473,13 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         )
         self._time_ns = act.timestamp.ToNanoseconds()
         self._is_replaying = act.is_replaying
+        if self._external_stream_runtime is not None:
+            # Re-arms the per-activation delivery budget. It has to be reset here
+            # rather than anywhere later: a producer that keeps a subscription's
+            # buffer non-empty would otherwise keep the iterator fed for the
+            # whole of this call, and this call runs on a thread-pool executor
+            # under a 2-second deadlock timeout that every retry would hit again.
+            self._external_stream_runtime.begin_activation()
         self._current_thread_id = threading.get_ident()
         self._current_internal_flags = act.available_internal_flags
         self._single_batch_activation = self._workflow_logic_flag_enabled(
@@ -2301,6 +2308,21 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         runtime = self._external_stream_runtime
         if runtime is None or self._deleting:
             return
+
+        if runtime.delivery_budget_exhausted():
+            # This activation stopped delivering because it ran out of budget,
+            # not because the streams ran dry, so records are still buffered and
+            # no readiness notification is coming for them -- the watcher moved
+            # its prefetch cursor past them when it buffered them. Re-reporting
+            # readiness is what brings the next activation in.
+            #
+            # Unconditional, and before every early return below: the waits the
+            # budget stopped are marked blocked, so they are in the quiescent
+            # snapshot, and a snapshot is what lets Core start the idle timer and
+            # eventually park. Parking a Workflow Task whose records are already
+            # in the local buffer would be wrong, and this is what makes Core
+            # resolve instead of park.
+            runtime.rearm_readiness()
 
         if self._is_replaying:
             # Every marker for a replayed Workflow Task is already in History,

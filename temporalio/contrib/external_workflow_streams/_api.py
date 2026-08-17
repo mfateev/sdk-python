@@ -49,6 +49,23 @@ A property of the **set**, not of one subscription: one idle stream must not
 park a Workflow Task another stream is still driving.
 """
 
+MAX_RECORDS_PER_ACTIVATION = 256
+"""How many records one activation may hand to Workflow code.
+
+Without a cap, a producer that keeps the buffer non-empty makes one
+``activate()`` call never return: the iterator re-fills before every record and
+always finds one. Activations run on a thread-pool executor under a **2-second
+deadlock timeout**, so the Workflow Task fails -- and every retry hits the same
+producer, so the Workflow is stuck permanently rather than merely slowed. Driving
+the real iterator against a never-empty buffer consumed 316,086 records in two
+seconds and blocked zero times.
+
+A **record count, never a duration**. A time-based cap would be nondeterministic,
+and because the boundary each activation stopped at is recorded in the
+annotation, a replay of the same records would cut the segments somewhere else
+and diverge from the live run.
+"""
+
 #: Where per-Run subscription state hangs off the Workflow instance. Reserved,
 #: and deliberately not in the `__temporal_workflow_stream*` namespace the
 #: shipped contrib feature already owns.
@@ -74,6 +91,16 @@ class ExternalStreamRuntime(Protocol):
 
     def drain(self, wait_id: int, max_records: int | None = None) -> list[StreamRecord]:
         """Pops buffered records. Performs no I/O."""
+        ...
+
+    def delivery_budget_remaining(self) -> int:
+        """How many more records this activation may hand to Workflow code.
+
+        Lives on the runtime rather than on a subscription because the budget is
+        an *activation* budget: :py:func:`merge` consumes from several
+        subscriptions in one activation, and a per-subscription counter would let
+        *n* streams run *n* times as long.
+        """
         ...
 
     def codec_for(self, value_type: type | None) -> StreamPayloadCodec[Any]:
@@ -272,6 +299,12 @@ async def merge(
     The recorded delivery schedule follows: alternating records across two
     streams encode as one run per delivery, because a run is a maximal
     consecutive stretch from a single wait.
+
+    The delivery budget covers the whole set rather than each member, so a merge
+    over *n* never-empty streams still returns after
+    :py:data:`MAX_RECORDS_PER_ACTIVATION` records. A per-subscription budget
+    would let the activation run *n* times as long, which is the same deadlock
+    with a larger constant in front of it.
     """
     ordered = sorted(subscriptions, key=lambda s: s.wait_id)
     if not ordered:
@@ -320,7 +353,10 @@ async def _await_any_readiness(
     try:
         # The same last look the single-subscription path takes, for the same
         # reason: a record buffered before these waits were registered had its
-        # readiness reported to nobody.
+        # readiness reported to nobody. And for the same reason as there, it
+        # goes through `_fill` and so finds nothing once the budget is spent --
+        # otherwise a merge over a busy stream would resume immediately and the
+        # activation would never end.
         for subscription in subscriptions:
             subscription._fill()
             if subscription._ready:
@@ -391,11 +427,22 @@ class ExternalStreamSubscription(Generic[AnyType]):
         Draining is a buffer pop and never touches the backend -- the record is
         already here or it is not, and if it is not, only Core can say when to
         look again.
+
+        Bounded by the activation's remaining delivery budget. A drain that took
+        the whole buffer would be handed straight back by a producer that keeps
+        refilling it, and this activation would never return.
         """
         if self._ready:
             return
         assert self._state.runtime is not None
-        drained = self._state.runtime.drain(self._wait_id)
+        budget = self._state.runtime.delivery_budget_remaining()
+        if budget <= 0:
+            # Nothing is taken even though records are sitting right here, so the
+            # caller blocks and the activation ends. The records are not lost:
+            # the completion path re-reports readiness for every buffer that is
+            # still non-empty, which is what brings the next activation in.
+            return
+        drained = self._state.runtime.drain(self._wait_id, budget)
         for record in drained:
             # Recorded for *every* record, control ones included: they occupy
             # offsets inside a run, so a run's count includes them and their
@@ -443,6 +490,12 @@ class ExternalStreamSubscription(Generic[AnyType]):
             # prefetch cursor past it. Checking after registering is what closes
             # that window: anything earlier is found here, anything later
             # resolves the future.
+            #
+            # It goes through `_fill`, so it observes the delivery budget like
+            # every other drain. A refill that ignored the budget would hand this
+            # wait a record the instant the budget stopped it, and the activation
+            # would go right back to never returning -- the double-check would
+            # undo the cap rather than merely coexist with it.
             self._fill()
             if self._ready:
                 return

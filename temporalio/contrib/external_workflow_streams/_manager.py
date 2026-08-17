@@ -381,6 +381,31 @@ class StreamSubscriptionManager:
             self._loop.call_soon_threadsafe(subscription.note_drained)
         return popped
 
+    def rearm_ready(self, run_id: str) -> None:
+        """Re-reports readiness for every buffer this Run left non-empty.
+
+        The per-activation delivery budget stops an iterator with records still
+        buffered. Nothing else will announce them: readiness is reported once,
+        when the watcher buffers a record, and that watcher has long since moved
+        its prefetch cursor past these. Without this the Workflow blocks forever
+        on records already sitting in front of it -- and worse, it blocks
+        *quiescently*, so Core would start the idle timer and eventually park a
+        Workflow Task whose data had already arrived.
+
+        Called from the Workflow thread at activation completion, so the work is
+        hopped onto the manager's loop: `create_task` is not thread-safe, and a
+        task created from the Workflow executor thread is silently never
+        scheduled -- indistinguishable from a stream that never delivers.
+        """
+        self._loop.call_soon_threadsafe(self._rearm_ready, run_id)
+
+    def _rearm_ready(self, run_id: str) -> None:
+        """The manager-loop half of :meth:`rearm_ready`."""
+        for subscription in self.subscriptions(run_id):
+            if subscription._cancelled or not subscription.buffered:
+                continue
+            self._loop.create_task(self._report_ready(subscription))
+
     def blocked_snapshot(self, run_id: str) -> dict[int, Cursor]:
         """Where every active subscription's deliveries stopped.
 
