@@ -68,24 +68,37 @@ class TimerThenStreamWorkflow:
 
 
 @workflow.defn
-class ParkedByATimerWorkflow:
-    """Subscribes, starts a long timer, and waits on the stream.
+class LeftWithNoOpenTaskWorkflow:
+    """Blocks on the stream first, then starts a long timer. The order is the point.
 
-    The timer suppresses retention for the life of the Run, so every Workflow
-    Task completes and the Run sits in the ``NoOpenWorkflowTask`` window -- with
-    a live subscription -- for as long as the test needs. The timer itself is the
-    "unrelated Workflow event" the shutdown sweep must not wait for.
+    The ``NoOpenWorkflowTask`` window needs two things at once -- a wait set Core
+    knows about, and no Workflow Task holding it -- and only this order produces
+    both:
+
+    1. **Block before doing anything else.** A completion that carries no command
+       sends ``WorkflowStreamQuiescent``, and that command is the *only* thing
+       that registers a wait set with Core. A Workflow that starts a timer on the
+       same completion it first blocks on never registers one at all: retention
+       is suppressed, so no quiescent snapshot is ever sent, Core's wait set stays
+       empty, and a wake Signal then marks nothing ready and creates a Workflow
+       Task that Core completes with no activation. Such a Run cannot be resumed
+       by anything -- which is what this case used to try to shut down.
+    2. **Start the timer only after a record has woken it.** That command
+       suppresses retention for *that* completion, so the Workflow Task ends with
+       the wait set still registered and the Run sits in the window for as long as
+       the test needs. The timer is also the "unrelated Workflow event" the
+       shutdown sweep must not wait for.
     """
 
     @workflow.run
     async def run(self, expected: int) -> list[str]:
         tokens = external_stream.topic("tokens", backend="tokens-memory", type=str)
-        timer = asyncio.ensure_future(asyncio.sleep(600))
         seen: list[str] = []
-        async for token in tokens.subscribe():
-            seen.append(token)
-            if len(seen) >= expected:
-                break
+        iterator = tokens.subscribe().__aiter__()
+        seen.append(await iterator.__anext__())
+        timer = asyncio.ensure_future(asyncio.sleep(600))
+        while len(seen) < expected:
+            seen.append(await iterator.__anext__())
         timer.cancel()
         return seen
 
@@ -192,14 +205,48 @@ async def wait_until(predicate: Any, timeout: float, message: str) -> None:
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "the sweep itself now runs on a clean shutdown -- the Run is probed, no "
-        "marker is written, and an unparked wake Signal reaches History -- but "
-        "the second Worker's own wake is deduplicated away. An unparked wake's "
-        "request ID is derived from (sender identity, per-sender wake counter), "
-        "and a fresh Worker restarts that counter at 1 while sharing this "
-        "test's one Client identity, so its first wake derives byte-identical "
-        "material to the wake Worker A already sent. The server keeps one, no "
-        "Workflow Task is created, and the Run never resumes"
+        "the sweep's wake Signal never reaches the Workflow's History: it is "
+        "sent as a *parked* wake naming a park generation that is already dead, "
+        "and the server deduplicates it against the wake that generation "
+        "already had. "
+        "Nothing removes a confirmed park intent from the backend when the park "
+        "is resolved -- `remove_park_intent` is called only when a recheck "
+        "aborts a park -- so `current_park_generation` still answers 1 long "
+        "after `mark_all_ready_for_wake` cleared it in Core. "
+        "`_send_external_stream_wake` reads that answer, so the sweep builds "
+        "`WakeRequest(park_generation=1)` instead of the unparked "
+        "`park_generation=0` P20 requires. A parked wake's request ID is "
+        "derived from (namespace, workflow id, first execution run id, stream "
+        "name, wait id, park generation) alone -- deliberately, since a "
+        "generation is woken once -- so it comes out byte-identical to the wake "
+        "the watcher already sent for generation 1. Observed by tracing "
+        "`send_wake_signal`: two sends, both `park_generation=1`, one distinct "
+        "request ID between them, and one "
+        "`__temporal_external_stream_wake` event in History, unchanged across "
+        "shutdown. No Workflow Task is created and no second Worker ever sees "
+        "the Run. Were it not deduplicated, Core would reject it anyway: "
+        "`accepts_wake_generation(1)` requires `park_generation == Some(1)`, "
+        "and the wake that resolved the park set it to None. "
+        "This is not the only blocker, and the next reader should not assume it "
+        "is: with `_send_external_stream_wake` forced to `generation = 0` as an "
+        "experiment, the sweep's wake does reach History, the server does "
+        "create a Workflow Task, and a second Worker does take it and replay -- "
+        "and the Run then stalls again. A replayed completion returns early "
+        "from `_emit_external_stream_commands`, so it sends no "
+        "`WorkflowStreamQuiescent`, and `become_quiescent` is the only thing "
+        "that populates Core's wait set; the handed-over Run therefore ends "
+        "replay with an empty one. Every later wake -- the watcher's, and the "
+        "one for the record published after the handover -- creates a Workflow "
+        "Task that Core completes with no activation at all, exactly as it does "
+        "for a Run that never registered. "
+        "One more fact a reader will trip over: the sweep's own probe answers "
+        "`RunNotFound`, not `NoOpenWorkflowTask`, because the manager sweeps "
+        "after the poller tasks have been awaited and Core has already dropped "
+        "the Run from its cache. The same probe called on the live Worker one "
+        "line earlier answers `NoOpenWorkflowTask`. Both branches owe a wake, so "
+        "this does not change what the sweep does here -- but it does mean the "
+        "probe cannot currently distinguish the `Parked` and `WftOpen` cases "
+        "that P20 asks it to"
     ),
 )
 @pytest.mark.timeout(180)
@@ -208,11 +255,17 @@ async def test_shutdown_with_no_open_task_hands_the_run_to_another_worker(
 ) -> None:
     """The window the sweep exists for, with the second Worker that proves it.
 
-    The Run is cached, has a live subscription, and holds no Workflow Task. Its
-    records are buffered in a process about to exit and **nothing else will ever
-    say so**: the only other thing that could create a Workflow Task here is the
-    Workflow's own 600-second timer, and waiting for an unrelated event is not a
-    plan.
+    The Run is cached, has a wait set Core knows about, and holds no Workflow
+    Task. **Nothing else will ever create work for it**: the only other thing
+    that could produce a Workflow Task here is the Workflow's own 600-second
+    timer, and waiting for an unrelated event is not a plan. That is why the
+    sweep exists, and why it runs whether or not a record happens to be waiting
+    -- the obligation is to hand the Run over, not to announce an append.
+
+    The window is *asserted*, not assumed: the read-only probe is called on the
+    live Worker before shutdown and must answer ``NoOpenWorkflowTask``. Getting
+    there needs both of the Workflow's steps, which is what
+    :class:`LeftWithNoOpenTaskWorkflow` documents.
 
     Four separate claims, none of which the others imply:
 
@@ -220,25 +273,27 @@ async def test_shutdown_with_no_open_task_hands_the_run_to_another_worker(
     - the Run's state is resolved with the read-only probe rather than a
       readiness notification, which would assert a buffered record that the
       sweep has no business claiming;
-    - the wake Signal is an *unparked* one -- ``park_generation = 0`` -- read out
-      of the Workflow's own History rather than inferred from a delivery;
-    - a second Worker takes the resulting Workflow Task and reconstructs the
-      subscription from the marker, delivering the record without the timer ever
-      firing.
+    - a **new** wake Signal reaches the Workflow's own History, and it is an
+      *unparked* one -- ``park_generation = 0``. Counted against the Signals
+      already there rather than merely found, because an earlier wake in the
+      same History proves nothing about this one;
+    - a second Worker takes the resulting Workflow Task, reconstructs the
+      subscription from the marker, and delivers a record published after the
+      handover -- without the timer ever firing.
     """
     task_queue = f"tq-{uuid.uuid4()}"
     session = f"handoff-{uuid.uuid4()}"
     worker_a = Worker(
         client,
         task_queue=task_queue,
-        workflows=[ParkedByATimerWorkflow],
+        workflows=[LeftWithNoOpenTaskWorkflow],
         external_stream_backends={"tokens-memory": backend},
     )
     worker_a_task = asyncio.create_task(worker_a.run())
     handle = None
     try:
         handle = await client.start_workflow(
-            ParkedByATimerWorkflow.run,
+            LeftWithNoOpenTaskWorkflow.run,
             2,
             id=f"wf-{uuid.uuid4()}",
             task_queue=task_queue,
@@ -246,38 +301,58 @@ async def test_shutdown_with_no_open_task_hands_the_run_to_another_worker(
         )
         key = await stream_key_for(client, handle)
 
-        # One delivery first, so the Run has a marker for the second Worker to
-        # reconstruct from and is demonstrably in the no-open-task window.
-        await publish(backend, key, ["alpha"], session=session)
+        # Published only once the Run's first Workflow Task has ended, which is
+        # what registers the wait set with Core. A record that arrives before
+        # that lands on a Run whose wait set is still empty.
         await wait_until(
             lambda: _has_markers(handle),
             60,
-            "no marker was written, so there is nothing for a second Worker to "
-            "reconstruct the subscription from",
+            "the Run's first Workflow Task never ended, so its wait set was "
+            "never registered with Core and no wake could reach it",
         )
-        before = markers(await history(handle))
+        await publish(backend, key, ["alpha"], session=session)
+        await wait_until(
+            lambda: _timer_started(handle),
+            60,
+            "the record never reached the Workflow, so the completion that "
+            "leaves the Run in the no-open-task window never happened",
+        )
 
-        probes: list[str] = []
-        readiness: list[str] = []
         manager = worker_a._workflow_worker._external_stream_manager
         assert manager is not None, "the manager should exist by now"
         real_probe, real_ready = manager._run_status, manager._notify_ready
+        await wait_until(
+            lambda: _run_is_registered(manager),
+            30,
+            "the manager holds no Run with subscriptions, so the sweep has "
+            "nothing to sweep",
+        )
+        run_id = next(iter(manager._runs))
+        await wait_until(
+            lambda: _in_the_window(real_probe, run_id),
+            30,
+            "the Run never reached the no-open-Workflow-Task window, so this "
+            "case is not testing the transition it names",
+        )
 
-        async def counting_probe(run_id: str) -> Any:
-            probes.append(run_id)
-            return await real_probe(run_id)
+        before = markers(await history(handle))
+        signals_before = wake_signals(await history(handle))
 
-        async def counting_ready(run_id: str, wait_id: int, generation: int) -> Any:
-            readiness.append(run_id)
-            return await real_ready(run_id, wait_id, generation)
+        probes: list[str] = []
+        readiness: list[str] = []
+
+        async def counting_probe(probed_run_id: str) -> Any:
+            probes.append(probed_run_id)
+            return await real_probe(probed_run_id)
+
+        async def counting_ready(
+            ready_run_id: str, wait_id: int, generation: int
+        ) -> Any:
+            readiness.append(ready_run_id)
+            return await real_ready(ready_run_id, wait_id, generation)
 
         manager._run_status = counting_probe
         manager._notify_ready = counting_ready
-
-        # Buffered on the Worker that is about to go away.
-        await publish(backend, key, ["beta"], session=session)
-        await asyncio.sleep(0.5)
-        readiness.clear()
 
         await asyncio.wait_for(worker_a.shutdown(), 60)
 
@@ -296,12 +371,13 @@ async def test_shutdown_with_no_open_task_hands_the_run_to_another_worker(
             "a marker was written on the way out of the no-open-task window; "
             "nothing was accumulated there, so there was nothing to write"
         )
-        signals = wake_signals(await history(handle))
-        assert signals, (
-            "no wake Signal reached the Workflow, so nothing will ever tell it "
-            "the buffered record arrived"
+        signals_after = wake_signals(await history(handle))
+        assert len(signals_after) > len(signals_before), (
+            "the sweep's wake Signal never reached the Workflow's own History, "
+            f"which still holds the same {len(signals_before)} it did before "
+            "shutdown. Nothing will ever create a Workflow Task for this Run"
         )
-        envelope = wake_envelope(signals[-1])
+        envelope = wake_envelope(signals_after[-1])
         assert envelope.park_generation == 0, (
             "the shutdown wake must be an unparked one -- there is no confirmed "
             f"park to name -- got generation {envelope.park_generation}"
@@ -310,9 +386,12 @@ async def test_shutdown_with_no_open_task_hands_the_run_to_another_worker(
         async with Worker(
             client,
             task_queue=task_queue,
-            workflows=[ParkedByATimerWorkflow],
+            workflows=[LeftWithNoOpenTaskWorkflow],
             external_stream_backends={"tokens-memory": backend},
         ):
+            # Published after the handover, so delivering it proves the second
+            # Worker rebuilt a live subscription rather than replaying one.
+            await publish(backend, key, ["beta"], session=session)
             result = await asyncio.wait_for(handle.result(), 60)
 
         assert result == ["alpha", "beta"], (
@@ -337,6 +416,26 @@ async def test_shutdown_with_no_open_task_hands_the_run_to_another_worker(
 
 async def _has_markers(handle: Any) -> bool:
     return bool(markers(await history(handle)))
+
+
+async def _timer_started(handle: Any) -> bool:
+    return any(
+        e.HasField("timer_started_event_attributes") for e in await history(handle)
+    )
+
+
+async def _run_is_registered(manager: Any) -> bool:
+    return bool(manager._runs)
+
+
+async def _in_the_window(probe: Any, run_id: str) -> bool:
+    """Whether Core says this Run has waits registered and no task open.
+
+    Asked through the read-only probe, which is the same call the sweep makes
+    and the only thing that can tell the three states apart.
+    """
+    status = await probe(run_id)
+    return getattr(status, "value", status) == "NoOpenWorkflowTask"
 
 
 # --- case 30: teardown racing finalization ------------------------------------
