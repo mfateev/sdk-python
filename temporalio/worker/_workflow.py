@@ -301,14 +301,30 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
                 completion.failed.failure.message = "Worker shutting down"
                 await self._bridge_worker().complete_workflow_activation(completion)
             except PollShutdownError:
-                # Every Run has been dealt with, so the manager's watchers have
-                # nothing left to watch. Tearing them down here rather than
-                # leaving it to eviction is necessary because an *idle cached
-                # Run receives no eviction activation at shutdown at all* --
-                # `shutdown_done` treats a Run with no pending work as finished.
-                if self._external_stream_manager is not None:
-                    await self._external_stream_manager.shutdown()
                 return
+
+    async def shutdown_external_streams(self) -> None:
+        """Sweeps and tears down the external stream manager. P20's entry point.
+
+        Called by the Worker once every activation has been dealt with, on
+        *both* shutdown paths. It deliberately does not live in
+        :py:meth:`drain_poll_queue`, which the Worker substitutes only for a
+        worker task whose ``run()`` raised: wiring it there means a clean
+        ``Worker.shutdown()`` never sweeps at all, leaving Runs registered,
+        watchers running, and buffers and backend connections open in a process
+        that is about to exit.
+
+        It is not folded into eviction either, because an *idle cached Run
+        receives no eviction activation at shutdown at all* -- ``shutdown_done``
+        treats a Run with no pending work as finished -- and that is exactly the
+        Run that most needs a wake: its records are buffered here and nothing
+        else will ever tell the Workflow they arrived.
+
+        The manager bounds the sweep with its own grace period, so this cannot
+        hold shutdown open indefinitely.
+        """
+        if self._external_stream_manager is not None:
+            await self._external_stream_manager.shutdown()
 
     async def _activate_inline_for_debug(
         self,

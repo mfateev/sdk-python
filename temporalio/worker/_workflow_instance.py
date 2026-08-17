@@ -873,6 +873,18 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
                 runtime.begin_replay_segment(list(segment.deliveries))
                 runtime.resolve_all_pending()
                 self._run_once(check_conditions=True)
+            # The manager knew nothing about this marker while replay was
+            # running: its watcher has been reading the very same records from
+            # the subscription's start cursor into the live buffer. The next
+            # live drain would hand them over again -- observed end-to-end as
+            # one marker's record delivered twice. Moving the cursors to what
+            # the marker committed is what makes live delivery resume *after*
+            # those records rather than in front of them.
+            #
+            # After the loop, not inside it: a replay that raised part-way
+            # committed nothing, and advancing a committed cursor for records
+            # this Workflow may never have received would lose them outright.
+            runtime.reposition_after_replay(plan.committed_boundaries)
         finally:
             runtime.end_replay()
 

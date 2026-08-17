@@ -38,6 +38,9 @@ class FakeRuntime:
     def __init__(self, registered_backends: set[str] | None = None) -> None:
         self.registered = registered_backends or {"tokens-redis"}
         self.registrations: list[tuple[int, StreamKey, str]] = []
+        #: `wait_id -> configured idle timeout`, so a test can see that the
+        #: value `with_options` was given actually reached the Worker.
+        self.idle_timeouts: dict[int, timedelta] = {}
         self.buffers: dict[int, list[StreamRecord]] = {}
         self.deliveries: list[tuple[int, StreamRecord]] = []
         self.consumed: list[tuple[int, StreamRecord]] = []
@@ -49,11 +52,17 @@ class FakeRuntime:
         return StreamKey("ns", "wf", "first-run", stream_name)
 
     def register(
-        self, *, wait_id: int, stream_key: StreamKey, backend_name: str
+        self,
+        *,
+        wait_id: int,
+        stream_key: StreamKey,
+        backend_name: str,
+        idle_timeout: timedelta,
     ) -> None:
         if backend_name not in self.registered:
             raise KeyError(f"no external stream backend named {backend_name!r}")
         self.registrations.append((wait_id, stream_key, backend_name))
+        self.idle_timeouts[wait_id] = idle_timeout
 
     def drain(self, wait_id: int, max_records: int | None = None) -> list[StreamRecord]:
         buffered = self.buffers.get(wait_id, [])

@@ -86,6 +86,9 @@ class StubManager:
     def register(self, *, run_id, wait_id, stream_key, backend_name, start_cursor):  # type: ignore[no-untyped-def]
         self.registered.append((wait_id, start_cursor))
 
+    def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]
+        pass
+
 
 @pytest.fixture
 def manager() -> StubManager:

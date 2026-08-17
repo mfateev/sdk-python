@@ -85,6 +85,28 @@ class SubscribeOnlyWorkflow:
             pass
 
 
+@workflow.defn
+class TimerSuppressedSubscriptionWorkflow:
+    """Subscribes and waits, with a long timer stopping the task being retained.
+
+    Deliberately distinct from :py:class:`SubscribeOnlyWorkflow`: a Workflow
+    blocked on the stream *alone* leaves a retained Workflow Task, which is a
+    different shutdown transition. The timer makes every task complete, so the
+    Run sits cached with a live subscription and no open Workflow Task -- the
+    state that receives no eviction activation at shutdown at all.
+    """
+
+    @workflow.run
+    async def run(self) -> None:
+        tokens = external_stream.topic("tokens", backend="tokens-memory", type=str)
+        timer = asyncio.ensure_future(asyncio.sleep(600))
+        try:
+            async for _ in tokens.subscribe():
+                pass
+        finally:
+            timer.cancel()
+
+
 @pytest.fixture
 def backend() -> MemoryStreamBackend:
     return MemoryStreamBackend()
@@ -438,3 +460,71 @@ async def test_a_flood_larger_than_one_activations_budget_is_delivered_in_full(
         await publish(backend, key, [f"t{i}" for i in range(total)])
 
         assert await asyncio.wait_for(handle.result(), 60) == total
+
+
+async def test_a_clean_shutdown_sweeps_and_tears_down_the_manager(
+    client: Client, backend: MemoryStreamBackend
+) -> None:
+    """P20's sweep has to run on the path users actually take.
+
+    A normal ``Worker.shutdown()`` completes with no worker task raising, so
+    nothing is replaced by ``drain_poll_queue()``. Wiring the sweep there alone
+    means the whole mechanism is dead on the ordinary path: the manager never
+    enters its shutting-down state, every Run stays registered, watchers go on
+    polling, and the buffers and backend connections go out with the process --
+    while the wake Signal that would hand the Run to another Worker is never
+    even considered.
+
+    The Workflow here keeps a long timer running alongside its subscription, so
+    every Workflow Task completes and the Run sits *cached, subscribed, and
+    holding no Workflow Task* when shutdown begins. That is the state the sweep
+    exists for, and the one that gets no eviction activation of its own.
+    """
+    task_queue = f"tq-{uuid.uuid4()}"
+    worker = Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[TimerSuppressedSubscriptionWorkflow],
+        external_stream_backends={"tokens-memory": backend},
+    )
+    worker_task = asyncio.create_task(worker.run())
+    handle = None
+    try:
+        handle = await client.start_workflow(
+            TimerSuppressedSubscriptionWorkflow.run,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=task_queue,
+        )
+        # Wait for the subscription to actually reach the manager rather than
+        # sleeping: with no Run registered there is nothing to sweep and the
+        # assertions below would hold for the wrong reason.
+        deadline = asyncio.get_running_loop().time() + 30
+        while asyncio.get_running_loop().time() < deadline:
+            manager = worker._workflow_worker._external_stream_manager  # type: ignore[union-attr]
+            if manager is not None and manager.runs_with_subscriptions():
+                break
+            await asyncio.sleep(0.2)
+        manager = worker._workflow_worker._external_stream_manager  # type: ignore[union-attr]
+        assert manager is not None and manager.runs_with_subscriptions(), (
+            "the Workflow never registered a subscription, so there is nothing "
+            "for a shutdown sweep to find"
+        )
+
+        await asyncio.wait_for(worker.shutdown(), 60)
+
+        assert manager._shutting_down, (
+            "the manager was never told the Worker is shutting down, so no Run "
+            "was probed and no owed wake was sent"
+        )
+        assert manager.runs_with_subscriptions() == [], (
+            "subscriptions survived shutdown: their watchers, buffers, and "
+            "backend connections leak with the process"
+        )
+    finally:
+        if handle is not None:
+            try:
+                await handle.terminate()
+            except Exception:
+                pass
+        if not worker_task.done():
+            worker_task.cancel()

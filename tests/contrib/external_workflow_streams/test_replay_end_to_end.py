@@ -29,9 +29,19 @@ from tests.contrib.external_workflow_streams.memory_backend import MemoryStreamB
 
 with workflow.unsafe.imports_passed_through():
     from temporalio.contrib.external_workflow_streams._api import external_stream
+    from tests.contrib.external_workflow_streams import observations
 
 
-@workflow.defn
+EXTERNAL_STREAM_MARKER = "core_external_stream"
+"""The marker name Core writes a replay annotation under."""
+
+
+# Unsandboxed on purpose: the observation sink below has to be the *same*
+# object in Workflow code as in the test. A sandboxed Workflow re-imports every
+# module it touches, including a passed-through one, so it would write its
+# observations into a copy and the comparison would silently compare nothing.
+# Nothing here depends on the sandbox; the sandbox itself is covered elsewhere.
+@workflow.defn(sandboxed=False)
 class ConditionWorkflow:
     """Consumes records while a ``wait_condition`` watches the same state.
 
@@ -63,6 +73,10 @@ class ConditionWorkflow:
             if len(self._seen) >= expected:
                 break
         await watcher
+        # Recorded outside the Workflow as well as returned: the return value is
+        # only visible for the live run, and the whole question here is whether
+        # the *replay* saw the same thing.
+        observations.record(workflow.info().run_id, self._states_observed)
         return self._states_observed
 
     def _observe(self) -> bool:
@@ -134,6 +148,14 @@ async def test_replaying_a_stream_history_reproduces_the_same_observations(
     A collapsed replay would deliver the same records in the same order and
     still be wrong: the predicate would fire a different number of times, and
     any Workflow whose control flow depends on a condition would diverge.
+
+    So "replay did not fail" is not the assertion. Replay is only obliged to
+    match the *commands* in History, and this Workflow's commands say nothing
+    about how many times its predicate ran -- a replay that delivered both
+    records in one drain would produce the same completion and pass a
+    failure-only check. What is compared instead is the sequence the predicate
+    itself observed, live against replayed, for a marker that spans several
+    activations.
     """
     task_queue = f"tq-{uuid.uuid4()}"
     async with Worker(
@@ -157,6 +179,15 @@ async def test_replaying_a_stream_history_reproduces_the_same_observations(
 
         live = await asyncio.wait_for(handle.result(), 60)
         history = await handle.fetch_history()
+        run_id = handle.first_execution_run_id or handle.result_run_id
+
+    markers = [
+        e
+        for e in history.events
+        if e.HasField("marker_recorded_event_attributes")
+        and e.marker_recorded_event_attributes.marker_name == EXTERNAL_STREAM_MARKER
+    ]
+    assert markers, "no stream marker was written, so there is nothing to replay"
 
     replayer = Replayer(
         workflows=[ConditionWorkflow],
@@ -168,6 +199,28 @@ async def test_replaying_a_stream_history_reproduces_the_same_observations(
         f"replaying the history the Worker just wrote failed: {result.replay_failure}"
     )
     assert live, "the live run observed nothing, so this proves nothing"
+    assert len(live) > 1, (
+        "the predicate ran only once live, so a collapsed replay would look "
+        f"identical and this proves nothing: {live}"
+    )
+
+    assert run_id is not None
+    runs = observations.executions(run_id)
+    assert len(runs) == 2, (
+        "expected exactly two executions to be recorded -- the live run and the "
+        f"replay -- got {len(runs)}"
+    )
+    live_observed, replayed_observed = runs
+    assert live_observed == live, (
+        "the live run recorded something other than it returned"
+    )
+    assert replayed_observed == live_observed, (
+        "the replayed run's predicate saw a different sequence of states than "
+        "the live one did. The records arrive in the same order either way, so "
+        "this is the segmentation itself diverging: recorded activation "
+        f"boundaries were collapsed or re-cut. live={live_observed} "
+        f"replayed={replayed_observed}"
+    )
 
 
 async def test_a_history_with_stream_markers_needs_its_backends_to_replay(

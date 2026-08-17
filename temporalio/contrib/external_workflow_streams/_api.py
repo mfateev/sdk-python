@@ -84,9 +84,19 @@ class ExternalStreamRuntime(Protocol):
         ...
 
     def register(
-        self, *, wait_id: int, stream_key: StreamKey, backend_name: str
+        self,
+        *,
+        wait_id: int,
+        stream_key: StreamKey,
+        backend_name: str,
+        idle_timeout: timedelta,
     ) -> None:
-        """Registers a wait with the Worker's subscription manager."""
+        """Registers a wait with the Worker's subscription manager.
+
+        ``idle_timeout`` is the *configured* value for this one subscription.
+        The runtime reduces the quiescent set's values to one; this side has no
+        business doing that reduction, because it can only see one member.
+        """
         ...
 
     def drain(self, wait_id: int, max_records: int | None = None) -> list[StreamRecord]:
@@ -268,7 +278,16 @@ class ExternalStreamTopic(Generic[AnyType]):
 
         stream_key = state.runtime.stream_key(self.name)
         state.runtime.register(
-            wait_id=wait_id, stream_key=stream_key, backend_name=self.backend_name
+            wait_id=wait_id,
+            stream_key=stream_key,
+            backend_name=self.backend_name,
+            # Passed on registration rather than read back from the subscription
+            # later, because the runtime is what holds the quiescent set and
+            # reduces it with `min`. Leaving it out is not a smaller default --
+            # it silently substitutes DEFAULT_IDLE_TIMEOUT for whatever
+            # `with_options` was given, so no configured value can ever reach
+            # the reduction and every set parks after one second.
+            idle_timeout=self.options.idle_timeout,
         )
         return ExternalStreamSubscription(
             topic=self, wait_id=wait_id, stream_key=stream_key, state=state

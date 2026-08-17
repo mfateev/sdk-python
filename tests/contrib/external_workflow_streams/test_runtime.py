@@ -7,6 +7,7 @@ scheduling.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import timedelta
 
@@ -421,6 +422,64 @@ async def test_re_entering_the_blocked_state_bumps_the_generation(
 
     snapshot = runtime.quiescent_snapshot()
     assert snapshot is not None and snapshot[0].generation == 1
+
+
+async def test_readiness_after_a_re_block_names_the_current_generation(
+    backend: MemoryStreamBackend,
+) -> None:
+    """Bumping the generation is only half of it; the manager has to be told.
+
+    Core compares the generation a readiness notification carries against the
+    one lang put in the quiescent snapshot. The manager is what makes that call
+    and only the runtime knows when a wait re-blocks, so a manager left to
+    itself reports 0 for the life of the subscription. Every notification after
+    the first block is then answered ``Stale``, which the manager treats as
+    "re-probe later" -- but the watcher's prefetch cursor is already past the
+    record and no second notification is coming, so an append after a confirmed
+    park never wakes the Workflow at all.
+    """
+    reported: list[int] = []
+    notified = asyncio.Event()
+
+    async def notify(run_id: str, wait_id: int, generation: int) -> str:
+        reported.append(generation)
+        notified.set()
+        return ReadinessResult.ACCEPTED
+
+    manager = StreamSubscriptionManager(
+        backends={"tokens": backend},
+        notify_ready=notify,
+        watch_block=timedelta(milliseconds=10),
+    )
+    runtime = WorkflowStreamRuntime(
+        manager=manager,
+        backends={"tokens": backend},
+        run_id=RUN_ID,
+        namespace="ns",
+        workflow_id="wf",
+        first_execution_run_id=uuid.uuid4().hex,
+        data_converter=temporalio.converter.DataConverter.default,
+        default_idle_timeout=timedelta(seconds=1),
+    )
+    try:
+        key = subscribe(runtime, 1)
+        # One resolved block, so the wait is on its second one -- the state
+        # every subscription is in for every record after its first.
+        runtime.note_blocked(1, False)
+        runtime.note_blocked(1, True)
+
+        await backend.append(key, StreamRecord(RecordKind.DATA, b"x", "s", 0))
+        await asyncio.wait_for(notified.wait(), 5)
+
+        snapshot = runtime.quiescent_snapshot()
+        assert snapshot is not None
+        assert reported == [snapshot[0].generation] == [1], (
+            "the generation reported to Core is not the one lang put in the "
+            f"quiescent snapshot, so Core answers Stale: reported={reported} "
+            f"snapshot={snapshot[0].generation}"
+        )
+    finally:
+        await manager.shutdown()
 
 
 # --- the byte budget --------------------------------------------------------

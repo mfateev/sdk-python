@@ -118,6 +118,9 @@ class NeverEmptyManager:
     def register(self, *, run_id, wait_id, stream_key, backend_name, start_cursor):  # type: ignore[no-untyped-def]
         self._next.setdefault(wait_id, 0)
 
+    def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]
+        pass
+
     def drain(
         self, run_id: str, wait_id: int, max_records: int | None = None
     ) -> list[StreamRecord]:
@@ -516,6 +519,9 @@ def test_a_wait_the_budget_stopped_is_not_immediately_parkable(
         def register(self, **kwargs: Any) -> None:
             pass
 
+        def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]
+            pass
+
     runtime = make_runtime(StubManager(), backend)
     runtime.begin_activation()
     runtime.register(
@@ -551,6 +557,9 @@ class LateArrivalManager:
         self.calls = 0
 
     def register(self, **kwargs: Any) -> None:
+        pass
+
+    def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]
         pass
 
     def drain(
@@ -614,6 +623,9 @@ async def test_a_replay_segment_larger_than_the_budget_is_delivered_in_full(
         def register(self, **kwargs: Any) -> None:
             pass
 
+        def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]
+            pass
+
         def drain(self, run_id: str, wait_id: int, max_records: int | None = None):  # type: ignore[no-untyped-def]
             return []
 
@@ -671,6 +683,9 @@ async def test_replay_delivers_in_full_even_when_the_live_budget_is_spent(
 
     class StubManager:
         def register(self, **kwargs: Any) -> None:
+            pass
+
+        def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]
             pass
 
         def drain(self, run_id: str, wait_id: int, max_records: int | None = None):  # type: ignore[no-untyped-def]
@@ -735,6 +750,9 @@ def test_a_budget_stop_records_batch_limit(backend: MemoryStreamBackend) -> None
         def register(self, **kwargs: Any) -> None:
             pass
 
+        def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]
+            pass
+
     runtime = make_runtime(StubManager(), backend)
     runtime.begin_activation()
     runtime.register(
@@ -757,6 +775,9 @@ def test_an_activation_that_ran_out_of_records_still_records_no_data(
 
     class StubManager:
         def register(self, **kwargs: Any) -> None:
+            pass
+
+        def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]
             pass
 
     runtime = make_runtime(StubManager(), backend)

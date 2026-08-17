@@ -327,6 +327,26 @@ class WorkflowStreamRuntime:
         """Makes one recorded segment the only thing a drain can see."""
         self._replay_ready = list(deliveries)
 
+    def reposition_after_replay(self, boundaries: Mapping[int, Cursor]) -> None:
+        """Moves the manager's cursors to what the replayed marker committed.
+
+        Replay delivers from the annotation, not from the manager's buffer --
+        but the watcher has been filling that buffer from the subscription's
+        start cursor the whole time, because nothing out there knows a marker
+        for these records exists. Without this the first live drain after a
+        replay hands Workflow code every replayed record a second time; the
+        symptom is a Workflow that received ``['alpha', 'alpha', 'beta']``.
+
+        The boundaries come from the marker rather than from wherever the
+        replay's deliveries happened to stop -- the marker is History's own
+        statement of what was committed -- and only the waits it recorded
+        something for are named.
+
+        Hopped onto the manager's loop inside the manager, for the same reason
+        :meth:`rearm_readiness` hops: this runs on the Workflow thread.
+        """
+        self._manager.reposition_to_committed(self._run_id, boundaries)
+
     def end_replay(self) -> None:
         """Hands drains back to the live buffer.
 
@@ -435,6 +455,15 @@ class WorkflowStreamRuntime:
             # and it is what makes a readiness notification for the previous
             # block recognisable as stale.
             state.generation += 1
+            # Pushed to the manager immediately. The manager is what reports
+            # readiness to Core, and Core compares the generation it is given
+            # against the one this runtime put in the quiescent snapshot. A
+            # manager left at the generation it registered with reports every
+            # block after the first under a stale number, Core answers `Stale`,
+            # and the watcher -- whose prefetch cursor is already past the
+            # record -- never re-announces it. The Workflow then waits forever
+            # on an append that did arrive.
+            self._manager.note_wait_generation(self._run_id, wait_id, state.generation)
         state.blocked = blocked
 
     # --- the observation delta (P10b) ----------------------------------------

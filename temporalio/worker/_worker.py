@@ -927,6 +927,20 @@ class Worker:
         if self._nexus_worker:
             await self._nexus_worker.wait_all_completed()
 
+        # Sweep and tear down external stream subscriptions. This is P20's
+        # obligation and it happens here rather than inside the workflow
+        # worker's poll loop because both shutdown paths have to reach it: the
+        # poll drain above only replaces a worker task whose run() raised, so a
+        # clean shutdown would otherwise leave every Run registered, its
+        # watchers running, and its owed wake Signals unsent.
+        #
+        # After the wait above, so per-Run teardown stays driven by
+        # RemoveFromCache: every activation, eviction included, has been
+        # answered by now. Before finalize_shutdown, because the sweep's
+        # read-only Run-status probe still needs the bridge worker.
+        if self._workflow_worker:
+            await self._workflow_worker.shutdown_external_streams()
+
         # Do final shutdown
         try:
             await self._bridge_worker.finalize_shutdown()

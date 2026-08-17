@@ -9,6 +9,7 @@ rather than merely plausible.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import timedelta
 
@@ -636,6 +637,109 @@ async def test_a_replayed_drain_never_reaches_the_live_buffer(
 
 
 @pytest.mark.asyncio
+async def test_two_markers_reassemble_in_workflow_task_order(
+    manager: StreamSubscriptionManager, backend: MemoryStreamBackend, key: StreamKey
+) -> None:
+    """A batch split by a rollover replays as one continuous consumption.
+
+    The byte-budget high-water mark rolls the Workflow Task over rather than
+    growing the marker, so one logical batch ends up in *two* markers -- and
+    replay reaches them as two separate ``ReplayExternalStreams`` jobs, one per
+    replayed Workflow Task. Core's own test proves the two annotations
+    concatenate at the byte level; what only this side can show is that feeding
+    them through the manager in Workflow Task order reproduces the original
+    consumption exactly.
+
+    Two failures this rules out, both silent:
+
+    - a seam that loses or repeats a record, which is what an exclusive read or
+      an off-by-one at the split would produce -- the second marker resumes at
+      the first's terminal, so the record *at* that boundary must appear exactly
+      once across the pair;
+    - a second marker delivered against the first one's segmentation, which
+      would put records in front of Workflow code in a drain that never saw
+      them.
+    """
+    placed = await append_five(backend, key)
+    split = 1  # The first marker stops after `placed[1]`.
+
+    first_marker = encode_annotation(
+        Annotation(
+            header=AnnotationHeader("memory", 1, {1: StreamBinding(key, BEGINNING)}),
+            segments=(
+                Segment(
+                    (Run(1, placed[0].offset, placed[0].offset, 1),),  # type: ignore[arg-type]
+                    SegmentEndReason.BATCH_LIMIT,
+                ),
+                Segment(
+                    (Run(1, placed[1].offset, placed[1].offset, 1),),  # type: ignore[arg-type]
+                    # The annotation passed its high-water mark here, so this
+                    # batch continues in the following marker.
+                    SegmentEndReason.BUDGET_ROLLOVER,
+                ),
+            ),
+            terminal={1: AFTER(placed[split].offset)},  # type: ignore[arg-type]
+        )
+    )
+    # The replacement Workflow Task's annotation begins where the first one's
+    # terminal left the subscription: a rollover preserves the cursor rather
+    # than restarting it.
+    second_marker = encode_annotation(
+        Annotation(
+            header=AnnotationHeader(
+                "memory",
+                1,
+                {1: StreamBinding(key, AFTER(placed[split].offset))},  # type: ignore[arg-type]
+            ),
+            segments=(
+                Segment(
+                    (Run(1, placed[2].offset, placed[4].offset, 3),),  # type: ignore[arg-type]
+                    SegmentEndReason.NO_DATA_AVAILABLE,
+                ),
+            ),
+            terminal={1: AFTER(placed[4].offset)},  # type: ignore[arg-type]
+        )
+    )
+
+    runtime = make_runtime(manager, backend)
+    per_marker: list[list[list[Offset]]] = []
+
+    for annotation in (first_marker, second_marker):
+        await manager.prepare_replay(RUN_ID, annotation)
+        drains: list[list[Offset]] = []
+
+        class DrainingStub(DriverStub):
+            def _run_once(self, *, check_conditions: bool) -> None:
+                super()._run_once(check_conditions=check_conditions)
+                drains.append([r.offset for r in runtime.drain(1)])  # type: ignore[misc]
+
+        from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
+
+        _WorkflowInstanceImpl._apply_replay_external_streams(  # type: ignore[arg-type]
+            DrainingStub(runtime), object()
+        )
+        per_marker.append(drains)
+
+    assert per_marker == [
+        [[placed[0].offset], [placed[1].offset]],
+        [[placed[2].offset, placed[3].offset, placed[4].offset]],
+    ], (
+        "each marker must deliver its own segments and nothing else; a marker "
+        "reassembled against the wrong segmentation puts records in a drain "
+        f"that never saw them, got {per_marker}"
+    )
+
+    reassembled = [
+        offset for drains in per_marker for drain in drains for offset in drain
+    ]
+    assert reassembled == [r.offset for r in placed], (
+        "the two markers must reassemble into the original consumption, in "
+        f"Workflow Task order and with nothing lost or repeated at the seam: "
+        f"{reassembled}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_one_segment_delivers_each_waits_own_records(
     manager: StreamSubscriptionManager, backend: MemoryStreamBackend, key: StreamKey
 ) -> None:
@@ -691,3 +795,70 @@ async def test_one_segment_delivers_each_waits_own_records(
 
     assert drained[1] == [r.offset for r in placed]
     assert drained[2] == [r.offset for r in other_placed]
+
+
+# --- what the live buffer must look like afterwards ---------------------------
+
+
+async def _until(predicate, timeout: float, message: str) -> None:  # type: ignore[no-untyped-def]
+    """Polls rather than sleeping a fixed time, so a slow watcher is not a flake."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(message)
+
+
+@pytest.mark.asyncio
+async def test_live_delivery_after_a_replay_resumes_past_the_marker(
+    manager: StreamSubscriptionManager, backend: MemoryStreamBackend, key: StreamKey
+) -> None:
+    """A replayed marker's records must not be handed over a second time, live.
+
+    Replay delivers from the annotation, but the manager's watcher has been
+    reading the *same* records from the subscription's start cursor into the
+    live buffer the whole time -- nothing out there knows the marker exists. So
+    the first live drain after a replay re-delivers everything the marker
+    recorded: observed end-to-end as a Workflow that received
+    ``['alpha', 'alpha', 'beta', 'gamma']``.
+
+    Repositioning to the marker's terminal is what makes live delivery resume
+    after the recorded range rather than in front of it.
+    """
+    placed = await append_five(backend, key)
+    runtime = make_runtime(manager, backend)
+    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+
+    subscription = manager.subscription(RUN_ID, 1)
+    assert subscription is not None
+    await _until(
+        lambda: subscription.buffered == 5,
+        5,
+        "the watcher never buffered the records, so nothing would be "
+        "re-delivered either way and this proves nothing",
+    )
+
+    # A marker recording only the first two of the five, so "resumed past it"
+    # and "delivered nothing at all" are distinguishable.
+    await manager.prepare_replay(RUN_ID, annotation_for(key, placed[:2]))
+    drive(runtime)
+    # The reposition is hopped onto this loop, exactly as the Workflow thread
+    # would hop it.
+    await asyncio.sleep(0)
+
+    await _until(
+        lambda: subscription.buffered == 3,
+        5,
+        "the buffer did not refill from the marker's boundary",
+    )
+    assert [r.offset for r in manager.drain(RUN_ID, 1)] == [
+        r.offset for r in placed[2:]
+    ], (
+        "the live buffer still holds records the replayed marker already "
+        "delivered, so the Workflow receives them twice"
+    )
+    assert subscription.committed_cursor == AFTER(placed[1].offset), (
+        "the marker's boundary was never committed, so a later reset would "
+        "send the subscription back to the start cursor"
+    )

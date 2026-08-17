@@ -67,6 +67,9 @@ class StubManager:
     def register(self, *, run_id, wait_id, stream_key, backend_name, start_cursor):  # type: ignore[no-untyped-def]
         pass
 
+    def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]
+        pass
+
 
 @pytest.fixture
 def manager() -> StubManager:
@@ -178,6 +181,44 @@ def test_differing_idle_timeouts_reduce_to_the_minimum(
         runtime.note_blocked(wait_id, True)
 
     assert runtime.effective_idle_timeout() == timedelta(seconds=2)
+
+
+def test_with_options_timeouts_reach_the_reduction_through_the_public_api(
+    manager: StubManager,
+    backend: MemoryStreamBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reduction is unreachable unless ``subscribe()`` passes the value on.
+
+    The test above registers with an explicit ``idle_timeout``, which proves
+    ``min`` reduces but says nothing about whether a configured value can ever
+    get there. ``with_options`` is the only route a user has, and a
+    ``subscribe()`` that dropped the option would leave every quiescent set on
+    the one-second default while that test, and
+    ``ExternalStreamSubscription.idle_timeout``, both kept passing -- the option
+    would be silently decorative.
+    """
+
+    class Instance:
+        """Stands in for the Workflow object the per-Run state hangs off."""
+
+    instance = Instance()
+    monkeypatch.setattr(temporalio.workflow, "instance", lambda: instance)
+    runtime = make_runtime(manager, backend, idle=timedelta(seconds=1))
+    _install_runtime(instance, runtime)  # type: ignore[arg-type]
+
+    for name, seconds in (("slow", 30), ("quick", 4), ("slower", 60)):
+        subscription = (
+            external_stream.with_options(idle_timeout=timedelta(seconds=seconds))
+            .topic(name, backend="tokens", type=str)
+            .subscribe()
+        )
+        runtime.note_blocked(subscription.wait_id, True)
+
+    assert runtime.effective_idle_timeout() == timedelta(seconds=4), (
+        "no configured timeout reached the runtime, so the whole quiescent set "
+        "fell back to the default and every with_options() call was ignored"
+    )
 
 
 def test_the_reduction_ignores_waits_that_are_not_blocked(
@@ -416,7 +457,14 @@ class FakeRuntime:
     def stream_key(self, stream_name: str) -> StreamKey:
         return StreamKey("ns", "wf", "first-run", stream_name)
 
-    def register(self, *, wait_id: int, stream_key: StreamKey, backend_name: str):
+    def register(
+        self,
+        *,
+        wait_id: int,
+        stream_key: StreamKey,
+        backend_name: str,
+        idle_timeout: timedelta,
+    ):
         self.registrations.append((wait_id, stream_key, backend_name))
 
     def drain(self, wait_id: int, max_records: int | None = None):

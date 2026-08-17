@@ -169,7 +169,12 @@ class Subscription:
     """Advances on buffering. Speculative, and discarded outright on eviction."""
 
     wait_generation: int = 0
-    """Increments each time this wait re-enters the blocked state."""
+    """Increments each time this wait re-enters the blocked state.
+
+    Written by :meth:`note_wait_generation` from the Workflow thread and read by
+    the watcher on the Worker's loop, so both go through ``_lock``. Only the
+    runtime knows when a wait re-blocks, so nothing out here can derive it.
+    """
 
     #: Records read ahead but not yet delivered. Appended by the manager loop,
     #: popped by the Workflow thread, so every touch is under `_lock`.
@@ -178,6 +183,12 @@ class Subscription:
     _has_room: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     _watcher: asyncio.Task[None] | None = field(default=None, repr=False)
     _cancelled: bool = field(default=False, repr=False)
+    #: Bumped whenever every speculative read is discarded. A `read_after`
+    #: already in flight started from the cursor being discarded, so its records
+    #: are speculative too; the watcher compares this across the await and drops
+    #: them rather than appending them on top of the reset -- which would put the
+    #: buffer straight back where it was and re-advance `prefetch_cursor`.
+    _prefetch_epoch: int = field(default=0, repr=False)
 
     #: Wakes owed because local readiness could not be delivered. Counted rather
     #: than merely logged, so a test can tell "no wake was needed" from "a wake
@@ -210,6 +221,25 @@ class Subscription:
             assert last is not None
             self.delivery_cursor = AFTER(last)
         return popped
+
+    def note_wait_generation(self, generation: int) -> None:
+        """Takes the wait generation the runtime just moved to.
+
+        Called from the Workflow thread the moment the wait re-enters the
+        blocked state. Without it this stays 0 for the life of the
+        subscription, every readiness report after the first block names a
+        generation Core has already left behind, and Core answers ``Stale`` --
+        which the watcher treats as "re-probe later" while its prefetch cursor
+        is already past the record. The append is then never re-announced and
+        the Workflow is never woken.
+        """
+        with self._lock:
+            self.wait_generation = generation
+
+    def current_wait_generation(self) -> int:
+        """The generation to report readiness under, read on the Worker's loop."""
+        with self._lock:
+            return self.wait_generation
 
     def blocked_cursor(self) -> Cursor:
         """Where this subscription's deliveries stopped.
@@ -253,6 +283,7 @@ class Subscription:
         """
         with self._lock:
             self._buffer.clear()
+            self._prefetch_epoch += 1
         self.delivery_cursor = self.committed_cursor
         self.prefetch_cursor = self.committed_cursor
         self._has_room.set()
@@ -260,6 +291,23 @@ class Subscription:
     def commit(self, cursor: Cursor) -> None:
         """Advances the committed cursor when a marker commits."""
         self.committed_cursor = cursor
+
+    def reposition_to(self, cursor: Cursor) -> None:
+        """Commits a marker's boundary and restarts every read from it.
+
+        What replay needs afterwards. While replay was handing this Workflow the
+        records the marker recorded, the watcher was independently reading the
+        *same* records from the subscription's start cursor into this buffer --
+        nothing had told it the marker exists. Leaving it there hands Workflow
+        code every replayed record a second time the moment the next live drain
+        happens.
+
+        The boundary comes from the marker rather than from what the buffer
+        happens to hold, because the marker is the only durable statement of
+        where consumption reached.
+        """
+        self.commit(cursor)
+        self.reset_to_committed()
 
 
 class StreamSubscriptionManager:
@@ -381,6 +429,19 @@ class StreamSubscriptionManager:
             self._loop.call_soon_threadsafe(subscription.note_drained)
         return popped
 
+    def note_wait_generation(self, run_id: str, wait_id: int, generation: int) -> None:
+        """Hands one wait's current generation to the subscription reporting it.
+
+        Called from the Workflow thread, and deliberately *not* hopped onto the
+        manager's loop: the next readiness report may be issued by a watcher
+        before a queued callback would run, and it would then name the stale
+        generation this exists to replace. The write is a single guarded field
+        assignment, so it is safe to make directly.
+        """
+        subscription = self.subscription(run_id, wait_id)
+        if subscription is not None:
+            subscription.note_wait_generation(generation)
+
     def rearm_ready(self, run_id: str) -> None:
         """Re-reports readiness for every buffer this Run left non-empty.
 
@@ -405,6 +466,34 @@ class StreamSubscriptionManager:
             if subscription._cancelled or not subscription.buffered:
                 continue
             self._loop.create_task(self._report_ready(subscription))
+
+    def reposition_to_committed(
+        self, run_id: str, cursors: Mapping[int, Cursor]
+    ) -> None:
+        """Moves each named wait to the boundary a replayed marker committed.
+
+        Called from the Workflow thread once replay has delivered a marker's
+        recorded ranges, so the work is hopped onto the manager's loop for the
+        same reason :meth:`rearm_ready` hops: an ``asyncio.Event`` may not be
+        set from another thread, and a watcher task created from the Workflow
+        executor thread is silently never scheduled.
+        """
+        self._loop.call_soon_threadsafe(
+            self._reposition_to_committed, run_id, dict(cursors)
+        )
+
+    def _reposition_to_committed(
+        self, run_id: str, cursors: Mapping[int, Cursor]
+    ) -> None:
+        """The manager-loop half of :meth:`reposition_to_committed`."""
+        for wait_id, cursor in cursors.items():
+            subscription = self.subscription(run_id, wait_id)
+            if subscription is None or subscription._cancelled:
+                # A wait the marker records but this Run no longer holds. Replay
+                # itself reports that as nondeterminism; there is nothing to
+                # reposition here and nothing to say about it.
+                continue
+            subscription.reposition_to(cursor)
 
     def blocked_snapshot(self, run_id: str) -> dict[int, Cursor]:
         """Where every active subscription's deliveries stopped.
@@ -436,6 +525,12 @@ class StreamSubscriptionManager:
                     await subscription._has_room.wait()
                     continue
 
+                # Captured before the read, so that a reposition landing while
+                # it is in flight is detected afterwards. The read started from
+                # a cursor that no longer describes this subscription, and
+                # appending its result would undo the reposition rather than
+                # merely race it.
+                epoch = subscription._prefetch_epoch
                 try:
                     records = await subscription.backend.read_after(
                         subscription.stream_key,
@@ -459,6 +554,12 @@ class StreamSubscriptionManager:
 
                 if not records:
                     continue
+                if subscription._prefetch_epoch != epoch:
+                    # Discarded rather than buffered: these were read from a
+                    # position a reposition has since retracted, so they are
+                    # records the marker already accounts for. The next pass
+                    # reads from the new cursor.
+                    continue
 
                 subscription._append(records)
                 await self._report_ready(subscription)
@@ -469,7 +570,9 @@ class StreamSubscriptionManager:
         """Tells Core a record is buffered, and acts on which answer comes back."""
         result = _result_value(
             await self._notify_ready(
-                subscription.run_id, subscription.wait_id, subscription.wait_generation
+                subscription.run_id,
+                subscription.wait_id,
+                subscription.current_wait_generation(),
             )
         )
 

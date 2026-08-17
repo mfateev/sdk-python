@@ -53,7 +53,11 @@ from temporalio.contrib.external_workflow_streams._errors import (
     StreamIntegrityError,
     StreamStorageError,
 )
-from temporalio.contrib.external_workflow_streams._record import StreamRecord
+from temporalio.contrib.external_workflow_streams._record import (
+    AFTER,
+    Cursor,
+    StreamRecord,
+)
 
 __all__ = ["ReplayPlan", "ReplaySegment", "build_replay_plan", "validate_run"]
 
@@ -81,6 +85,34 @@ class ReplayPlan:
     @property
     def total_records(self) -> int:
         return sum(len(s.deliveries) for s in self.segments)
+
+    @property
+    def committed_boundaries(self) -> dict[int, Cursor]:
+        """Where this marker left each wait it recorded anything for.
+
+        What live delivery has to resume from once replay has handed the
+        recorded ranges over. The terminal is the authority where there is one,
+        but **a marker does not always have one**: Core asks for a terminal only
+        when it decides the boundary itself, so a Workflow Task that completed
+        carrying server-bound commands -- a timer, an activity -- writes its
+        marker without one. Falling back to the last recorded delivery per wait
+        is not an approximation; both name the last record the Workflow Task
+        handed over.
+
+        A wait the marker recorded nothing for is deliberately absent rather
+        than mapped to its start cursor. Nothing was delivered for it, so there
+        is nothing to resume past.
+        """
+        boundaries: dict[int, Cursor] = {}
+        for segment in self.annotation.segments:
+            for run in segment.runs:
+                boundaries[run.wait_id] = AFTER(run.last_offset)
+        # The terminal wins wherever it exists: it is where deliveries stopped
+        # at the end of the Workflow Task, which can be past the last run for a
+        # wait whose final activation delivered nothing.
+        for wait_id, cursor in (self.annotation.terminal or {}).items():
+            boundaries[wait_id] = cursor
+        return boundaries
 
 
 def validate_run(run: Run, records: list[StreamRecord], backend: StreamBackend) -> None:
