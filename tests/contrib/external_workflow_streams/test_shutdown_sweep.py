@@ -90,6 +90,28 @@ class Harness:
         return key
 
 
+def _swept_request_id(harness: Harness, subscription) -> str:  # type: ignore[no-untyped-def]
+    """What the Worker's real sender derives for one swept subscription.
+
+    Built from the manager's own sender identity rather than a literal, because
+    that identity is exactly what has to be fixed across one sweep's retries and
+    distinct between two Workers.
+    """
+    key = subscription.stream_key
+    return wake_request_id(
+        WakeRequest(
+            namespace=key.namespace,
+            workflow_id=key.workflow_id,
+            first_execution_run_id=key.first_execution_run_id,
+            stream_name=key.stream_name,
+            wait_id=subscription.wait_id,
+            park_generation=0,
+            sender_identity=harness.manager.wake_sender_identity,
+            wake_counter=subscription.wakes_owed,
+        )
+    )
+
+
 @pytest.fixture
 def backend() -> MemoryStreamBackend:
     return MemoryStreamBackend()
@@ -481,21 +503,7 @@ async def test_the_retry_is_the_same_wake_not_a_second_one(
     seen: list[str] = []
 
     async def recording_wake(sub) -> None:  # type: ignore[no-untyped-def]
-        # What the Worker's real sender derives, for this subscription.
-        seen.append(
-            wake_request_id(
-                WakeRequest(
-                    namespace=sub.stream_key.namespace,
-                    workflow_id=sub.stream_key.workflow_id,
-                    first_execution_run_id=sub.stream_key.first_execution_run_id,
-                    stream_name=sub.stream_key.stream_name,
-                    wait_id=sub.wait_id,
-                    park_generation=0,
-                    sender_identity="worker-a",
-                    wake_counter=sub.wakes_owed,
-                )
-            )
-        )
+        seen.append(_swept_request_id(harness, sub))
         if len(seen) == 1:
             raise ConnectionError("service unavailable")
 
@@ -507,4 +515,37 @@ async def test_the_retry_is_the_same_wake_not_a_second_one(
     assert seen[0] == seen[1], (
         "the retry must derive the same request ID; a fresh one would ask for a "
         "second Workflow Task rather than resolve the first attempt"
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_workers_sweeps_do_not_deduplicate_each_other(
+    backend: MemoryStreamBackend,
+) -> None:
+    """The opposite half of the same requirement, and the reason it is per instance.
+
+    Two Workers shutting down at different times are two separate asks, and they
+    share a ``Client`` -- so a sender identity taken from the client identity
+    would give both first unparked wakes the same request ID. The server would
+    deduplicate the second, and the Run the surviving Worker picked up would
+    never get its Workflow Task.
+    """
+    harnesses = [Harness(backend, RunStatus.NO_OPEN_WORKFLOW_TASK) for _ in range(2)]
+    seen: list[str] = []
+
+    for harness in harnesses:
+        harness.register()
+
+        async def recording_wake(sub, harness=harness) -> None:  # type: ignore[no-untyped-def]
+            seen.append(_swept_request_id(harness, sub))
+
+        harness.manager._send_wake = recording_wake
+
+    for harness in harnesses:
+        await harness.manager.shutdown()
+
+    assert len(seen) == 2
+    assert seen[0] != seen[1], (
+        "both Workers' sweeps derived the same request ID, so the second "
+        "Worker's wake would be deduplicated away and its Run would stall"
     )

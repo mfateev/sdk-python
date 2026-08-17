@@ -952,6 +952,16 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
                 # waiting.
                 run_status=self._bridge_worker().external_stream_run_status,
                 shutdown_wake_failed_metric=self._record_shutdown_wake_failed,
+                # Only a prefix on this Worker's sender identity, which the
+                # manager makes unique per instance. Passed so a wake request ID
+                # stays traceable to a client in server-side logs; it is
+                # deliberately not the identity itself, since two Workers
+                # sharing one Client share this string.
+                client_identity=(
+                    self._client.service_client.config.identity
+                    if self._client is not None
+                    else ""
+                ),
             )
         return self._external_stream_manager
 
@@ -1016,7 +1026,11 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
                     stream_name=key.stream_name,
                     wait_id=subscription.wait_id,
                     park_generation=generation,
-                    sender_identity=self._client.service_client.config.identity,
+                    # This Worker's own identity, not the client's: two Workers
+                    # in one process share a Client, and a shared identity would
+                    # give their unparked wakes the same request ID for the
+                    # server to deduplicate -- losing the second Worker's wake.
+                    sender_identity=self._stream_manager().wake_sender_identity,
                     # Each owed wake is a separate ask, not a retry of the last
                     # one: two records arriving in two different windows both
                     # need a Workflow Task, and a shared request ID would let

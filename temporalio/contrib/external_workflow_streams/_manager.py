@@ -67,6 +67,7 @@ from temporalio.contrib.external_workflow_streams._record import (
     Cursor,
     StreamRecord,
 )
+from temporalio.contrib.external_workflow_streams._wake import new_sender_identity
 
 __all__ = ["ReadinessResult", "StreamSubscriptionManager", "Subscription"]
 
@@ -326,6 +327,7 @@ class StreamSubscriptionManager:
         send_wake: WakeSender | None = None,
         run_status: Callable[[str], Awaitable[Any]] | None = None,
         shutdown_wake_failed_metric: Callable[[Any], None] | None = None,
+        client_identity: str = "",
         buffer_size: int = DEFAULT_BUFFER_SIZE,
         watch_block: timedelta = DEFAULT_WATCH_BLOCK,
     ) -> None:
@@ -334,6 +336,14 @@ class StreamSubscriptionManager:
         self._send_wake = send_wake
         self._run_status = run_status
         self._metric = shutdown_wake_failed_metric
+        #: This Worker's sender identity for unparked wakes. Drawn once here
+        #: rather than taken from the client identity, because two Workers in
+        #: one process share a `Client`: with the client identity their first
+        #: unparked wakes derive the same request ID, the server deduplicates
+        #: the second, and the Run that the surviving Worker picked up never
+        #: gets a Workflow Task. Fixed for this manager's lifetime, so the
+        #: shutdown sweep's retry stays the same wake rather than a new one.
+        self.wake_sender_identity = new_sender_identity(client_identity)
         #: Wakes the shutdown sweep could not get acknowledged. Reported through
         #: `external_stream_shutdown_wake_failed`; kept here so a test can tell
         #: "no wake was needed" from "a wake was needed and lost".

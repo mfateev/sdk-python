@@ -156,6 +156,126 @@ def test_a_parked_wake_needs_no_sender_identity() -> None:
     )
 
 
+# --- the Worker's sender identity ---------------------------------------------
+
+
+class _StubBackend:
+    """Reports no confirmed park, so every wake here is an unparked one."""
+
+    async def current_park_generation(self, stream_key, wait_id):  # type: ignore[no-untyped-def]
+        return None
+
+
+class _StubSubscription:
+    def __init__(self, wakes_owed: int = 1) -> None:
+        self.stream_key = StreamKey("ns", "wf-1", "first-run-1", "tokens")
+        self.wait_id = 1
+        self.wakes_owed = wakes_owed
+        self.backend = _StubBackend()
+
+
+def _worker_sending_wakes(client_identity: str):  # type: ignore[no-untyped-def]
+    """One Worker's real wake sender, wired to a manager and nothing else.
+
+    Built around the actual ``_WorkflowWorker`` method rather than a
+    reimplementation of it, because the defect this guards was in *which*
+    identity that method passed, not in the derivation it passed it to.
+    """
+    from temporalio.contrib.external_workflow_streams._manager import (
+        StreamSubscriptionManager,
+    )
+    from temporalio.worker._workflow import _WorkflowWorker
+
+    async def notify_ready(run_id: str, wait_id: int, generation: int) -> str:
+        raise AssertionError("readiness is not part of this path")
+
+    worker = object.__new__(_WorkflowWorker)
+    worker._client = object()  # only ever handed to the patched sender
+    worker._external_stream_manager = StreamSubscriptionManager(
+        backends={},
+        notify_ready=notify_ready,
+        client_identity=client_identity,
+    )
+    return worker
+
+
+@pytest.fixture
+def sent_request_ids(monkeypatch):  # type: ignore[no-untyped-def]
+    """Records the request ID each wake would actually be sent under."""
+    import temporalio.contrib.external_workflow_streams._wake as wake_module
+
+    recorded: list[str] = []
+
+    async def fake_send(client, wake_request, *, producer_session_id: str = "") -> str:
+        request_id = wake_request_id(wake_request)
+        recorded.append(request_id)
+        return request_id
+
+    monkeypatch.setattr(wake_module, "send_wake_signal", fake_send)
+    return recorded
+
+
+@pytest.mark.asyncio
+async def test_two_workers_sharing_one_client_derive_different_request_ids(
+    sent_request_ids: list[str],
+) -> None:
+    """The client identity is shared; the sender identity must not be.
+
+    Two Workers in one process share a ``Client`` and so share its identity, and
+    each one's counter restarts at 1 -- so deriving from the client identity
+    gives both first unparked wakes the same request ID. The server
+    deduplicates the second, no Workflow Task is created, and the Run the
+    surviving Worker picked up stalls.
+    """
+    first = _worker_sending_wakes("one-shared-client")
+    second = _worker_sending_wakes("one-shared-client")
+
+    await first._send_external_stream_wake(_StubSubscription(wakes_owed=1))
+    await second._send_external_stream_wake(_StubSubscription(wakes_owed=1))
+
+    assert sent_request_ids[0] != sent_request_ids[1], (
+        "both Workers derived the same request ID, so the server would "
+        "deduplicate the second wake away and the Run would never be woken"
+    )
+
+
+@pytest.mark.asyncio
+async def test_one_workers_retry_of_an_unparked_wake_keeps_its_request_id(
+    sent_request_ids: list[str],
+) -> None:
+    """The identity is fixed for the Worker's lifetime, which is what makes it a retry.
+
+    The shutdown sweep re-sends one owed wake within its grace period. If the
+    sender identity were redrawn per attempt the retry would ask for a second
+    Workflow Task instead of resolving the attempt that may in fact have
+    arrived.
+    """
+    worker = _worker_sending_wakes("one-shared-client")
+    subscription = _StubSubscription(wakes_owed=1)
+
+    await worker._send_external_stream_wake(subscription)
+    await worker._send_external_stream_wake(subscription)
+
+    assert sent_request_ids[0] == sent_request_ids[1], (
+        "the retry derived a fresh request ID, so it would wake the Workflow a "
+        "second time rather than deduplicate against the first attempt"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_workers_sender_identity_still_names_its_client() -> None:
+    """So a request ID stays traceable to a client in server-side logs.
+
+    The per-instance part is what makes two Workers distinct; the client
+    identity is what makes either of them identifiable afterwards.
+    """
+    worker = _worker_sending_wakes("client-identity-here")
+
+    assert worker._external_stream_manager.wake_sender_identity.startswith(
+        "client-identity-here"
+    )
+
+
 # --- the envelope -------------------------------------------------------------
 
 

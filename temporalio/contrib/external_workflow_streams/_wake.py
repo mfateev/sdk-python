@@ -37,7 +37,12 @@ if TYPE_CHECKING:
 
     from temporalio.contrib.external_workflow_streams._producer import WorkflowChainKey
 
-__all__ = ["WakeRequest", "send_wake_signal", "wake_request_id"]
+__all__ = [
+    "WakeRequest",
+    "new_sender_identity",
+    "send_wake_signal",
+    "wake_request_id",
+]
 
 WAKE_SIGNAL_NAME = "__temporal_external_stream_wake"
 """Fixed, and versioned by the envelope rather than by the name.
@@ -67,6 +72,27 @@ Deriving a UUID rather than passing the tuple through keeps the request ID
 inside the length the server accepts while staying a pure function of its
 inputs.
 """
+
+
+def new_sender_identity(client_identity: str = "") -> str:
+    """One sender instance's identity for unparked wakes.
+
+    Unique per *sender*, not per client identity. Two Workers in one process
+    share a ``Client`` and therefore one client identity, so deriving from that
+    alone gives their first unparked wakes byte-identical request IDs -- the
+    server deduplicates the second, no Workflow Task is created, and the Run
+    stalls. That is precisely the loss the sender identity exists to prevent.
+
+    Drawn once and held for the sender's lifetime, which is what "fixed across
+    retries of that one attempt" requires: a value redrawn per attempt would
+    turn the shutdown sweep's in-grace retry into a second wake.
+
+    Random, which is safe here: the wake Signal is sent from the Worker's own
+    event loop and never from Workflow code, so it is not replay-visible and
+    cannot affect determinism. The client identity is kept as a prefix so a
+    request ID stays traceable to a Worker in server-side logs.
+    """
+    return f"{client_identity}#{uuid.uuid4()}"
 
 
 @dataclass(frozen=True)
@@ -110,9 +136,10 @@ def wake_request_id(request: WakeRequest) -> str:
     server keeps one.
 
     An **unparked** wake has no generation to identify it, so the derivation
-    additionally includes the sender's identity and a per-sender monotonic
-    counter, both held fixed across retries of that one attempt. Two senders'
-    unparked wakes must stay distinct even though neither knows about the other.
+    additionally includes the sender's identity -- unique per sender *instance*,
+    see :py:func:`new_sender_identity` -- and a per-sender monotonic counter,
+    both held fixed across retries of that one attempt. Two senders' unparked
+    wakes must stay distinct even though neither knows about the other.
     """
     parts = [
         request.namespace,
