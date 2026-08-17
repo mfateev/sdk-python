@@ -54,16 +54,54 @@ that can release the task is rollover."""
 
 WAKE_SIGNAL_NAME = "__temporal_external_stream_wake"
 
-BLOCKED_ON_ROLLOVER_ANCHOR = (
-    "Core re-anchors the rollover deadline on every quiescence: "
-    "begin_external_stream_quiescence calls start_wft_rollover_timer("
-    "Instant::now(), ...), and start_wft_rollover_timer cancels the pending "
-    "one first. A record therefore pushes the deadline out, a continuously fed "
-    "stream re-establishes quiescence after every delivery, and the deadline "
-    "never arrives -- the retained task runs until the server times it out. "
-    "The deadline has to be anchored at the Workflow Task's start time, the way "
-    "restart_external_stream_deadlines already anchors it"
+ROLLOVER_DELIVERY_TOLERANCE = timedelta(milliseconds=500)
+"""How far past the deadline a released input may land and still count as bounded by it.
+
+The deadline is what Core aims the replacement Workflow Task at, not an instant
+the server can hit. What a test can measure is the gap between two
+``WorkflowTaskStarted`` event times, and between those sit Core's completion
+RPC, the server scheduling the replacement, and a poll picking it up. Measured
+overheads here are 16-65ms, so half a second is most of an order of magnitude of
+headroom.
+
+It is deliberately far short of ``TASK_TIMEOUT - ROLLOVER_DEADLINE``, which is
+two seconds: an input released because the *server* timed the retained task out
+lands at about 10s and still fails the assertion, and telling that apart from a
+rollover is the only thing the assertion is for.
+"""
+
+STALLS_AFTER_A_STREAM_WORKFLOW_TASK = (
+    "A Workflow Task whose activation Core builds with an empty job list is "
+    "flagged as a replay, and the task a stream's wake Signal creates -- which "
+    "is also the replacement task after a rollover -- is built exactly that "
+    "way. get_wf_activation computes all_query as jobs.iter().all(is_query) "
+    "(machines/workflow_machines.rs:458), which is vacuously true for an empty "
+    "list, and is_replaying is then `self.replaying || all_query` (:464). The "
+    "wake Signal is intercepted and produces no job, and ManagedRun appends "
+    "ResolveExternalStreamWaits only *after* the activation has been built "
+    "(managed_run.rs:294-303) -- so the list is empty at the moment the flag is "
+    "computed. Activations for readiness arriving on an already-open task queue "
+    "their job first and are correctly flagged live, which is why this shows up "
+    "only at a task boundary. Python's completion path returns early "
+    "while replaying (_workflow_instance.py:2339), so that task emits neither "
+    "WorkflowStreamProgress nor WorkflowStreamQuiescent: what it consumed is "
+    "never marked, and Core is left holding the wait generation from the "
+    "previous task. Every readiness report after it answers Stale, the watcher "
+    "treats Stale as 'probe again later' while its prefetch cursor is already "
+    "past those records, and the subscription never receives anything again. "
+    "Shown minimally by parking a subscription and then creating the second "
+    "Workflow Task two ways: an ordinary user Signal activates with "
+    "is_replaying=False, the reserved wake Signal activates with "
+    "is_replaying=True, over identical History. "
 )
+"""The one defect behind both remaining expected failures, stated once.
+
+It is *not* the rollover anchor the previous reason described: rollover itself
+works. Core completes the retained task at 80% of the Workflow Task timeout,
+writes its marker, and asks for a replacement -- which is exactly what
+``test_a_signal_into_a_retained_task_lands_by_the_rollover_deadline`` now
+passes on. What fails is everything after that replacement task.
+"""
 
 
 @workflow.defn
@@ -154,6 +192,22 @@ def timed_out_tasks(events: list[Any]) -> list[Any]:
     return [e for e in events if e.HasField("workflow_task_timed_out_event_attributes")]
 
 
+def wake_signals(events: list[Any]) -> list[Any]:
+    """The reserved wake Signals in a Workflow's own History.
+
+    The mechanism itself, rather than a record turning up -- which after a
+    rollover proves nothing, since the server has already scheduled a
+    replacement task that could have picked the record up on its own.
+    """
+    return [
+        e
+        for e in events
+        if e.HasField("workflow_execution_signaled_event_attributes")
+        and e.workflow_execution_signaled_event_attributes.signal_name
+        == WAKE_SIGNAL_NAME
+    ]
+
+
 async def feed(
     backend: MemoryStreamBackend,
     key: StreamKey,
@@ -179,7 +233,15 @@ async def feed(
 # --- case 19 ------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=BLOCKED_ON_ROLLOVER_ANCHOR)
+@pytest.mark.xfail(
+    strict=True,
+    reason=STALLS_AFTER_A_STREAM_WORKFLOW_TASK
+    + "Here that is the replacement task itself: it activates with "
+    "is_replaying=True, completes carrying no command at all, and the Run goes "
+    "quiet with the remaining records buffered in the Worker and never "
+    "delivered. The first assertion below passes -- a task did complete inside "
+    "the deadline, so rollover fired -- and the Workflow then never finishes",
+)
 @pytest.mark.timeout(180)
 async def test_a_continuously_fed_stream_survives_a_rollover(
     client: Client, backend: MemoryStreamBackend
@@ -268,7 +330,6 @@ async def test_a_continuously_fed_stream_survives_a_rollover(
 # --- case 21 ------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=BLOCKED_ON_ROLLOVER_ANCHOR)
 @pytest.mark.timeout(180)
 async def test_a_signal_into_a_retained_task_lands_by_the_rollover_deadline(
     client: Client, backend: MemoryStreamBackend
@@ -286,6 +347,13 @@ async def test_a_signal_into_a_retained_task_lands_by_the_rollover_deadline(
     Task had completed, so the Signal had nothing to be delivered on -- and that
     the Workflow saw it within the deadline, measured in *Workflow* time from
     the Run's own start.
+
+    The second half carries :data:`ROLLOVER_DELIVERY_TOLERANCE`, because what it
+    measures is the distance between two ``WorkflowTaskStarted`` event times and
+    the deadline can only be the moment Core *decides* to hand the task on. A
+    completion RPC, the server scheduling the replacement, and a poll picking it
+    up all land between the two, so an exact bound is unreachable by
+    construction rather than merely flaky.
     """
     task_queue = f"tq-{uuid.uuid4()}"
     async with Worker(
@@ -316,14 +384,13 @@ async def test_a_signal_into_a_retained_task_lands_by_the_rollover_deadline(
             )
 
             await handle.signal(SignalledStreamWorkflow.poke)
-            # Waited out only as far as the deadline, never as far as the
-            # Workflow Task timeout: a retained task that reaches that is a
-            # panicking Core, not a failed assertion.
+            # Waited out only as far as the deadline and its tolerance, never as
+            # far as the Workflow Task timeout: a retained task that reaches that
+            # is a panicking Core, not a failed assertion.
+            bound = (ROLLOVER_DEADLINE + ROLLOVER_DELIVERY_TOLERANCE).total_seconds()
             waited = asyncio.get_running_loop().time() - started_at
             try:
-                elapsed = await asyncio.wait_for(
-                    handle.result(), ROLLOVER_DEADLINE.total_seconds() + 1 - waited
-                )
+                elapsed = await asyncio.wait_for(handle.result(), bound + 0.5 - waited)
             except asyncio.TimeoutError:
                 raise AssertionError(
                     "the Signal had still not been delivered by the rollover "
@@ -332,10 +399,12 @@ async def test_a_signal_into_a_retained_task_lands_by_the_rollover_deadline(
                     "long an input queues behind it"
                 ) from None
 
-            assert elapsed <= ROLLOVER_DEADLINE.total_seconds(), (
-                f"the Signal was delivered {elapsed:.1f}s into the Run, past the "
-                f"rollover deadline of {ROLLOVER_DEADLINE}. Retention latency is "
-                "bounded by that deadline and by nothing else"
+            assert elapsed <= bound, (
+                f"the Signal was delivered {elapsed:.3f}s into the Run, past the "
+                f"rollover deadline of {ROLLOVER_DEADLINE} and the "
+                f"{ROLLOVER_DELIVERY_TOLERANCE} allowed for getting the "
+                "replacement task started. Retention latency is bounded by that "
+                "deadline and by nothing else"
             )
             events = await history(handle)
             assert not timed_out_tasks(events), (
@@ -354,7 +423,16 @@ async def test_a_signal_into_a_retained_task_lands_by_the_rollover_deadline(
 # --- case 23 ------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=BLOCKED_ON_ROLLOVER_ANCHOR)
+@pytest.mark.xfail(
+    strict=True,
+    reason=STALLS_AFTER_A_STREAM_WORKFLOW_TASK
+    + "Here that removes the wake this test looks for. The append below is "
+    "answered Stale rather than NoOpenWorkflowTask, and the watcher owes a "
+    "Signal only on the three answers that mean local readiness could not be "
+    "delivered -- Stale is not one of them, so nothing is sent and no "
+    "__temporal_external_stream_wake ever reaches History. The watcher is right "
+    "to trust the answer; the answer is wrong",
+)
 @pytest.mark.timeout(180)
 async def test_an_append_after_a_rollover_completion_wakes_the_subscription(
     client: Client, backend: MemoryStreamBackend
@@ -404,25 +482,17 @@ async def test_an_append_after_a_rollover_completion_wakes_the_subscription(
                 "the task was released by the server's timeout rather than by a "
                 "rollover"
             )
-            before = len(
-                [
-                    e
-                    for e in events
-                    if e.HasField("workflow_execution_signaled_event_attributes")
-                ]
-            )
+            # Counted by name, and by the *same* name the check below uses: a
+            # baseline that counted every Signal would be compared against a
+            # total that counts only wake Signals, and any unrelated Signal in
+            # this Workflow's History would then make the comparison meaningless
+            # in whichever direction it happened to fall.
+            before = len(wake_signals(events))
 
             await publish(backend, key, ["after-rollover"], session=session)
 
             async def a_wake_arrived() -> bool:
-                signals = [
-                    e
-                    for e in await history(handle)
-                    if e.HasField("workflow_execution_signaled_event_attributes")
-                    and e.workflow_execution_signaled_event_attributes.signal_name
-                    == WAKE_SIGNAL_NAME
-                ]
-                return len(signals) > before
+                return len(wake_signals(await history(handle))) > before
 
             deadline = asyncio.get_running_loop().time() + 20
             while asyncio.get_running_loop().time() < deadline:
