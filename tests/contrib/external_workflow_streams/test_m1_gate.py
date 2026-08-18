@@ -92,6 +92,10 @@ M1_COVERAGE: dict[int, str | tuple[str, ...]] = {
     33: "test_runtime_only_jobs.py::test_finalization_touches_no_provider_at_all",
     34: "test_replay.py::test_replay_performs_no_live_waiting",
     35: "test_replay_end_to_end.py::test_replaying_a_stream_history_reproduces_the_same_observations",
+    36: (
+        "test_replay_end_to_end.py::test_an_empty_stream_parked_and_evicted_replays_from_the_recorded_cursor",
+        "test_replay_end_to_end.py::test_an_empty_stream_replays_from_its_recorded_boundary",
+    ),
     37: "test_replay.py::test_an_unreachable_backend_fails_as_transient_storage",
     38: "test_replay.py::test_each_deletion_position_fails_a_different_check",
     39: "test_replay.py::test_an_intact_but_undecodable_record_is_a_decode_error",
@@ -119,11 +123,7 @@ M1_COVERAGE: dict[int, str | tuple[str, ...]] = {
 #: Case number -> what is still missing, for cases the suite does not fully
 #: cover. A case is in exactly one of the two maps: claiming a partially covered
 #: case as covered is how a gate stops meaning anything.
-M1_GAPS: dict[int, str] = {
-    36: (
-        "an empty stream that parks, is evicted, and replays has no end-to-end test. test_replay_end_to_end.py::test_an_empty_stream_replays_from_its_recorded_boundary covers subscribe-and-replay but neither the park nor the eviction"
-    ),
-}
+M1_GAPS: dict[int, str] = {}
 
 #: The same, for `tests-m2.md`.
 M2_COVERAGE: dict[int, str | tuple[str, ...]] = {

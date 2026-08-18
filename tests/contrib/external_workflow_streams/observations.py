@@ -13,14 +13,22 @@ replay appends second, which is what makes the two comparable at all.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import Any
+
 #: ``run_id -> [observations of each execution, in the order they ran]``.
-OBSERVED: dict[str, list[list[int]]] = {}
+#:
+#: Deliberately untyped in its element: what is worth comparing between a live
+#: run and its replay differs per test -- the states a predicate saw, the
+#: records that were delivered -- and narrowing it here would only push a cast
+#: into every caller.
+OBSERVED: dict[str, list[list[Any]]] = {}
 
 
-def record(run_id: str, states: list[int]) -> None:
+def record(run_id: str, states: Sequence[Any]) -> None:
     """Appends one execution's observed sequence for a Run."""
     OBSERVED.setdefault(run_id, []).append(list(states))
 
 
-def executions(run_id: str) -> list[list[int]]:
+def executions(run_id: str) -> list[list[Any]]:
     return OBSERVED.get(run_id, [])
