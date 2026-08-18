@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 from datetime import timedelta
 from typing import Any, Final
+from urllib.parse import quote
 
 from temporalio.contrib.external_workflow_streams._backend import (
     DEFAULT_WATCH_BLOCK,
@@ -131,10 +132,19 @@ class RedisStreamBackend(StreamBackend):
     # --- key layout ---------------------------------------------------------
 
     def stream_key(self, key: StreamKey) -> str:
-        return (
-            f"{self._key_prefix}:{key.namespace}:{key.workflow_id}:"
-            f"{key.first_execution_run_id}:{key.stream_name}"
-        )
+        """The physical Redis key for one stream identity.
+
+        Injective: distinct :class:`StreamKey` values always render as distinct
+        Redis keys, because :func:`_escaped` removes the delimiter from every
+        component before they are joined. See that function for why joining the
+        raw fields is not merely untidy but a correctness failure.
+
+        An identity with no reserved character in it renders byte-identically to
+        the delimiter-joined layout this replaced, and the feature is private and
+        unreleased, so there is nothing written under the old rendering worth
+        migrating and no compatibility path here to maintain.
+        """
+        return f"{self._key_prefix}:{_escaped(key)}"
 
     def _idempotency_key(self, key: StreamKey) -> str:
         return f"{self.stream_key(key)}:idem"
@@ -279,7 +289,13 @@ class RedisStreamBackend(StreamBackend):
         found = []
         # SCAN rather than KEYS: this runs on the producer's hot path after every
         # append, and KEYS blocks the whole server for the length of the keyspace.
-        async for name in self._client.scan_iter(match=f"{prefix}*"):
+        #
+        # The prefix is a *literal* here, so it is escaped before the trailing
+        # `*` makes it a pattern. `_escaped` already leaves no glob character in
+        # the identity half, but the operator-supplied `key_prefix` is not
+        # escaped, and a pattern that quietly widened would enumerate another
+        # stream's intents rather than fail.
+        async for name in self._client.scan_iter(match=f"{_as_glob_literal(prefix)}*"):
             suffix = _text(name)[len(prefix) :]
             if suffix.isdigit():
                 found.append(int(suffix))
@@ -297,6 +313,56 @@ class RedisStreamBackend(StreamBackend):
     async def delete_for_test(self, key: StreamKey, offset: Offset) -> None:
         """Removes one record, standing in for trimming or retention expiry."""
         await self._client.xdel(self.stream_key(key), offset.serialize())
+
+
+#: What Redis' glob matcher treats as more than itself. `]` and `^` are special
+#: only inside a class, but escaping them too costs nothing and keeps the rule
+#: one line long.
+_GLOB_METACHARACTERS: Final = frozenset("*?[]\\")
+
+
+def _as_glob_literal(text: str) -> str:
+    """A literal string, made safe to embed in a `SCAN MATCH` pattern."""
+    return "".join(
+        f"\\{character}" if character in _GLOB_METACHARACTERS else character
+        for character in text
+    )
+
+
+def _escaped(key: StreamKey) -> str:
+    r"""One stream identity as a single, unambiguous key component.
+
+    Percent-encoded per field, then joined -- **not** joined raw. A Workflow ID
+    and a stream name are user-chosen strings in which `:` is an ordinary
+    character, so joining the raw fields is not injective:
+
+        ("ns", "wf", r1, f"{r2}:tokens")   and   ("ns", f"wf:{r1}", r2, "tokens")
+
+    both render as `ns:wf:r1:r2:tokens`. Two unrelated Workflows would then share
+    one stream, one idempotency hash, one park intent and one claim -- delivering
+    each other's records, and each concluding the other's claim had already taken
+    its wake. Same reasoning as `_wake.py`'s length-prefixed request-ID material,
+    applied to a key rather than to a digest.
+
+    Percent-encoding rather than length prefixes because a key is read by humans:
+    an ordinary identity still renders verbatim in `redis-cli`, and only a field
+    that actually contains a delimiter pays for it. It buys one property the
+    length prefix does not -- the encoded form contains no `:`, `*`, `?`, `[` or
+    `\`, so the derived `:idem`, `:park:<id>` and `:claim:<id>` suffixes stay
+    unambiguous and `parked_wait_ids`' pattern cannot be widened by a stream name.
+
+    Not reversible in practice, and not meant to be: `key_prefix` is
+    operator-supplied and unescaped, so only the identity half round-trips.
+    """
+    return ":".join(
+        quote(component, safe="")
+        for component in (
+            key.namespace,
+            key.workflow_id,
+            key.first_execution_run_id,
+            key.stream_name,
+        )
+    )
 
 
 def _text(value: Any) -> str:

@@ -14,7 +14,7 @@ from datetime import timedelta
 import pytest
 import pytest_asyncio
 
-from temporalio.contrib.external_workflow_streams._backend import StreamKey
+from temporalio.contrib.external_workflow_streams._backend import ParkIntent, StreamKey
 from temporalio.contrib.external_workflow_streams._record import (
     AFTER,
     BEGINNING,
@@ -299,3 +299,182 @@ async def test_a_deleted_write_fence_is_integrity_loss(
     assert "contains 2 record(s)" in str(caught.value), (
         f"a deleted fence must fail the count check, got: {caught.value}"
     )
+
+
+# --- key injectivity ---------------------------------------------------------
+
+
+def _colliding_identities() -> tuple[StreamKey, StreamKey]:
+    """Two distinct identities a delimiter-joined key layout renders identically.
+
+    Nothing here is exotic: a Workflow ID and a stream name are user-chosen
+    strings, and `:` is an ordinary character in both.
+    """
+    first_run, second_run = uuid.uuid4().hex, uuid.uuid4().hex
+    return (
+        StreamKey("ns", "wf", first_run, f"{second_run}:tokens"),
+        StreamKey("ns", f"wf:{first_run}", second_run, "tokens"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_distinct_identities_never_share_one_physical_key(
+    redis_backend: RedisStreamBackend,
+) -> None:
+    """Every derivation, not only the stream: they all come from `stream_key`.
+
+    Two `StreamKey`s that are not equal are two streams, and nothing they own --
+    records, idempotency hashes, park intents, claims -- may land in one place.
+    Two Workflows sharing one data structure is a cross-Workflow leak, and it
+    reads as ordinary corruption rather than as a key-layout bug.
+    """
+    first, second = _colliding_identities()
+    assert first != second
+
+    for name, derive in (
+        ("stream", redis_backend.stream_key),
+        ("idempotency", redis_backend._idempotency_key),
+        ("park intent", lambda k: redis_backend._intent_key(k, 1)),
+        ("claim", lambda k: redis_backend._claim_key(k, 1)),
+    ):
+        assert derive(first) != derive(second), (
+            f"the {name} key is not injective: {first} and {second} both "
+            f"render as {derive(first)!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_colliding_identities_hold_isolated_records(
+    redis_backend: RedisStreamBackend,
+) -> None:
+    """The consequence, asserted through the public operations rather than keys."""
+    first, second = _colliding_identities()
+
+    await redis_backend.append(
+        first, StreamRecord(RecordKind.DATA, b"first", "producer-first", 0)
+    )
+    await redis_backend.append(
+        second, StreamRecord(RecordKind.DATA, b"second", "producer-second", 0)
+    )
+
+    from_first = await redis_backend.read_after(
+        first, BEGINNING, max_records=10, block=None
+    )
+    from_second = await redis_backend.read_after(
+        second, BEGINNING, max_records=10, block=None
+    )
+
+    assert [r.payload for r in from_first] == [b"first"]
+    assert [r.payload for r in from_second] == [b"second"]
+
+
+@pytest.mark.asyncio
+async def test_colliding_identities_hold_isolated_park_state(
+    redis_backend: RedisStreamBackend,
+) -> None:
+    """An intent and a claim installed on one must be invisible on the other.
+
+    A shared claim key is worse than a shared stream: the second Workflow's
+    producer reads a claim it never made, concludes the wake is someone else's,
+    and stays silent -- so the Run is never woken at all.
+    """
+    first, second = _colliding_identities()
+
+    await redis_backend.install_park_intent(
+        first, ParkIntent(wait_id=1, cursor=BEGINNING, park_generation=3, run_id="r")
+    )
+
+    assert await redis_backend.park_intent(second, 1) is None
+    assert await redis_backend.current_park_generation(second, 1) is None
+    assert await redis_backend.parked_wait_ids(second) == []
+    assert await redis_backend.parked_wait_ids(first) == [1]
+
+    lease = timedelta(seconds=30)
+    assert await redis_backend.claim_park_generation(
+        first, 1, 3, claimant="producer-first", lease=lease
+    )
+    assert await redis_backend.claim_park_generation(
+        second, 1, 3, claimant="producer-second", lease=lease
+    ), "a claim on one identity's generation must say nothing about another's"
+
+
+@pytest.mark.parametrize(
+    ("metacharacter", "impostor_name"),
+    [
+        # Each impostor name is a *different* stream whose rendering, read as a
+        # `SCAN MATCH` glob, matches the victim's park keys. The lengths are
+        # chosen so the suffix a naive implementation slices off still parses as
+        # a wait id -- otherwise the leak hides behind an incidental filter.
+        ("*", "token*"),
+        ("?", "token?"),
+        ("[", "toke[n]s"),
+    ],
+    ids=["star", "question", "bracket"],
+)
+@pytest.mark.asyncio
+async def test_glob_metacharacters_cannot_enumerate_another_streams_intents(
+    redis_backend: RedisStreamBackend,
+    metacharacter: str,
+    impostor_name: str,
+) -> None:
+    """`parked_wait_ids` must answer about one stream, whatever the name spells.
+
+    The key goes into a `SCAN MATCH` pattern, so an unescaped `*`, `?` or `[` in
+    a user-chosen stream name turns the enumeration into a wildcard over the
+    keyspace -- and the producer then wakes, claims and rechecks waits that
+    belong to a different Workflow.
+    """
+    assert metacharacter in impostor_name
+    run_id = uuid.uuid4().hex
+    victim = StreamKey("ns", "wf", run_id, "tokens")
+    impostor = StreamKey("ns", "wf", run_id, impostor_name)
+
+    for wait_id in (101, 202):
+        await redis_backend.install_park_intent(
+            victim,
+            ParkIntent(
+                wait_id=wait_id, cursor=BEGINNING, park_generation=1, run_id="r"
+            ),
+        )
+    await redis_backend.install_park_intent(
+        impostor, ParkIntent(wait_id=7, cursor=BEGINNING, park_generation=1, run_id="r")
+    )
+
+    assert await redis_backend.parked_wait_ids(impostor) == [7]
+    assert await redis_backend.parked_wait_ids(victim) == [101, 202]
+
+
+@pytest.mark.asyncio
+async def test_a_glob_metacharacter_in_the_key_prefix_does_not_widen_the_scan(
+    redis_backend: RedisStreamBackend,
+) -> None:
+    """The prefix is the operator's, not the identity's, so encoding cannot fix it.
+
+    `key_prefix` separates deployments sharing one Redis and is passed through
+    verbatim -- which is what makes it readable and what makes it the one place
+    a `SCAN MATCH` pattern can still be widened. The two prefixes here are the
+    same length so a leaked key's suffix still parses as a wait id; a shorter
+    impostor would be hidden by that filter rather than by the escaping.
+    """
+    base = redis_backend._key_prefix  # cleaned up by the fixture's scan
+    victim_backend = RedisStreamBackend(
+        client=redis_backend._client, key_prefix=f"{base}:px"
+    )
+    impostor_backend = RedisStreamBackend(
+        client=redis_backend._client, key_prefix=f"{base}:p*"
+    )
+    key = StreamKey("ns", "wf", uuid.uuid4().hex, "tokens")
+
+    for wait_id in (101, 202):
+        await victim_backend.install_park_intent(
+            key,
+            ParkIntent(
+                wait_id=wait_id, cursor=BEGINNING, park_generation=1, run_id="r"
+            ),
+        )
+    await impostor_backend.install_park_intent(
+        key, ParkIntent(wait_id=7, cursor=BEGINNING, park_generation=1, run_id="r")
+    )
+
+    assert await impostor_backend.parked_wait_ids(key) == [7]
+    assert await victim_backend.parked_wait_ids(key) == [101, 202]
