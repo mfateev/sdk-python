@@ -698,6 +698,67 @@ async def check_observe_only_providers_always_grant(
     ), "an observe-only provider must grant every claim so no wake is lost"
 
 
+async def check_distinct_identities_never_share_storage(
+    backend: StreamBackend, key: StreamKey
+) -> None:
+    """Two different `StreamKey` values must never address the same storage.
+
+    Every component of the identity is a user-chosen string -- a namespace, a
+    Workflow ID, a Run ID, a topic name -- so a provider that renders the tuple
+    by joining the fields with a delimiter is not injective. These two are
+    different Workflows:
+
+        ("ns", "wf", r1, f"{r2}:tokens")   and   ("ns", f"wf:{r1}", r2, "tokens")
+
+    and a provider that joins on ``:`` gives them one physical location. They
+    then share records, idempotency state, park intents and claims: each reads
+    the other's data, and -- the quiet one -- each concludes the other's claim
+    has already taken responsibility for its wake, so neither signals and both
+    Runs wait forever on records that are already durable.
+
+    The delimiter here is the one this suite happens to use. A provider using a
+    different separator has the same obligation against its own, which is why
+    this check asserts *isolation of behaviour* rather than any property of the
+    key strings a provider builds -- those are private to it.
+    """
+    left = StreamKey(key.namespace, "wf", "run-a", "run-b:tokens")
+    right = StreamKey(key.namespace, "wf:run-a", "run-b", "tokens")
+
+    placed_left = await backend.append(left, _data("left", 0, b"left-only"))
+    placed_right = await backend.append(right, _data("right", 0, b"right-only"))
+
+    assert [
+        r.payload
+        for r in await backend.read_after(
+            left, BEGINNING, max_records=10, block=NO_BLOCK
+        )
+    ] == [b"left-only"], (
+        "two distinct stream identities share one physical stream; joining the "
+        "identity's fields without escaping is not injective, and these two "
+        "unrelated Workflows now read each other's records"
+    )
+    assert [
+        r.payload
+        for r in await backend.read_after(
+            right, BEGINNING, max_records=10, block=NO_BLOCK
+        )
+    ] == [b"right-only"]
+
+    # Park state keyed off the same identity must be isolated for the same
+    # reason: an intent read across the boundary answers a generation Core has
+    # never heard of, and the producer's wake naming it is discarded as stale.
+    await backend.install_park_intent(
+        left,
+        ParkIntent(1, AFTER(placed_left.offset), park_generation=4, run_id="a"),  # type: ignore[arg-type]
+    )
+    assert await backend.park_intent(right, 1) is None, (
+        "a park intent installed on one stream identity is visible on another"
+    )
+    assert await backend.current_park_generation(right, 1) is None
+    assert await backend.parked_wait_ids(right) == []
+    del placed_right
+
+
 #: The parking checks, kept as their own list so a provider can adopt the core
 #: contract before the parking extension.
 PARKING_CONFORMANCE_CHECKS: list[Check] = [
@@ -709,6 +770,7 @@ PARKING_CONFORMANCE_CHECKS: list[Check] = [
     check_recheck_of_a_removed_intent_is_false,
     check_the_current_generation_is_readable,
     check_a_removed_intent_reports_no_generation,
+    check_distinct_identities_never_share_storage,
     check_a_claim_excludes_a_second_producer,
     check_a_claim_is_renewable_by_its_holder,
     check_an_expired_claim_is_taken_over,

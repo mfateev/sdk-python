@@ -159,6 +159,55 @@ class GenerationOutlivesRemovalBackend(MemoryStreamBackend):
         return self._generations.get((key, wait_id))
 
 
+class DelimiterJoiningBackend(MemoryStreamBackend):
+    """Renders an identity by joining its fields, the way a first draft does.
+
+    The natural implementation for any store with a flat keyspace, and the one
+    the Redis provider originally had. It looks correct for every identity that
+    contains no delimiter, which is every identity anyone writes by hand -- so
+    the collision needs a Workflow ID or a topic name carrying a `:`, which is
+    an ordinary character in both.
+    """
+
+    def _collapse(self, key: StreamKey) -> StreamKey:
+        joined = ":".join(
+            (
+                key.namespace,
+                key.workflow_id,
+                key.first_execution_run_id,
+                key.stream_name,
+            )
+        )
+        # The remaining fields are placeholders: what matters is that two
+        # distinct identities collapse onto one, which is exactly what a
+        # delimiter-joined physical key does. They stay non-empty because
+        # StreamKey rejects empty components.
+        return StreamKey(joined, "-", "-", "-")
+
+    async def append(self, key, record):  # type: ignore[no-untyped-def]
+        return await super().append(self._collapse(key), record)
+
+    async def read_after(self, key, after, *, max_records, block=None):  # type: ignore[no-untyped-def]
+        return await super().read_after(
+            self._collapse(key), after, max_records=max_records, block=block
+        )
+
+    async def read_range(self, key, first, last):  # type: ignore[no-untyped-def]
+        return await super().read_range(self._collapse(key), first, last)
+
+    async def install_park_intent(self, key, intent):  # type: ignore[no-untyped-def]
+        return await super().install_park_intent(self._collapse(key), intent)
+
+    async def park_intent(self, key, wait_id):  # type: ignore[no-untyped-def]
+        return await super().park_intent(self._collapse(key), wait_id)
+
+    async def current_park_generation(self, key, wait_id):  # type: ignore[no-untyped-def]
+        return await super().current_park_generation(self._collapse(key), wait_id)
+
+    async def parked_wait_ids(self, key):  # type: ignore[no-untyped-def]
+        return await super().parked_wait_ids(self._collapse(key))
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("broken", "check", "reason"),
@@ -174,6 +223,12 @@ class GenerationOutlivesRemovalBackend(MemoryStreamBackend):
             conformance.check_an_expired_claim_is_taken_over,
             "expired claim was not taken over",
             id="claim-never-expires",
+        ),
+        pytest.param(
+            DelimiterJoiningBackend,
+            conformance.check_distinct_identities_never_share_storage,
+            "share one physical stream",
+            id="identity-fields-joined-without-escaping",
         ),
         pytest.param(
             LastIntentOnlyBackend,
