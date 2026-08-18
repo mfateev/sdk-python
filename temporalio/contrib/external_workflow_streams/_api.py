@@ -289,6 +289,15 @@ class ExternalStreamTopic(Generic[AnyType]):
             # the reduction and every set parks after one second.
             idle_timeout=self.options.idle_timeout,
         )
+        # Registering a wait is not blocking on one. The quiescent snapshot is a
+        # request to Core to retain the Workflow Task and, once the idle timer
+        # expires, to park it; a subscription Workflow code has not begun
+        # iterating has no coroutine waiting on it, so including it would ask
+        # Core to hold a Workflow Task open -- and eventually park it -- for a
+        # wait nothing will ever resolve. The first `_await_readiness` is what
+        # enters the blocked state, and that transition is what the wait
+        # generation counts.
+        state.runtime.note_blocked(wait_id, False)
         return ExternalStreamSubscription(
             topic=self, wait_id=wait_id, stream_key=stream_key, state=state
         )
@@ -309,11 +318,35 @@ async def merge(
     the first while records piled up on the second, and the idle timer covering
     the set would then fire against a Workflow that was not actually idle.
 
-    Draining goes in ``wait_id`` order on every pass, which is what makes the
-    interleaving reproduce. Records that arrived in one batch across two streams
-    have no inherent order between them, so an order that depended on dict
-    iteration or on which watcher happened to run first would replay differently
-    than it ran.
+    Each pass takes **at most one record from each subscription**, in ``wait_id``
+    order. Both halves of that are load-bearing:
+
+    - *In ``wait_id`` order*, which is what makes the interleaving reproduce.
+      Records that arrived in one batch across two streams have no inherent
+      order between them, so an order that depended on dict iteration, on
+      arrival time, or on which watcher happened to run first would replay
+      differently than it ran. ``wait_id`` comes from a per-Run counter in
+      ``subscribe()`` call order, so replay reconstructs the same total order
+      from the Workflow code itself, and the pass then depends only on which
+      waits have a record ready -- which replay reconstructs from the recorded
+      segments.
+    - *At most one record*, which is what makes it a merge rather than a
+      priority order. Draining one subscription's whole ready list first lets
+      the lowest ``wait_id`` spend the entire
+      :py:data:`MAX_RECORDS_PER_ACTIVATION` budget by itself, and the next
+      activation starts the same pass in the same order, so a continuously
+      backlogged first stream starves every later one forever. Because no
+      subscription may take a second record before every other ready one has
+      taken its first, the skew between any two streams is bounded by a single
+      record and no rotating start position is needed to keep it fair.
+
+    A control record spends the subscription's turn: it is consumed, because it
+    occupies an offset inside a run, and the pass moves on. Filling one record
+    at a time is also what keeps the budget exact -- a fill that took the whole
+    remaining budget into one subscription's ready list would let the rest of
+    that list be consumed after the budget was spent, and would strand it there,
+    since the completion path re-arms readiness from the *manager's* buffers and
+    knows nothing about records already popped out of them.
 
     The recorded delivery schedule follows: alternating records across two
     streams encode as one run per delivery, because a run is a maximal
@@ -336,19 +369,32 @@ async def merge(
         )
 
     while True:
+        # A closed subscription leaves the set rather than blocking it: it has
+        # no coroutine behind it, so including it in the wait would ask Core to
+        # retain the Workflow Task for a wait nothing can resolve.
+        active = [s for s in ordered if not s._finished]
+        if not active:
+            return
         delivered_any = False
-        for subscription in ordered:
-            subscription._fill()
-            while subscription._ready:
-                record = subscription._take()
-                delivered_any = True
-                if record.is_control:
-                    continue
-                yield subscription, await subscription._decode(record)
+        for subscription in active:
+            subscription._fill(1)
+            record = subscription._peek()
+            if record is None:
+                continue
+            delivered_any = True
+            if record.is_control:
+                subscription._commit(record)
+                continue
+            # Decoded before consumption is committed, for the same reason as in
+            # `_iterate`: a decode that is cancelled or raises must leave the
+            # record where a later pass can still find it.
+            value = await subscription._decode(record)
+            subscription._commit(record)
+            yield subscription, value
         if not delivered_any:
             # Nothing anywhere: block on all of them at once. Whichever wait
             # Core resolves first wakes this, and the next pass picks it up.
-            if await _await_any_readiness(ordered):
+            if await _await_any_readiness(active):
                 continue
 
 
@@ -368,6 +414,10 @@ async def _await_any_readiness(
         runtime.note_blocked(subscription.wait_id, True)
         future = runtime.new_readiness_future()
         runtime.register_pending(subscription.wait_id, future)
+        # Also on the subscription, so `close()` can resume a merge that is
+        # sitting on this wait: the runtime's map is keyed for the side that
+        # resolves readiness, and closing is neither that side nor this one.
+        subscription._pending_future = future
         futures.append(future)
     try:
         # The same last look the single-subscription path takes, for the same
@@ -376,14 +426,29 @@ async def _await_any_readiness(
         # goes through `_fill` and so finds nothing once the budget is spent --
         # otherwise a merge over a busy stream would resume immediately and the
         # activation would never end.
+        #
+        # One record, matching the pass above: a fill that took the whole
+        # remaining budget here would put records into a ready list the budget
+        # can no longer pay for, and the completion path re-arms readiness from
+        # the manager's buffers, which no longer hold them.
         for subscription in subscriptions:
-            subscription._fill()
+            subscription._fill(1)
             if subscription._ready:
                 return True
         await asyncio.wait(futures, return_when=asyncio.FIRST_COMPLETED)
         return False
+    except BaseException:
+        # Abandoned rather than resolved -- cancellation, most often because
+        # this merge lost a race against a timer. Nothing is awaiting these
+        # waits any more, so they must leave the blocked set; leaving them in it
+        # asks Core to retain and eventually park the Workflow Task for a
+        # coroutine that no longer exists.
+        for subscription in subscriptions:
+            runtime.note_blocked(subscription.wait_id, False)
+        raise
     finally:
         for subscription in subscriptions:
+            subscription._pending_future = None
             runtime.discard_pending(subscription.wait_id)
         for future in futures:
             if not future.done():
@@ -406,7 +471,13 @@ class ExternalStreamSubscription(Generic[AnyType]):
         self._stream_key = stream_key
         self._state = state
         self._ready: list[StreamRecord] = []
+        #: Set by :meth:`close`, and the only thing that ends iteration.
         self._finished = False
+        #: The readiness future currently being awaited, if any. Held here as
+        #: well as on the runtime because :meth:`close` has to be able to resume
+        #: the coroutine sitting on it, and the runtime's map is keyed by wait
+        #: id for the *resolving* side rather than for this one.
+        self._pending_future: asyncio.Future[None] | None = None
 
     @property
     def wait_id(self) -> int:
@@ -432,15 +503,28 @@ class ExternalStreamSubscription(Generic[AnyType]):
             # without looking would wait forever on a record that is already
             # here. Filling is a buffer pop and costs nothing.
             self._fill()
-            if self._ready:
-                record = self._take()
+            record = self._peek()
+            if record is not None:
                 if record.is_control:
+                    self._commit(record)
                     continue
-                yield await self._decode(record)
+                # Decoded first, committed second. Consumption is a claim that
+                # Workflow code *received* this record, and the claim is only
+                # true once a value exists: a decode that is cancelled, or that
+                # raises out of a mismatched converter, never yields anything.
+                # Committing first makes the claim false in exactly that case --
+                # the record leaves the ready list, the buffer it came from is
+                # already empty, and the consumption cursor a Continue-As-New
+                # successor resumes from has stepped over a record nothing ever
+                # saw. Left uncommitted it stays at the head of the ready list
+                # and the next `__anext__` retries it.
+                value = await self._decode(record)
+                self._commit(record)
+                yield value
                 continue
             await self._await_readiness()
 
-    def _fill(self) -> None:
+    def _fill(self, limit: int | None = None) -> None:
         """Moves whatever is buffered into this subscription's ready list.
 
         Draining is a buffer pop and never touches the backend -- the record is
@@ -450,11 +534,20 @@ class ExternalStreamSubscription(Generic[AnyType]):
         Bounded by the activation's remaining delivery budget. A drain that took
         the whole buffer would be handed straight back by a producer that keeps
         refilling it, and this activation would never return.
+
+        ``limit`` bounds it further, for a caller that will consume fewer records
+        than the budget allows. :py:func:`merge` passes 1: it takes one record
+        per subscription per pass, and anything it pulled out of the manager's
+        buffer and did not take would be stranded there -- the completion path
+        re-arms readiness from the manager's buffers, so a record already popped
+        out of one has nothing left to announce it.
         """
         if self._ready:
             return
         assert self._state.runtime is not None
         budget = self._state.runtime.delivery_budget_remaining()
+        if limit is not None:
+            budget = min(budget, limit)
         if budget <= 0:
             # Nothing is taken even though records are sitting right here, so the
             # caller blocks and the activation ends. The records are not lost:
@@ -474,18 +567,36 @@ class ExternalStreamSubscription(Generic[AnyType]):
         # cursor would step over it.
         self._ready = list(drained)
 
-    def _take(self) -> StreamRecord:
-        """Pops the next record, recording that Workflow code now has it."""
+    def _peek(self) -> StreamRecord | None:
+        """The next ready record, or ``None``. Commits nothing.
+
+        Leaving this wait's blocked state is right here rather than at commit
+        time: a record is in hand, so no coroutine is waiting on this wait, and a
+        quiescent snapshot taken while the value is being decoded must not name
+        it.
+        """
+        if not self._ready:
+            return None
         assert self._state.runtime is not None
         self._state.runtime.note_blocked(self._wait_id, False)
-        record = self._ready.pop(0)
-        # Recorded *before* the record is handed over: consumption is not
-        # delivery. A batch is delivered whole, but a Workflow that stops
-        # iterating part-way through has consumed only its prefix, and a
-        # successor Run resuming from the delivery cursor would step over the
-        # rest.
+        return self._ready[0]
+
+    def _commit(self, record: StreamRecord) -> None:
+        """Pops the record and records that Workflow code now has it.
+
+        Consumption is not delivery. A batch is delivered whole, but a Workflow
+        that stops iterating part-way through has consumed only its prefix, and
+        a successor Run resuming from the delivery cursor would step over the
+        rest.
+
+        Called only once the record has actually become a value -- or, for a
+        control record, once it has been skipped, which is the whole of what
+        receiving one means.
+        """
+        assert self._state.runtime is not None
+        assert self._ready and self._ready[0] is record
+        self._ready.pop(0)
         self._state.runtime.record_consumption(self._wait_id, record)
-        return record
 
     async def _await_readiness(self) -> None:
         """Blocks until the readiness activation resolves this wait.
@@ -501,6 +612,7 @@ class ExternalStreamSubscription(Generic[AnyType]):
         self._state.runtime.note_blocked(self._wait_id, True)
         future = self._state.runtime.new_readiness_future()
         self._state.runtime.register_pending(self._wait_id, future)
+        self._pending_future = future
         try:
             # Look once more, now that this wait is registered. A record buffered
             # between the last drain and this registration had its readiness
@@ -519,13 +631,63 @@ class ExternalStreamSubscription(Generic[AnyType]):
             if self._ready:
                 return
             await future
+        except BaseException:
+            # Abandoned rather than resolved: cancellation, most often because
+            # Workflow code raced this stream against a timer and cancelled the
+            # loser. Nothing is awaiting this wait any more, so it must leave the
+            # blocked set -- a wait left in it is named by the quiescent
+            # snapshot, and Core would retain and eventually park the Workflow
+            # Task for a coroutine that no longer exists.
+            self._state.runtime.note_blocked(self._wait_id, False)
+            raise
         finally:
+            self._pending_future = None
             self._state.runtime.discard_pending(self._wait_id)
 
     async def _decode(self, record: StreamRecord) -> AnyType:
         assert self._state.runtime is not None
         codec = self._state.runtime.codec_for(self._topic.value_type)
         return await codec.decode(record.payload)
+
+    def close(self) -> None:
+        """Ends this subscription: iteration stops and the wait goes away.
+
+        Synchronous and idempotent, because the ordinary shape is a ``finally``
+        that cannot know whether the iterator already ended.
+
+        Three things happen, and each answers a distinct way an abandoned
+        subscription is visible:
+
+        - the wait leaves the **blocked set**, so no quiescent snapshot names it
+          and Core is not asked to retain -- and eventually park -- the Workflow
+          Task for it;
+        - any coroutine sitting on this wait's readiness future is **resumed**
+          rather than cancelled, so ``_iterate`` reaches its loop condition and
+          the iteration ends with ``StopAsyncIteration`` instead of raising
+          ``CancelledError`` into Workflow code that merely closed a stream;
+        - records already drained but never handed over are **dropped without
+          being consumed**, so the consumption cursor still points in front of
+          them and a Continue-As-New successor receives them.
+
+        What it cannot do from here is tear down the Worker-side half: the
+        watcher for this wait keeps running and its park intent, if one is
+        installed, stays in the backend. That teardown is the manager's, reached
+        through a runtime hop, and is deliberately left out rather than half
+        done here.
+        """
+        if self._finished:
+            return
+        self._finished = True
+        runtime = self._state.runtime
+        if runtime is None:
+            return
+        runtime.note_blocked(self._wait_id, False)
+        runtime.discard_pending(self._wait_id)
+        self._ready.clear()
+        future = self._pending_future
+        self._pending_future = None
+        if future is not None and not future.done():
+            future.set_result(None)
 
 
 #: The entry point Workflow code uses.

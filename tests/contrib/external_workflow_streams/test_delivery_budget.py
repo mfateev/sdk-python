@@ -337,6 +337,103 @@ async def test_merge_blocks_on_every_wait_once_the_budget_is_spent(
     await cancel(task)
 
 
+class OneBusyOneQuietManager:
+    """Wait 1 never runs dry; wait 2 holds a single record and then nothing.
+
+    The shape a merge has to survive: one stream a producer keeps saturated, and
+    one that has something to say exactly once. A merge that drains the busy
+    stream to the bottom of the budget before it looks at the quiet one never
+    reaches the quiet one at all, and never will -- every fresh budget starts at
+    the same lowest wait id.
+    """
+
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+        self.rearmed: list[str] = []
+        self._next = 0
+        self._quiet_pending = True
+
+    def register(self, *, run_id, wait_id, stream_key, backend_name, start_cursor):  # type: ignore[no-untyped-def]
+        pass
+
+    def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]
+        pass
+
+    def drain(
+        self, run_id: str, wait_id: int, max_records: int | None = None
+    ) -> list[StreamRecord]:
+        if max_records is not None and max_records <= 0:
+            return []
+        if wait_id == 2:
+            if not self._quiet_pending:
+                return []
+            self._quiet_pending = False
+            return [
+                StreamRecord(RecordKind.DATA, self.payload, "p2", 0).placed_at(
+                    Offset("02-00000000")
+                )
+            ]
+        count = _UNBOUNDED_BATCH if max_records is None else max_records
+        start = self._next
+        self._next = start + count
+        return [
+            StreamRecord(RecordKind.DATA, self.payload, "p1", i).placed_at(
+                Offset(f"01-{i:08d}")
+            )
+            for i in range(start, start + count)
+        ]
+
+    def rearm_ready(self, run_id: str) -> None:
+        self.rearmed.append(run_id)
+
+
+@pytest.mark.asyncio
+async def test_merge_does_not_starve_a_stream_behind_a_saturated_one(
+    workflow_instance: FakeInstance, backend: MemoryStreamBackend
+) -> None:
+    """A merge that is not fair is not a merge.
+
+    Draining one subscription's whole ready list before looking at the next lets
+    the lowest wait id spend the entire activation budget by itself, and the next
+    activation begins the same pass in the same order. A record sitting ready on
+    a later wait is then never yielded -- deterministically, but that only makes
+    it reproducible rather than acceptable.
+
+    Three budget cycles is well past any plausible "it was just slow": one pass
+    over the set is enough for a fair merge.
+    """
+    manager = OneBusyOneQuietManager(await encoded("x"))
+    runtime = make_runtime(manager, backend)
+    _install_runtime(workflow_instance, runtime)
+    runtime.begin_activation()
+    busy = external_stream.topic("busy", backend="tokens", type=str).subscribe()
+    quiet = external_stream.topic("quiet", backend="tokens", type=str).subscribe()
+    assert (busy.wait_id, quiet.wait_id) == (1, 2)
+
+    seen: list[tuple[int, str]] = []
+
+    async def consume_merged() -> None:
+        async for subscription, value in merge(busy, quiet):
+            seen.append((subscription.wait_id, value))
+
+    task = asyncio.ensure_future(consume_merged())
+    for cycle in range(1, 4):
+        await settle(task, seen, cycle * MAX_RECORDS_PER_ACTIVATION)  # type: ignore[arg-type]
+        # What the Worker's completion path does: a fresh budget, and readiness
+        # re-armed for the records the budget left buffered.
+        runtime.begin_activation()
+        runtime.resolve_all_pending()
+
+    await cancel(task)
+    assert quiet.wait_id in {wait_id for wait_id, _ in seen}, (
+        "the quiet stream's one ready record was never yielded across three "
+        "whole activation budgets; the busy stream spent every one of them"
+    )
+    assert len(seen) <= 3 * MAX_RECORDS_PER_ACTIVATION + 1, (
+        "the budget must still bound the merged set as a whole"
+    )
+
+
 # --- re-arming readiness ------------------------------------------------------
 
 

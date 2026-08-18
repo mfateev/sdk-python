@@ -70,6 +70,9 @@ class StubManager:
     def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]
         pass
 
+    def drain(self, run_id, wait_id, max_records=None):  # type: ignore[no-untyped-def]
+        return []
+
 
 @pytest.fixture
 def manager() -> StubManager:
@@ -529,6 +532,13 @@ async def encoded(*values: str) -> list[StreamRecord]:
 
 @pytest.mark.asyncio
 async def test_merge_yields_from_every_subscription(fake_runtime: FakeRuntime) -> None:
+    """One record per subscription per pass, in ``wait_id`` order.
+
+    The second stream's record comes out between the first stream's two, not
+    behind them: a pass that emptied one subscription before looking at the next
+    would let a backlogged first stream spend a whole activation budget on
+    itself and reach the second one never.
+    """
     first = external_stream.topic("a", backend="tokens-redis", type=str).subscribe()
     second = external_stream.topic("b", backend="tokens-redis", type=str).subscribe()
     fake_runtime.buffers[first.wait_id] = await encoded("a1", "a2")
@@ -540,7 +550,7 @@ async def test_merge_yields_from_every_subscription(fake_runtime: FakeRuntime) -
         if len(seen) == 3:
             break
 
-    assert seen == [(1, "a1"), (1, "a2"), (2, "b1")]
+    assert seen == [(1, "a1"), (2, "b1"), (1, "a2")]
 
 
 @pytest.mark.asyncio
@@ -631,20 +641,23 @@ async def test_merge_never_yields_control_records(fake_runtime: FakeRuntime) -> 
     """A fence advances the cursor but belongs to the runtime, not the Workflow."""
     first = external_stream.topic("a", backend="tokens-redis", type=str).subscribe()
     second = external_stream.topic("b", backend="tokens-redis", type=str).subscribe()
-    records = await encoded("a1")
+    records = await encoded("a1", "a2")
     fake_runtime.buffers[first.wait_id] = [
         records[0],
-        StreamRecord(RecordKind.WRITE_FENCE, b"", "p", 1),
+        StreamRecord(RecordKind.WRITE_FENCE, b"", "p", 2),
+        records[1],
     ]
     fake_runtime.buffers[second.wait_id] = await encoded("b1")
 
     seen = []
     async for subscription, value in merge(first, second):
         seen.append(value)
-        if len(seen) == 2:
+        if len(seen) == 3:
             break
 
-    assert seen == ["a1", "b1"]
+    # The fence spends the first stream's turn on the second pass, so its "a2"
+    # arrives on the third -- consumed, and never yielded.
+    assert seen == ["a1", "b1", "a2"]
     # The fence was still consumed -- it occupies an offset inside a run.
     assert any(r.is_control for _, r in fake_runtime.consumed)
 
@@ -710,3 +723,101 @@ async def test_a_workflow_consumes_two_streams_as_one_wait_set(
             )
 
         assert await asyncio.wait_for(handle.result(), 60) == ["r1", "r2"]
+
+
+# --- a wait nothing is awaiting ------------------------------------------------
+
+
+@pytest.fixture
+def public_api_runtime(
+    manager: StubManager,
+    backend: MemoryStreamBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> WorkflowStreamRuntime:
+    """The real runtime, reachable through ``subscribe()``.
+
+    The quiescent snapshot is the thing under test here, and only the real
+    runtime has one.
+    """
+
+    class Instance:
+        pass
+
+    instance = Instance()
+    monkeypatch.setattr(temporalio.workflow, "instance", lambda: instance)
+    runtime = make_runtime(manager, backend)
+    _install_runtime(instance, runtime)  # type: ignore[arg-type]
+    return runtime
+
+
+def test_a_subscription_nobody_has_iterated_is_not_blocked(
+    public_api_runtime: WorkflowStreamRuntime,
+) -> None:
+    """Blocked means *Workflow code is waiting*, not *a subscription exists*.
+
+    A snapshot is a request to Core to retain the Workflow Task and, once the
+    idle timer expires, to park it. Constructing a subscription and then doing
+    something else entirely -- a timer, an activity, a signal handler -- must not
+    on its own produce a wait for Core to hold the task open for.
+    """
+    external_stream.topic("tokens", backend="tokens", type=str).subscribe()
+
+    assert public_api_runtime.quiescent_snapshot() is None, (
+        "a subscription that has never been iterated reported itself as a "
+        "quiescent wait, so Core would retain and eventually park the Workflow "
+        "Task for a wait no coroutine is awaiting"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_wait_leaves_the_quiescent_set(
+    public_api_runtime: WorkflowStreamRuntime,
+) -> None:
+    """Racing a stream against a timer is ordinary code, and the loser is cancelled.
+
+    ``asyncio.wait(..., FIRST_COMPLETED)`` followed by cancelling the pending
+    half is the standard shape. If the cancelled half stays in the blocked set,
+    every such race leaves a ghost wait behind, and the ghosts accumulate.
+    """
+    subscription = external_stream.topic(
+        "tokens", backend="tokens", type=str
+    ).subscribe()
+
+    pending = asyncio.ensure_future(subscription.__aiter__().__anext__())
+    await asyncio.sleep(0.05)
+    assert public_api_runtime.quiescent_snapshot() is not None, (
+        "a wait that is genuinely being awaited must be in the snapshot"
+    )
+
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+    assert public_api_runtime.quiescent_snapshot() is None, (
+        "the cancelled wait stayed in the quiescent set, so Core is asked to "
+        "hold the Workflow Task open for a coroutine that no longer exists"
+    )
+
+
+@pytest.mark.asyncio
+async def test_closing_a_subscription_ends_its_wait_and_its_iteration(
+    public_api_runtime: WorkflowStreamRuntime,
+) -> None:
+    """``_finished`` has to be reachable, or iteration has no end at all."""
+    subscription = external_stream.topic(
+        "tokens", backend="tokens", type=str
+    ).subscribe()
+
+    iterator = subscription.__aiter__()
+    pending = asyncio.ensure_future(iterator.__anext__())
+    await asyncio.sleep(0.05)
+    assert not pending.done()
+
+    subscription.close()
+
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(pending, 1)
+    assert public_api_runtime.quiescent_snapshot() is None
+    # Idempotent: closing twice is not an error, because the ordinary shape is a
+    # `finally` that cannot know whether the iterator already ended.
+    subscription.close()

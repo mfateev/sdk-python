@@ -47,6 +47,9 @@ class FakeRuntime:
         self.blocked: list[tuple[int, bool]] = []
         self.pending: dict[int, asyncio.Future[None]] = {}
         self.budget = MAX_RECORDS_PER_ACTIVATION
+        #: Overrides what `codec_for` hands back, so a test can control when --
+        #: and whether -- decoding a record succeeds.
+        self.codec: Any = None
 
     def stream_key(self, stream_name: str) -> StreamKey:
         return StreamKey("ns", "wf", "first-run", stream_name)
@@ -83,6 +86,8 @@ class FakeRuntime:
         self.budget = max(0, self.budget - 1)
 
     def codec_for(self, value_type: type | None) -> StreamPayloadCodec[Any]:
+        if self.codec is not None:
+            return self.codec
         return StreamPayloadCodec(
             temporalio.converter.DataConverter.default, value_type
         )
@@ -432,3 +437,110 @@ async def test_a_record_buffered_after_blocking_begins_still_resolves(
     runtime.pending[subscription.wait_id].set_result(None)
 
     assert await asyncio.wait_for(pending, 1) == "late"
+
+
+# --- consumption is committed only once a value exists ------------------------
+
+
+class GatedCodec:
+    """A codec whose first ``decode`` suspends until the test releases it.
+
+    A ``DataConverter`` may carry a payload codec, so ``decode`` is genuinely
+    async and genuinely interruptible. What matters is what the subscription's
+    bookkeeping says while it is suspended, and what it says if it never
+    finishes.
+    """
+
+    def __init__(self, value_type: type | None = str) -> None:
+        self._inner = StreamPayloadCodec(
+            temporalio.converter.DataConverter.default, value_type
+        )
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+
+    async def decode(self, payload: bytes) -> Any:
+        self.calls += 1
+        if self.calls == 1:
+            self.entered.set()
+            await self.release.wait()
+        return await self._inner.decode(payload)
+
+
+class FailingCodec:
+    """A converter mismatch: the stream is fine, the configuration is not."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def decode(self, payload: bytes) -> Any:
+        self.calls += 1
+        raise RuntimeError("this converter cannot read this payload")
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_decode_leaves_the_record_unconsumed(
+    runtime: FakeRuntime,
+) -> None:
+    """Consumption is a claim about what Workflow code received.
+
+    Recording it before the value exists makes the claim false in exactly the
+    case that matters: nothing was yielded, the record is gone from the ready
+    list, and the consumption cursor -- which is what a Continue-As-New
+    successor resumes from -- has already stepped over it.
+    """
+    codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
+    gated = GatedCodec()
+    runtime.codec = gated
+    subscription = external_stream.topic(
+        "tokens", backend="tokens-redis", type=str
+    ).subscribe()
+    runtime.buffers[subscription.wait_id] = [
+        StreamRecord(RecordKind.DATA, await codec.encode("a"), "s", 0)
+    ]
+
+    iterator = subscription.__aiter__()
+    pending = asyncio.ensure_future(iterator.__anext__())
+    await asyncio.wait_for(gated.entered.wait(), 1)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+    assert runtime.consumed == [], (
+        "the record was committed as consumed while its value did not yet "
+        "exist; a Continue-As-New successor would resume past a record the "
+        "Workflow never received"
+    )
+
+    # And it is still there to be taken: the buffer it came out of is empty, so
+    # if the subscription did not keep it, nothing else has it.
+    gated.release.set()
+    assert await asyncio.wait_for(subscription.__aiter__().__anext__(), 1) == "a"
+    assert [wait_id for wait_id, _ in runtime.consumed] == [subscription.wait_id]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_decode_leaves_the_record_unconsumed(
+    runtime: FakeRuntime,
+) -> None:
+    """The same ordering, reached by the failure a converter mismatch produces.
+
+    The budget is spent on the record either way; the question is whether the
+    Run also records having handed it over.
+    """
+    codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
+    runtime.codec = FailingCodec()
+    subscription = external_stream.topic(
+        "tokens", backend="tokens-redis", type=str
+    ).subscribe()
+    runtime.buffers[subscription.wait_id] = [
+        StreamRecord(RecordKind.DATA, await codec.encode("a"), "s", 0)
+    ]
+
+    with pytest.raises(RuntimeError, match="cannot read this payload"):
+        await subscription.__aiter__().__anext__()
+
+    assert runtime.consumed == [], (
+        "a record whose decode raised was marked consumed, so the value is lost "
+        "and the cursor claims the Workflow received it"
+    )
