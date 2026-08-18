@@ -20,6 +20,7 @@ from temporalio.contrib.external_workflow_streams._record import (
     RecordKind,
     StreamRecord,
 )
+from temporalio.service import RPCError, RPCStatusCode
 from temporalio.worker import Worker
 from tests.contrib.external_workflow_streams.memory_backend import MemoryStreamBackend
 
@@ -497,19 +498,6 @@ class TimerThenFirstRecordWorkflow:
             timer.cancel()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Core registers a wait set only from a WorkflowStreamQuiescent it also "
-        "retains for: `will_retain` gates `begin_external_stream_quiescence`, and "
-        "it is false whenever server-bound commands ride along. Python has no "
-        "other way to register -- the quiescent command is the only channel, and "
-        "an idle timeout of zero is rejected as malformed rather than meaning "
-        "'register these, retain nothing'. Sending the command anyway was tried "
-        "and changes nothing. Fixing this needs Core to register the waits "
-        "independently of the retention decision, which is not a Python change"
-    ),
-)
 async def test_a_first_block_that_rides_a_server_bound_command_is_still_wakeable(
     client: Client, backend: MemoryStreamBackend
 ) -> None:
@@ -553,7 +541,14 @@ async def test_a_first_block_that_rides_a_server_bound_command_is_still_wakeable
             # a known gap slower to report.
             assert await asyncio.wait_for(handle.result(), 15) == ["first"]
         finally:
-            await handle.terminate()
+            # The Workflow reaching its own end is the success case here, so
+            # terminating unconditionally turns a pass into a NOT_FOUND error --
+            # which is how the same mistake presented in the rollover tests.
+            try:
+                await handle.terminate()
+            except RPCError as err:
+                if err.status is not RPCStatusCode.NOT_FOUND:
+                    raise
 
 
 def _stream_markers(events: list) -> list:  # type: ignore[type-arg]

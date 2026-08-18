@@ -40,8 +40,22 @@ WAKE_SIGNAL_NAME = "__temporal_external_stream_wake"
 MARKER_DETAILS_KEY = "external_stream"
 """Where Core puts the marker's ``ExternalStreamMarkerData``."""
 
-FEED_GAP_SECONDS = 0.3
-"""Below the idle timeout, so a fed Workflow Task stays retained."""
+RETENTION_IDLE_TIMEOUT = timedelta(seconds=2)
+"""How long a fed Workflow Task stays retained here -- stated, not inherited.
+
+Case 30 needs a Workflow Task that is *open* at the moment Core asks for the
+terminal, and everything the test does between the last record reaching the
+Workflow and the shutdown call is bookkeeping read out of local state. The
+one-second default makes that bookkeeping share a window with the idle timer,
+which is not what this case is about.
+
+Not larger, because the same timeout also bounds how long the Workflow waits for
+its *first* record: a record appended before the subscription's watcher is
+running is picked up by the idle timer's park recheck rather than by the
+watcher, so raising this raises the test's own floor. Bounded above by the
+Workflow Task timeout the test starts the Workflow with in any case -- a task
+retained past that does not park, it fails (`wft-lifecycle.md`).
+"""
 
 
 @workflow.defn
@@ -53,11 +67,19 @@ class TimerThenStreamWorkflow:
     there, and the Run is left cached with **no open Workflow Task** and a live
     subscription. Once the timer fires, the Workflow blocks on the stream again
     and the next task is retained.
+
+    The marker and the retained task are therefore separated by the *whole*
+    timer: the marker is written when the timer is **started**, and the retained
+    task exists only once it has **fired** and its replacement task has reached
+    this Worker. A test that treats the marker as the signal to start feeding is
+    reading a clock, not a state -- see the caller.
     """
 
     @workflow.run
     async def run(self, expected: int) -> list[str]:
-        tokens = external_stream.topic("tokens", backend="tokens-memory", type=str)
+        tokens = external_stream.with_options(
+            idle_timeout=RETENTION_IDLE_TIMEOUT
+        ).topic("tokens", backend="tokens-memory", type=str)
         seen: list[str] = []
         iterator = tokens.subscribe().__aiter__()
         seen.append(await iterator.__anext__())
@@ -189,13 +211,21 @@ async def stream_key_for(client: Client, handle: Any) -> StreamKey:
     )
 
 
-async def wait_until(predicate: Any, timeout: float, message: str) -> None:
-    """Polls rather than sleeping a fixed time, so a slow start is not a flake."""
+async def wait_until(
+    predicate: Any, timeout: float, message: str, interval: float = 0.2
+) -> None:
+    """Polls rather than sleeping a fixed time, so a slow start is not a flake.
+
+    ``interval`` is worth lowering when the condition is read out of local
+    process state rather than fetched from the server, and when what happens
+    *after* it is satisfied is itself time-bounded: the poll gap is then part of
+    the window the caller has to act in, not merely latency.
+    """
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
         if await predicate():
             return
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(interval)
     raise AssertionError(message)
 
 
@@ -573,6 +603,35 @@ async def test_the_shutdown_probe_is_asked_while_core_still_holds_the_run(
 # --- case 30: teardown racing finalization ------------------------------------
 
 
+def _status_value(status: Any) -> Any:
+    """The probe's answer as a plain string, matched structurally as Core is."""
+    return getattr(status, "value", status)
+
+
+def _delivery_boundary(workflow_worker: Any, run_id: str) -> Any:
+    """Where this Run's deliveries have reached, read from the Run's own state.
+
+    ``blocked_snapshot()`` is the same thing the finalization terminal is built
+    from, which is what makes it the right thing to wait on: nothing else says
+    "a Workflow Task is open here and its annotation is not written yet". The
+    History cannot -- a retained task writes nothing until it ends, which is
+    exactly the state this case must catch it in.
+    """
+    runtime = workflow_worker._external_stream_runtimes.get(run_id)
+    return None if runtime is None else runtime.blocked_snapshot()
+
+
+async def _delivery_moved(workflow_worker: Any, run_id: str, previous: Any) -> bool:
+    """Whether the boundary has moved off ``previous``.
+
+    Movement rather than a value: a cursor is ordered by the provider's own
+    comparator, so "is it past the record just published" is a question only the
+    backend can answer, while "did the record land" is a question the boundary
+    answers by itself.
+    """
+    return _delivery_boundary(workflow_worker, run_id) != previous
+
+
 @pytest.mark.timeout(180)
 async def test_a_finalization_that_cannot_be_answered_writes_no_marker(
     client: Client, backend: MemoryStreamBackend
@@ -627,15 +686,60 @@ async def test_a_finalization_that_cannot_be_answered_writes_no_marker(
         committed_before = committed_boundary(before[-1], wait_id=1)
         marker_before = marker_bytes(before[-1])
 
-        # Fed continuously from here, so the task consuming these is retained
-        # and its annotation is still accumulating, unwritten, when the
-        # finalization arrives.
+        # Fed from here, and each record is *followed* to the Workflow rather
+        # than merely published on a schedule. The precondition this case needs
+        # is a Workflow Task that is open with an annotation still accumulating
+        # in it, and the marker above says nothing about when that exists: it is
+        # written when the timer is started, while the retained task appears
+        # only once the timer has fired and its replacement task has reached
+        # this Worker. Feeding on a fixed schedule from the marker races the
+        # timer, and a shutdown that wins the race finds no open Workflow Task
+        # at all -- Core issues no ``FinalizeExternalStreams``, so the sweep
+        # runs instead and nothing this case is about ever happens.
+        #
+        # The condition waited on is the Run's own delivery boundary, which is
+        # the snapshot the terminal would be built from. Once it has moved past
+        # what the previous marker committed, the open task and its unwritten
+        # annotation are both facts.
+        workflow_worker = worker_a._workflow_worker
+        manager = workflow_worker._external_stream_manager
+        assert manager is not None, "the manager should exist by now"
+        await wait_until(
+            lambda: _run_is_registered(manager),
+            30,
+            "the manager holds no Run with subscriptions, so there is no Run "
+            "state for a finalization to be answered from",
+        )
+        run_id = next(iter(manager._runs))
+        assert _delivery_boundary(workflow_worker, run_id) is not None, (
+            "the manager registered a Run the Worker holds no stream runtime "
+            "for, so the sabotage below would remove nothing"
+        )
         for value in values[1:3]:
+            delivered = _delivery_boundary(workflow_worker, run_id)
             await publish(backend, key, [value], session=session)
-            await asyncio.sleep(FEED_GAP_SECONDS)
+            await wait_until(
+                lambda: _delivery_moved(workflow_worker, run_id, delivered),
+                60,
+                f"{value!r} never reached the Workflow, so no Workflow Task is "
+                "open here with an unwritten annotation in it and the "
+                "finalization this case forces would have nothing to fail "
+                "against",
+                # The retained task the last delivery leaves behind is what the
+                # steps after this loop have to run inside, so the poll gap is
+                # spent out of that window. Short because the condition is a
+                # dictionary in this process, not a fetch from the server.
+                interval=0.02,
+            )
+
+        assert _status_value(await manager._run_status(run_id)) == "WftOpen", (
+            "the records were delivered but the Workflow Task holding them is "
+            "already gone, so Core has nothing to ask for a terminal on. The "
+            "task is retained for RETENTION_IDLE_TIMEOUT, which every step "
+            "since the last delivery is expected to fit inside"
+        )
 
         # The Run's entry disappears underneath the finalization, exactly once.
-        workflow_worker = worker_a._workflow_worker
         original = workflow_worker._handle_external_stream_jobs
         sabotaged: list[str] = []
 
@@ -645,9 +749,7 @@ async def test_a_finalization_that_cannot_be_answered_writes_no_marker(
             ):
                 sabotaged.append(act.run_id)
                 workflow_worker._external_stream_runtimes.pop(act.run_id, None)
-                manager = workflow_worker._external_stream_manager
-                if manager is not None:
-                    await manager.evict_run(act.run_id)
+                await manager.evict_run(act.run_id)
             return await original(act, running)
 
         workflow_worker._handle_external_stream_jobs = losing_the_run

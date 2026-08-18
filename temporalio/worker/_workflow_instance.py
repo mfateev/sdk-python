@@ -2346,22 +2346,21 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         commands = self._current_completion.successful.commands
         produced_commands = len(commands) > 0
 
-        # Retention is asked for only when nothing server-bound rides along. A
-        # completion carrying a timer, activity, child workflow, or signal must
-        # be reported so the server can act on it; the subscriptions stay
-        # registered and the wake Signal covers the window that leaves.
+        # The snapshot goes out whether or not this completion retains the task.
+        # A completion carrying a timer, activity, child workflow, or signal must
+        # be reported so the server can act on it, so it cannot ask for
+        # retention -- but the subscriptions stay registered, and the wake Signal
+        # covers the window that leaves.
         #
-        # "Stay registered" is the load-bearing word, and it only holds for a
-        # wait set Core already has: Core registers a wait set from a quiescent
-        # command it also *retains* for, and never from one that accompanies
-        # server-bound commands. A Workflow whose very first block rides such a
-        # completion therefore registers nothing, and no wake can resume it --
-        # see `test_a_first_block_that_rides_a_server_bound_command_is_still_
-        # wakeable`, which is xfailed against that gap. Sending the command here
-        # anyway does not close it; Core has to separate registering from
-        # retaining first.
-        snapshot = None if produced_commands else runtime.quiescent_snapshot()
-        retaining = bool(snapshot)
+        # "Stay registered" is the load-bearing phrase, and it is Core that
+        # decides how to read this: it registers the waits and, when the
+        # completion cannot be retained for, arms no timer. Withholding the
+        # snapshot here instead is what left a Workflow whose very first block
+        # rode such a completion registered nowhere, unresumable by any wake --
+        # a deadlock in ordinary user code.
+        snapshot = runtime.quiescent_snapshot()
+
+        retaining = bool(snapshot) and not produced_commands
 
         if self._is_replaying:
             # Every marker for a replayed Workflow Task is already in History,
