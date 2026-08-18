@@ -671,3 +671,121 @@ async def test_an_evicted_run_re_delivers_the_records_it_had_already_seen(
         )
     finally:
         await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_stale_answer_is_re_reported_rather_than_dropped(
+    stream_key: StreamKey,
+) -> None:
+    """`Stale` means Core held a newer generation, not that the record landed.
+
+    The watcher calls back here only after a *new* non-empty read, and its
+    prefetch cursor is already past the buffered record, so a `Stale` treated as
+    delivered announces that record to nobody. The Workflow then blocks forever
+    on data it is already holding.
+    """
+    backend = MemoryStreamBackend()
+
+    class StaleThenAccepted(RecordingNotifier):
+        async def __call__(self, run_id: str, wait_id: int, generation: int) -> str:
+            self.calls.append((run_id, wait_id, generation))
+            self.notified.set()
+            return (
+                ReadinessResult.STALE
+                if len(self.calls) == 1
+                else ReadinessResult.ACCEPTED
+            )
+
+    notifier = StaleThenAccepted()
+    manager = make_manager(backend, notifier)
+    try:
+        manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+        await append(backend, stream_key, b"a")
+        await asyncio.wait_for(notifier.notified.wait(), 2)
+        await asyncio.sleep(0.3)
+
+        assert len(notifier.calls) >= 2, (
+            "a stale answer must be re-reported; the watcher will not announce "
+            f"this record again, got {len(notifier.calls)} report(s)"
+        )
+        assert manager.subscriptions(RUN_ID)[0].buffered == 1, (
+            "the record must still be there to deliver"
+        )
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_readiness_transport_failure_does_not_kill_the_watcher(
+    stream_key: StreamKey,
+) -> None:
+    """An exception is a transport problem, not an answer.
+
+    Letting it escape ends the watcher for good: the subscription stays
+    registered, its buffer keeps its records, and nothing announces them again.
+    Swallowing it would instead claim the record was announced.
+    """
+    backend = MemoryStreamBackend()
+
+    class FailsOnce(RecordingNotifier):
+        async def __call__(self, run_id: str, wait_id: int, generation: int) -> str:
+            self.calls.append((run_id, wait_id, generation))
+            self.notified.set()
+            if len(self.calls) == 1:
+                raise ConnectionError("core unreachable")
+            return ReadinessResult.ACCEPTED
+
+    notifier = FailsOnce()
+    manager = make_manager(backend, notifier)
+    try:
+        subscription = manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+        await append(backend, stream_key, b"a")
+        await asyncio.wait_for(notifier.notified.wait(), 2)
+        await asyncio.sleep(0.5)
+
+        assert len(notifier.calls) >= 2, "the failing report must be retried"
+        watcher = subscription._watcher
+        assert watcher is not None and not watcher.done(), (
+            "the watcher must survive a readiness failure; if it ends, this "
+            "subscription is never served again"
+        )
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_wake_failure_does_not_kill_the_watcher(
+    stream_key: StreamKey,
+) -> None:
+    """The wake sender reports failure by raising, and that must stop here.
+
+    An owed wake that could not be sent stays owed for the shutdown sweep. An
+    exception escaping instead takes the watcher with it, which loses every
+    later record too.
+    """
+    backend = MemoryStreamBackend()
+    notifier = RecordingNotifier(answer=ReadinessResult.NO_OPEN_WORKFLOW_TASK)
+
+    async def failing_wake(subscription) -> None:  # type: ignore[no-untyped-def]
+        raise ConnectionError("service unavailable")
+
+    manager = make_manager(backend, notifier, send_wake=failing_wake)
+    try:
+        subscription = manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+        await append(backend, stream_key, b"a")
+        await asyncio.wait_for(notifier.notified.wait(), 2)
+        await asyncio.sleep(0.3)
+
+        watcher = subscription._watcher
+        assert watcher is not None and not watcher.done(), (
+            "a failed wake must not end the watcher"
+        )
+        assert subscription.wakes_owed >= 1, "the wake stays owed for the sweep"
+    finally:
+        await manager.shutdown()

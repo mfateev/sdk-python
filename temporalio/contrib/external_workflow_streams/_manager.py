@@ -113,6 +113,26 @@ class RunStatus:
     RUN_NOT_FOUND = "RunNotFound"
 
 
+READINESS_ATTEMPTS = 3
+"""How many times a failing readiness report is retried before a wake is owed.
+
+A raising notifier means the record is buffered and Core has not been told. That
+is indistinguishable, from here, from a Run with no open Workflow Task -- so
+after these attempts it is treated as exactly that.
+"""
+
+READINESS_RETRY_DELAY = timedelta(milliseconds=200)
+
+STALE_REPORT_ATTEMPTS = 3
+"""How many times a stale readiness report is re-sent against a newer generation.
+
+Bounded rather than open-ended: a generation that keeps moving is a Workflow
+consuming records happily, and owing a wake at the end of that costs one empty
+Workflow Task, where giving up silently costs the record.
+"""
+
+STALE_RETRY_DELAY = timedelta(milliseconds=50)
+
 SHUTDOWN_WAKE_ATTEMPTS = 3
 """How many times one owed wake is attempted before it is reported.
 
@@ -610,24 +630,52 @@ class StreamSubscriptionManager:
             pass
 
     async def _report_ready(self, subscription: Subscription) -> None:
-        """Tells Core a record is buffered, and acts on which answer comes back."""
-        result = _result_value(
-            await self._notify_ready(
-                subscription.run_id,
-                subscription.wait_id,
-                subscription.current_wait_generation(),
-            )
-        )
+        """Tells Core a record is buffered, and acts on which answer comes back.
 
-        if result in (ReadinessResult.ACCEPTED, ReadinessResult.STALE):
-            # Accepted: Core will activate. Stale: re-probe on the next loop.
+        **Total, except for cancellation.** Nothing but `CancelledError` may
+        leave this method. The watcher calls it in its loop, so an exception
+        escaping ends that watcher for good -- the subscription stays registered,
+        its buffer keeps its records, and nothing ever announces them again.
+        `_rearm_ready` also launches it with `create_task`, where an exception
+        becomes a task result nobody retrieves and the failure is not even
+        logged.
+        """
+        result = await self._notify_ready_with_retries(subscription)
+
+        if result == ReadinessResult.ACCEPTED:
+            # Core will activate; the record is announced and this is done.
             return
 
-        # The other three all mean local readiness could not be delivered, so a
+        if result == ReadinessResult.STALE:
+            # Core is holding a newer generation for this wait than the one just
+            # named, so the report was for a block that has already been
+            # resolved. Re-report against the current generation rather than
+            # returning: the watcher only calls back here after a *new*
+            # non-empty read, and `prefetch_cursor` is already past the record
+            # in the buffer, so nothing would announce it a second time. A
+            # record announced to nobody is a Workflow blocked forever on data
+            # it is already holding.
+            if await self._retry_stale(subscription):
+                return
+
+        # Everything left means local readiness could not be delivered, so a
         # Signal is owed. They differ in what happens to the watcher afterwards.
         subscription.wakes_owed += 1
         if self._send_wake is not None:
-            await self._send_wake(subscription)
+            try:
+                await self._send_wake(subscription)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The wake sender reports failure by raising, because a wake
+                # counted as delivered when it was not is the failure this whole
+                # path exists to prevent. `wakes_owed` stays incremented and the
+                # shutdown sweep remains the backstop.
+                logger.exception(
+                    "External stream wake failed for %s wait %s",
+                    subscription.stream_key,
+                    subscription.wait_id,
+                )
 
         if result == ReadinessResult.RUN_NOT_FOUND:
             # The Run is gone from this Worker. Nothing here can serve it again.
@@ -635,6 +683,60 @@ class StreamSubscriptionManager:
             self._runs.get(subscription.run_id, {}).pop(subscription.wait_id, None)
         # PARKED and NO_OPEN_WORKFLOW_TASK both *keep* the watcher: the Run is
         # still cached and this is the normal window between Workflow Tasks.
+
+    async def _notify_ready_with_retries(self, subscription: Subscription) -> str:
+        """Reports readiness, retrying a failing call a bounded number of times.
+
+        A raising notifier is a transport problem, not an answer. Letting it
+        escape kills the watcher; swallowing it and returning would claim the
+        record was announced. Retrying and then falling through to the
+        wake-owed branch treats an unreachable Core as what it is: local
+        readiness could not be delivered, which is the sixth case the five
+        answers do not name.
+        """
+        for attempt in range(READINESS_ATTEMPTS):
+            try:
+                return _result_value(
+                    await self._notify_ready(
+                        subscription.run_id,
+                        subscription.wait_id,
+                        subscription.current_wait_generation(),
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "External stream readiness report %s/%s failed for %s wait %s",
+                    attempt + 1,
+                    READINESS_ATTEMPTS,
+                    subscription.stream_key,
+                    subscription.wait_id,
+                    exc_info=True,
+                )
+                if attempt + 1 < READINESS_ATTEMPTS:
+                    await asyncio.sleep(READINESS_RETRY_DELAY.total_seconds())
+        return ReadinessResult.NO_OPEN_WORKFLOW_TASK
+
+    async def _retry_stale(self, subscription: Subscription) -> bool:
+        """Re-reports a stale readiness against the generation Core now holds.
+
+        Returns whether the record ended up announced. A generation moves when
+        the wait re-enters the blocked state, which is Workflow code coming back
+        around to it -- so the report that raced it is answered by the next one.
+        Bounded, because a wait that keeps moving is a Workflow consuming
+        happily, and a wake owed at the end of that costs one empty Workflow
+        Task rather than a silent stall.
+        """
+        for _ in range(STALE_REPORT_ATTEMPTS):
+            await asyncio.sleep(STALE_RETRY_DELAY.total_seconds())
+            if subscription._cancelled or not subscription.buffered:
+                return True
+            if await self._notify_ready_with_retries(subscription) == (
+                ReadinessResult.ACCEPTED
+            ):
+                return True
+        return False
 
     # --- the runtime-only jobs' backend work (P19) --------------------------
 
