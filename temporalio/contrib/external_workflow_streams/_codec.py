@@ -123,7 +123,15 @@ class StreamPayloadCodec(Generic[AnyType]):
         the record reached it by a path that does not prepare, which is a
         routing defect and not a user's converter mismatch.
         """
-        if self.data_converter._decode_payload_has_effect:
+        # Asked of the two public members rather than through the converter's
+        # `_decode_payload_has_effect`, which is the same condition but is marked
+        # in its own source as a temporary shortcircuit to be removed. This
+        # refusal is a safety property; it should not stop working the day an
+        # unrelated cleanup lands upstream.
+        if (
+            self.data_converter.payload_codec is not None
+            or self.data_converter.external_storage is not None
+        ):
             raise RuntimeError(
                 "an external stream record reached the Workflow thread without "
                 "its DataConverter's asynchronous half having been applied. "
