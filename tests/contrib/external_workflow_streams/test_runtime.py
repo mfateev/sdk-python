@@ -374,6 +374,151 @@ async def test_a_new_annotation_starts_from_the_current_cursors(
     assert decoded.header.streams[1].start_cursor == AFTER(Offset("9-0"))  # type: ignore[attr-defined]
 
 
+# --- a subscription created after the header went out -----------------------
+
+
+async def test_a_wait_registered_after_the_first_delta_reaches_the_header(
+    runtime: WorkflowStreamRuntime,
+) -> None:
+    """`register` accepts a subscription at any activation of a retained task.
+
+    The header frame is emitted with the first delta and Core appends rather
+    than rewrites, so a wait that joined later cannot be added to it in place.
+    Without a binding of its own that wait reaches the marker as a run and a
+    terminal entry with no stream key, no backend, and no start cursor, and
+    replay of *unchanged* code fails as a wait "this Workflow did not create".
+    """
+    subscribe(runtime, 1, "tokens")
+    runtime.record_delivery(1, data("1-0"))
+    first = runtime.take_observation_delta()
+    assert first is not None
+    assert set(decode_annotation(first).header.streams) == {1}, (
+        "the first delta's header is what this test is about; if it already "
+        "carried wait 2 the fix under test is not being exercised"
+    )
+
+    key = runtime.stream_key("tokens")
+    runtime.register(wait_id=2, stream_key=key, backend_name="tokens")
+    runtime.record_delivery(2, data("2-0"))
+    second = runtime.take_observation_delta()
+    assert second is not None
+    terminal = runtime.add_terminal()
+
+    decoded = decode_annotation(first + second + terminal)
+
+    assert set(decoded.header.streams) == {1, 2}, (
+        "wait 2 has a run and a terminal entry but no binding, so replay has "
+        "no stream key, no backend, and no start cursor for it"
+    )
+    assert decoded.header.streams[2].stream_key == key
+    assert decoded.header.streams[2].backend_name == "tokens"
+    assert decoded.terminal == {1: AFTER(Offset("1-0")), 2: AFTER(Offset("2-0"))}
+
+
+async def test_a_late_wait_is_bound_before_the_segment_that_records_it(
+    runtime: WorkflowStreamRuntime,
+) -> None:
+    """Order within the delta, not merely presence somewhere in the marker.
+
+    A decoder that met the run first would have no binding to attach it to, and
+    a marker truncated at a rollover boundary would carry the run without the
+    binding at all.
+    """
+    subscribe(runtime, 1)
+    runtime.record_delivery(1, data("1-0"))
+    first = runtime.take_observation_delta()
+    assert first is not None
+
+    subscribe(runtime, 2)
+    runtime.record_delivery(2, data("2-0"))
+    second = runtime.take_observation_delta()
+    assert second is not None
+
+    # 0x04 is the bindings frame tag.
+    assert second[0] == 0x04, (
+        "the delta must open with the binding for the wait it goes on to "
+        f"record a run for, got {second.hex()}"
+    )
+
+
+async def test_a_late_wait_starts_at_its_own_cursor(
+    runtime: WorkflowStreamRuntime,
+) -> None:
+    """Not wherever the waits already in the header have reached.
+
+    The annotation-wide position belongs to the waits that were there when it
+    opened. Recording it for a wait that joined afterwards would start replay
+    of that wait past records it in fact received.
+    """
+    subscribe(runtime, 1)
+    runtime.record_delivery(1, data("9-0"))
+    first = runtime.take_observation_delta()
+    assert first is not None
+
+    subscribe(runtime, 2)
+    runtime.record_delivery(2, data("3-0"))
+    second = runtime.take_observation_delta()
+    assert second is not None
+
+    decoded = decode_annotation(first + second + runtime.add_terminal())
+
+    assert decoded.header.streams[2].start_cursor == BEGINNING
+    assert decoded.header.streams[1].start_cursor == BEGINNING
+
+
+async def test_a_wait_is_bound_once_per_annotation(
+    runtime: WorkflowStreamRuntime,
+) -> None:
+    """Three activations, one binding each for the two waits that exist.
+
+    A binding re-emitted every activation would grow the marker with the
+    activation count and be rejected on decode as a wait bound twice.
+    """
+    subscribe(runtime, 1)
+    runtime.record_delivery(1, data("1-0"))
+    parts = [runtime.take_observation_delta()]
+
+    subscribe(runtime, 2)
+    runtime.record_delivery(2, data("2-0"))
+    parts.append(runtime.take_observation_delta())
+
+    runtime.record_delivery(2, data("3-0"))
+    parts.append(runtime.take_observation_delta())
+
+    joined = b"".join(p for p in parts if p is not None)
+
+    # A re-emitted binding is not merely wasteful: the decoder refuses a wait
+    # bound twice, so this decoding at all is the assertion.
+    decoded = decode_annotation(joined + runtime.add_terminal())
+    assert set(decoded.header.streams) == {1, 2}
+
+
+async def test_the_next_annotation_binds_every_wait_in_its_own_header(
+    runtime: WorkflowStreamRuntime,
+) -> None:
+    """A late binding belongs to the annotation it was emitted into.
+
+    The next Workflow Task writes a header from scratch, so the wait that
+    joined late must appear in *that* header rather than being remembered as
+    already announced -- a second marker missing it is the same defect one
+    Workflow Task later.
+    """
+    subscribe(runtime, 1)
+    runtime.record_delivery(1, data("1-0"))
+    runtime.take_observation_delta()
+    subscribe(runtime, 2)
+    runtime.record_delivery(2, data("2-0"))
+    runtime.take_observation_delta()
+    runtime.add_terminal()
+
+    runtime.start_new_annotation()
+    runtime.record_delivery(2, data("3-0"))
+    decoded = annotation_of(runtime)
+
+    assert set(decoded.header.streams) == {1, 2}  # type: ignore[attr-defined]
+    assert decoded.header.streams[2].start_cursor == AFTER(Offset("2-0"))  # type: ignore[attr-defined]
+
+
 # --- quiescence (P10a) ------------------------------------------------------
 
 

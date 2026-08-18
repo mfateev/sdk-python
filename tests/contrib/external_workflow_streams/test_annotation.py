@@ -19,6 +19,7 @@ from temporalio.contrib.external_workflow_streams._annotation import (
     StreamBinding,
     decode_annotation,
     encode_annotation,
+    encode_bindings,
 )
 from temporalio.contrib.external_workflow_streams._backend import StreamKey
 from temporalio.contrib.external_workflow_streams._record import (
@@ -272,9 +273,7 @@ def test_alternating_streams_cost_one_run_per_delivery() -> None:
     """The honest worst case, stated as a test rather than assumed away."""
     runs = tuple(Run(1 + (i % 2), offset(i), offset(i), 1) for i in range(1, 21))
     annotation = Annotation(
-        header(
-            {1: binding(KEY), 2: binding(OTHER_KEY)}
-        ),
+        header({1: binding(KEY), 2: binding(OTHER_KEY)}),
         segments=(Segment(runs, SegmentEndReason.NO_DATA_AVAILABLE),),
         terminal={1: AFTER(offset(19)), 2: AFTER(offset(20))},
     )
@@ -326,6 +325,124 @@ def test_the_accumulator_reports_the_size_the_marker_will_carry() -> None:
     assert accumulator.size == len(accumulator.accumulated())
 
 
+# --- a wait bound after the header ------------------------------------------
+
+
+def test_a_wait_bound_after_the_header_decodes_into_it() -> None:
+    """A subscription can be created at any activation of a retained task.
+
+    The header frame for that task has usually already gone to Core by then,
+    and Core appends deltas rather than rewriting them, so the binding rides a
+    frame of its own. What replay reads is still one flat table: a wait that
+    joined late is indistinguishable, once decoded, from one that was there
+    from the start -- which is what lets `prepare_replay` resolve its backend
+    and stream key at all.
+    """
+    accumulator = AnnotationAccumulator(header())
+    accumulator.add_segment(
+        Segment((Run(1, offset(100), offset(100), 1),), SegmentEndReason.BATCH_LIMIT)
+    )
+    accumulator.add_bindings({2: binding(OTHER_KEY)})
+    accumulator.add_segment(
+        Segment(
+            (Run(2, offset(200), offset(200), 1),), SegmentEndReason.NO_DATA_AVAILABLE
+        )
+    )
+    accumulator.add_terminal({1: AFTER(offset(100)), 2: AFTER(offset(200))})
+
+    decoded = decode_annotation(accumulator.accumulated())
+
+    assert decoded.header.streams == {1: binding(KEY), 2: binding(OTHER_KEY)}
+    assert decoded.terminal == {1: AFTER(offset(100)), 2: AFTER(offset(200))}
+    assert [run.wait_id for segment in decoded.segments for run in segment.runs] == [
+        1,
+        2,
+    ]
+
+
+def test_a_late_binding_keeps_its_own_start_cursor() -> None:
+    """Not wherever the waits already in the header have reached.
+
+    A wait registered part-way through a Workflow Task begins at the boundary
+    its own `subscribe()` was given. Recording the annotation-wide position
+    instead would start replay of that wait past records it in fact received.
+    """
+    accumulator = AnnotationAccumulator(header({1: binding(KEY, AFTER(offset(100)))}))
+    accumulator.add_bindings({2: binding(OTHER_KEY)})
+    accumulator.add_terminal({1: AFTER(offset(100)), 2: BEGINNING})
+
+    decoded = decode_annotation(accumulator.accumulated())
+
+    assert decoded.header.streams[1].start_cursor == AFTER(offset(100))
+    assert decoded.header.streams[2].start_cursor == BEGINNING
+
+
+def test_a_bindings_frame_is_the_header_frame_body_under_its_own_tag() -> None:
+    """Locked to exact bytes, like the golden annotation and for the reason.
+
+    A second *header* frame would have been the smaller change and is what the
+    encoding deliberately does not do: a header frame also carries the schema
+    version, so a decoder meeting two of them has to decide whether the later
+    replaces the earlier. The distinct tag says one thing only.
+    """
+    assert encode_bindings({2: binding(OTHER_KEY)}).hex() == "".join(
+        [
+            "04",  # bindings frame
+            "01",  # one stream
+            "02",  # wait id 2
+            "02" + "ns".encode().hex(),
+            "02" + "wf".encode().hex(),
+            "05" + "run-1".encode().hex(),
+            "0b" + "tool-events".encode().hex(),
+            "00",  # start cursor BEGINNING
+            "06" + "tokens".encode().hex(),  # backend name
+            "0d" + "redis-streams".encode().hex(),  # provider id
+            "01",  # provider format version 1
+        ]
+    )
+
+
+def test_a_wait_bound_twice_is_refused() -> None:
+    """Two bindings for one wait leave replay choosing between stream keys.
+
+    Whichever it chose could be the one the recorded records were not written
+    to, and the range read would then fail as integrity loss against a backend
+    nothing is wrong with.
+    """
+    accumulator = AnnotationAccumulator(header())
+    accumulator.add_bindings({1: binding(OTHER_KEY)})
+    accumulator.add_terminal({1: BEGINNING})
+
+    with pytest.raises(AnnotationDecodeError, match="bound twice"):
+        decode_annotation(accumulator.accumulated())
+
+
+def test_bindings_after_the_terminal_are_refused() -> None:
+    """Both halves: the encoder cannot emit one and the decoder rejects one.
+
+    The annotation ends at its terminal. A binding appended past it belongs to
+    a Workflow Task whose marker has already been decided, and Core would write
+    it into that marker rather than the next one.
+    """
+    accumulator = AnnotationAccumulator(header())
+    accumulator.add_terminal({1: BEGINNING})
+    with pytest.raises(ValueError, match="after the terminal"):
+        accumulator.add_bindings({2: binding(OTHER_KEY)})
+
+    with pytest.raises(AnnotationDecodeError, match="follows the terminal"):
+        decode_annotation(
+            encode_annotation(Annotation(header(), terminal={1: BEGINNING}))
+            + encode_bindings({2: binding(OTHER_KEY)})
+        )
+
+
+def test_a_bindings_frame_binds_at_least_one_wait() -> None:
+    """An empty frame costs bytes and says nothing, so it is a caller error."""
+    accumulator = AnnotationAccumulator(header())
+    with pytest.raises(ValueError, match="at least one wait"):
+        accumulator.add_bindings({})
+
+
 def test_a_segment_after_the_terminal_is_refused() -> None:
     accumulator = AnnotationAccumulator(header())
     accumulator.add_terminal({1: BEGINNING})
@@ -369,9 +486,7 @@ def test_an_alternating_two_stream_batch_asks_for_rollover_rather_than_overflowi
     rollover, not grow past the budget.
     """
     accumulator = AnnotationAccumulator(
-        header(
-            {1: binding(KEY), 2: binding(OTHER_KEY)}
-        )
+        header({1: binding(KEY), 2: binding(OTHER_KEY)})
     )
 
     delivered = 0

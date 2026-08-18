@@ -108,11 +108,17 @@ class _SubscriptionState:
     """Increments each time this wait re-enters the blocked state."""
 
     announced: bool = False
-    """Whether the header has recorded this subscription yet.
+    """Whether the *current* annotation has carried this subscription's binding.
 
     The first observation must carry provider identity, stream key, and start
     cursor even if no record was ever delivered -- otherwise replay of a
     subscription to an empty stream has nowhere to begin.
+
+    Read rather than merely set, because ``register`` accepts a subscription at
+    any activation of a retained Workflow Task and the header frame for that
+    task has usually already gone to Core. A wait that joined after it is bound
+    by its own bindings frame, and this is what says which waits still need
+    one.
     """
 
     fence_reached: bool = False
@@ -321,16 +327,27 @@ class WorkflowStreamRuntime:
             # hold something: a watcher that ran before the Run was evicted may
             # have prefetched past where the marker stops, and delivering that
             # would replay records this Workflow Task never saw.
+            #
+            # Taken from the **front**, and only while the front belongs to this
+            # wait. A segment is the recorded global order across every stream --
+            # the order `record_delivery` saw, which is the order Workflow code
+            # took records in -- so a drain that searched past a record belonging
+            # to another wait would hand this one a record that came *after* it
+            # live. A segment recorded as (wait 2, wait 1) replays through
+            # `merge` as (wait 1, wait 2) under that reading, because `merge`
+            # asks in `wait_id` order and the search obliges every time.
+            #
+            # Live, that drain would simply have found nothing: the record was
+            # not in this wait's buffer yet. Returning nothing here is the same
+            # answer, and it leaves the record where the drain that recorded it
+            # will find it.
             taken: list[StreamRecord] = []
-            remaining: list[tuple[int, StreamRecord]] = []
-            for entry_wait_id, record in self._replay_ready:
-                if entry_wait_id == wait_id and (
-                    max_records is None or len(taken) < max_records
-                ):
-                    taken.append(record)
-                else:
-                    remaining.append((entry_wait_id, record))
-            self._replay_ready = remaining
+            while (
+                self._replay_ready
+                and self._replay_ready[0][0] == wait_id
+                and (max_records is None or len(taken) < max_records)
+            ):
+                taken.append(self._replay_ready.pop(0)[1])
             return taken
         return self._manager.drain(self._run_id, wait_id, max_records)
 
@@ -808,10 +825,50 @@ class WorkflowStreamRuntime:
             # not emit simply never reaches the marker -- and a marker whose
             # annotation starts at a segment frame cannot be decoded at all.
             self._pending_deltas.append(self._accumulator.accumulated())
+        else:
+            self._announce_late_subscriptions()
         return self._accumulator
+
+    def _announce_late_subscriptions(self) -> None:
+        """Binds every subscription the emitted header does not already carry.
+
+        ``register`` accepts a subscription at any activation of a retained
+        Workflow Task, and only the first of those activations gets to write the
+        header -- Core appends the deltas it is handed and never rewrites what it
+        already holds, so the header cannot be extended in place. A wait that
+        joined later is bound by its own frame instead.
+
+        Called from :meth:`_ensure_accumulator`, which is on the path of both
+        things that can follow a registration: the segment that records the
+        wait's first run, and the terminal that records where it stopped. The
+        binding therefore always precedes both, and no wait can reach the marker
+        as a run or a terminal entry with no stream key, no backend, and no start
+        cursor -- which replay reports as a wait "this Workflow did not create"
+        even when the code is unchanged.
+        """
+        assert self._accumulator is not None
+        late = {
+            wait_id: state
+            for wait_id, state in sorted(self._subscriptions.items())
+            if not state.announced
+        }
+        if not late:
+            return
+        for state in late.values():
+            state.announced = True
+        self._pending_deltas.append(
+            self._accumulator.add_bindings(
+                {wait_id: self._binding(state) for wait_id, state in late.items()}
+            )
+        )
 
     def _header(self) -> AnnotationHeader:
         """One binding per subscription, each naming **its own** backend.
+
+        Marks every subscription announced, which is also how the flag is reset
+        for the *next* annotation: a header is written from scratch whenever an
+        accumulator is created, so whatever exists when it is carries its
+        binding there rather than in a bindings frame.
 
         The provider identity is read from the backend this subscription is
         actually registered against rather than from a single annotation-wide

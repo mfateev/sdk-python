@@ -21,11 +21,17 @@ import temporalio.workflow
 from temporalio.contrib.external_workflow_streams._annotation import (
     Annotation,
     AnnotationHeader,
+    decode_annotation,
     Run,
     Segment,
     SegmentEndReason,
     StreamBinding,
     encode_annotation,
+)
+from temporalio.contrib.external_workflow_streams._api import (
+    _install_runtime,
+    external_stream,
+    merge,
 )
 from temporalio.contrib.external_workflow_streams._backend import StreamKey
 from temporalio.contrib.external_workflow_streams._codec import StreamPayloadCodec
@@ -1245,3 +1251,217 @@ async def test_a_marker_naming_an_unregistered_backend_is_nondeterminism(
                 [Run(1, record.offset, record.offset, 1)],  # type: ignore[arg-type]
             ),
         )
+
+
+# --- a wait registered after the header, replayed ----------------------------
+
+
+class FakeInstance:
+    """Stands in for the Workflow object the per-Run subscription state hangs off."""
+
+
+@pytest.mark.asyncio
+async def test_a_wait_registered_mid_annotation_replays(
+    manager: StreamSubscriptionManager, backend: MemoryStreamBackend
+) -> None:
+    """The whole round trip for a subscription created after the first delta.
+
+    `register` accepts one at any activation of a retained Workflow Task, long
+    after the header frame went to Core -- and Core appends deltas rather than
+    rewriting them. A wait bound nowhere reaches the marker as a run and a
+    terminal entry alone, and `prepare_replay` then has no stream key and no
+    backend for it, so replay of *unchanged* code fails as a wait "this
+    Workflow did not create".
+    """
+    from temporalio.contrib.external_workflow_streams._runtime import (
+        WorkflowStreamRuntime,
+    )
+
+    chain = uuid.uuid4().hex
+    first_key = StreamKey("ns", "wf", chain, "tokens")
+    late_key = StreamKey("ns", "wf", chain, "tool-events")
+    first_record = (await append_five(backend, first_key))[0]
+    late_record = (await append_five(backend, late_key))[0]
+
+    recorder = WorkflowStreamRuntime(
+        manager=manager,
+        backends={"tokens": backend},
+        run_id="recording-run",
+        namespace="ns",
+        workflow_id="wf",
+        first_execution_run_id=chain,
+        data_converter=temporalio.converter.DataConverter.default,
+        default_idle_timeout=timedelta(seconds=1),
+    )
+    recorder.register(wait_id=1, stream_key=first_key, backend_name="tokens")
+    recorder.record_delivery(1, first_record)
+    deltas = [recorder.take_observation_delta()]
+    # The header is fixed from here on: Core already holds those bytes.
+    recorder.register(wait_id=2, stream_key=late_key, backend_name="tokens")
+    recorder.record_delivery(2, late_record)
+    deltas.append(recorder.take_observation_delta())
+    annotation = b"".join(d for d in deltas if d is not None) + recorder.add_terminal()
+
+    assert set(decode_annotation(annotation).header.streams) == {1, 2}
+
+    plan = await manager.prepare_replay(RUN_ID, annotation)
+    runtime = make_runtime(manager, backend)
+    runtime.register(wait_id=1, stream_key=first_key, backend_name="tokens")
+    runtime.register(wait_id=2, stream_key=late_key, backend_name="tokens")
+
+    drained: dict[int, list[Offset]] = {1: [], 2: []}
+
+    class DrainingStub(DriverStub):
+        def _run_once(self, *, check_conditions: bool) -> None:
+            super()._run_once(check_conditions=check_conditions)
+            for wait_id in (1, 2):
+                drained[wait_id].extend(r.offset for r in runtime.drain(wait_id))  # type: ignore[misc]
+
+    from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
+
+    _WorkflowInstanceImpl._apply_replay_external_streams(  # type: ignore[arg-type]
+        DrainingStub(runtime), object()
+    )
+
+    assert drained == {1: [first_record.offset], 2: [late_record.offset]}
+    assert plan.committed_boundaries == {
+        1: AFTER(first_record.offset),  # type: ignore[arg-type]
+        2: AFTER(late_record.offset),  # type: ignore[arg-type]
+    }
+
+
+# --- a segment's global order is the order Workflow code receives in ---------
+
+
+@pytest.mark.asyncio
+async def test_a_segment_replays_in_its_recorded_cross_stream_order(
+    manager: StreamSubscriptionManager,
+    backend: MemoryStreamBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A segment recorded as (wait 2, wait 1) must not replay as (wait 1, wait 2).
+
+    The order is reachable live and `merge` is how: a pass asks in `wait_id`
+    order, finds wait 1's buffer empty and wait 2's holding a record, and wait
+    1's record lands from the manager's loop before the next pass. That is one
+    activation, so it is one segment, and the segment records (2, 1).
+
+    On replay `merge` asks in the same `wait_id` order -- but every record of
+    the segment is already in hand. A drain that searched the segment for its
+    own wait would answer the first ask with wait 1's record and reverse the
+    two, which is a different sequence of values reaching Workflow code and so
+    a different sequence of commands. Taking only from the front is what makes
+    the empty answer replay as empty.
+    """
+    chain = uuid.uuid4().hex
+    left = StreamKey("ns", "wf", chain, "left")
+    right = StreamKey("ns", "wf", chain, "right")
+    left_record = (await append_five(backend, left))[0]
+    right_record = (await append_five(backend, right))[0]
+
+    annotation = encode_annotation(
+        Annotation(
+            header=AnnotationHeader({1: binding(left), 2: binding(right)}),
+            segments=(
+                Segment(
+                    (
+                        Run(2, right_record.offset, right_record.offset, 1),  # type: ignore[arg-type]
+                        Run(1, left_record.offset, left_record.offset, 1),  # type: ignore[arg-type]
+                    ),
+                    SegmentEndReason.NO_DATA_AVAILABLE,
+                ),
+            ),
+            terminal={
+                1: AFTER(left_record.offset),  # type: ignore[arg-type]
+                2: AFTER(right_record.offset),  # type: ignore[arg-type]
+            },
+        )
+    )
+    plan = await manager.prepare_replay(RUN_ID, annotation)
+    assert [wait_id for wait_id, _ in plan.segments[0].deliveries] == [2, 1]
+
+    runtime = make_runtime(manager, backend)
+    instance = FakeInstance()
+    monkeypatch.setattr(temporalio.workflow, "instance", lambda: instance)
+    _install_runtime(instance, runtime)
+
+    runtime.begin_replay(plan.annotation.header.streams)
+    try:
+        first = external_stream.topic("left", backend="tokens", type=str).subscribe()
+        second = external_stream.topic("right", backend="tokens", type=str).subscribe()
+        assert (first.wait_id, second.wait_id) == (1, 2)
+
+        runtime.begin_replay_segment(list(plan.segments[0].deliveries))
+        merged = merge(first, second)
+        seen = [await merged.__anext__() for _ in range(2)]
+        await merged.aclose()
+        runtime.verify_replay_consumed()
+    finally:
+        runtime.end_replay()
+
+    assert [(subscription.wait_id, value) for subscription, value in seen] == [
+        (2, "v0"),
+        (1, "v0"),
+    ], "replay reordered a segment that recorded wait 2's record before wait 1's"
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_drain_stops_at_another_waits_record(
+    manager: StreamSubscriptionManager, backend: MemoryStreamBackend
+) -> None:
+    """The same rule at the drain, where a wait appears twice in one segment.
+
+    Live, the second batch was not in this wait's buffer when the first drain
+    ran -- the record between them belongs to a drain that had not happened
+    yet. Handing both over at once would collapse two of the segment's drains
+    into one and let the values interleave differently.
+    """
+    chain = uuid.uuid4().hex
+    left = StreamKey("ns", "wf", chain, "left")
+    right = StreamKey("ns", "wf", chain, "right")
+    left_records = await append_five(backend, left)
+    right_records = await append_five(backend, right)
+
+    annotation = encode_annotation(
+        Annotation(
+            header=AnnotationHeader({1: binding(left), 2: binding(right)}),
+            segments=(
+                Segment(
+                    (
+                        Run(1, left_records[0].offset, left_records[0].offset, 1),  # type: ignore[arg-type]
+                        Run(2, right_records[0].offset, right_records[0].offset, 1),  # type: ignore[arg-type]
+                        Run(1, left_records[1].offset, left_records[1].offset, 1),  # type: ignore[arg-type]
+                    ),
+                    SegmentEndReason.NO_DATA_AVAILABLE,
+                ),
+            ),
+            terminal={
+                1: AFTER(left_records[1].offset),  # type: ignore[arg-type]
+                2: AFTER(right_records[0].offset),  # type: ignore[arg-type]
+            },
+        )
+    )
+    await manager.prepare_replay(RUN_ID, annotation)
+    runtime = make_runtime(manager, backend)
+    runtime.register(wait_id=1, stream_key=left, backend_name="tokens")
+    runtime.register(wait_id=2, stream_key=right, backend_name="tokens")
+
+    taken: list[tuple[int, Offset]] = []
+
+    class InterleavingStub(DriverStub):
+        def _run_once(self, *, check_conditions: bool) -> None:
+            super()._run_once(check_conditions=check_conditions)
+            for wait_id in (1, 2, 1):
+                taken.extend((wait_id, r.offset) for r in runtime.drain(wait_id))  # type: ignore[misc]
+
+    from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
+
+    _WorkflowInstanceImpl._apply_replay_external_streams(  # type: ignore[arg-type]
+        InterleavingStub(runtime), object()
+    )
+
+    assert taken == [
+        (1, left_records[0].offset),
+        (2, right_records[0].offset),
+        (1, left_records[1].offset),
+    ]

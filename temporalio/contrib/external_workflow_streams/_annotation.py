@@ -9,13 +9,15 @@ concatenation, so an annotation is a sequence of self-delimiting **frames**:
 
 .. code-block:: text
 
-    annotation := schema_version, header_frame, segment_frame*, terminal_frame
+    annotation := schema_version, header_frame
+                , (bindings_frame | segment_frame)*, terminal_frame
 
-    header  := streams[]                     // wait_id -> binding
-    binding := (stream_key, start_cursor, backend_name
+    header   := streams[]                    // wait_id -> binding
+    bindings := streams[]                    // the same, for waits added later
+    binding  := (stream_key, start_cursor, backend_name
                , provider_id, provider_format_version)
-    segment := run*, segment_end_reason
-    run     := (wait_id, first_offset, last_offset, count, control_positions)
+    segment  := run*, segment_end_reason
+    run      := (wait_id, first_offset, last_offset, count, control_positions)
     terminal := blocked_snapshot[]           // wait_id -> BEGINNING | AFTER(offset)
 
 The provider identity is **per wait**, not per annotation. One topic per
@@ -26,6 +28,18 @@ label does not even distinguish them. The binding therefore names the
 Worker-registered ``backend_name`` the Workflow itself chose, and carries the
 provider identity of that backend so replay can refuse to read through an
 implementation that is not the one that wrote the bytes.
+
+A subscription may be created at **any** activation of a retained Workflow
+Task, which is later than the header frame that already went to Core. Core
+appends bytes and never rewrites them, so a header cannot be extended in place;
+the binding rides its own frame instead, emitted with the delta of the
+activation that registered the wait and before the segment that first records a
+run for it. Decoding merges every bindings frame into ``header.streams``, so
+what replay reads is one complete ``wait_id -> binding`` table however late a
+wait joined. Without this a wait registered after the first delta reaches the
+marker as runs and a terminal entry with no stream key, no backend, and no start
+cursor -- and replay of *unchanged* code fails as "the Workflow did not create"
+that wait.
 
 Concatenating the deltas of one Workflow Task therefore *is* the annotation,
 with no reassembly step that could disagree with Core's.
@@ -44,6 +58,7 @@ Two properties the encoding is built around:
 from __future__ import annotations
 
 import enum
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Final
 
@@ -67,6 +82,7 @@ __all__ = [
     "StreamBinding",
     "decode_annotation",
     "encode_annotation",
+    "encode_bindings",
 ]
 
 SCHEMA_VERSION: Final = 2
@@ -77,7 +93,14 @@ per-record content-hash mode can be added later without a format break.
 
 Version 2 moved the provider identity from the header into each
 :class:`StreamBinding` and added the ``backend_name`` that selects the backend
-instance. No version-1 decoder is kept: the feature is private and unreleased,
+instance.
+
+The bindings frame added later is **not** a version bump, deliberately. It is
+purely additive: every annotation written before it decodes byte-identically,
+and the grammar is self-describing through its frame tags, so a decoder that
+does not know the tag fails loudly on it rather than misreading the bytes. A
+version exists to tell a reader what it is looking at, and here the tags already
+do -- nothing needs to assume that version 2 implies no bindings frame. No version-1 decoder is kept: the feature is private and unreleased,
 so no marker written by version 1 exists anywhere but in a test fixture. A
 version-1 annotation is rejected by :func:`decode_annotation` rather than
 silently read as though its single provider label applied to every wait.
@@ -102,6 +125,7 @@ was meant to avoid.
 _FRAME_HEADER: Final = 0x01
 _FRAME_SEGMENT: Final = 0x02
 _FRAME_TERMINAL: Final = 0x03
+_FRAME_BINDINGS: Final = 0x04
 
 _CURSOR_BEGINNING: Final = 0x00
 _CURSOR_AFTER: Final = 0x01
@@ -236,6 +260,12 @@ class Segment:
 class AnnotationHeader:
     """The bindings, and nothing else.
 
+    Holds **every** wait's binding once decoded, including the ones that arrived
+    in a later bindings frame because their ``subscribe()`` call ran after the
+    header had already gone to Core. Where a binding was carried is an encoding
+    detail; the decoded table is flat, so replay never has to ask when a wait
+    joined.
+
     There is deliberately no annotation-wide provider here. One existed through
     schema version 1 and was taken from whichever subscription happened to be
     registered first, which made it wrong for every other wait in a
@@ -349,8 +379,41 @@ class _Reader:
     def stream_key(self) -> StreamKey:
         return StreamKey(self.string(), self.string(), self.string(), self.string())
 
+    def bindings(self) -> dict[int, StreamBinding]:
+        streams: dict[int, StreamBinding] = {}
+        for _ in range(self.uvarint()):
+            # Read into locals rather than nesting the calls in the constructor:
+            # argument evaluation order is not the thing that should decide which
+            # field a byte lands in.
+            wait_id = self.uvarint()
+            stream_key = self.stream_key()
+            start_cursor = self.cursor()
+            backend_name = self.string()
+            provider_id = self.string()
+            provider_format_version = self.uvarint()
+            streams[wait_id] = StreamBinding(
+                stream_key,
+                start_cursor,
+                backend_name,
+                provider_id,
+                provider_format_version,
+            )
+        return streams
+
 
 # --- frame encoding ---------------------------------------------------------
+
+
+def _put_bindings(out: bytearray, streams: Mapping[int, StreamBinding]) -> None:
+    _put_uvarint(out, len(streams))
+    for wait_id in sorted(streams):
+        binding = streams[wait_id]
+        _put_uvarint(out, wait_id)
+        _put_stream_key(out, binding.stream_key)
+        _put_cursor(out, binding.start_cursor)
+        _put_str(out, binding.backend_name)
+        _put_str(out, binding.provider_id)
+        _put_uvarint(out, binding.provider_format_version)
 
 
 def encode_header(header: AnnotationHeader) -> bytes:
@@ -358,15 +421,21 @@ def encode_header(header: AnnotationHeader) -> bytes:
     out = bytearray()
     _put_uvarint(out, header.schema_version)
     out.append(_FRAME_HEADER)
-    _put_uvarint(out, len(header.streams))
-    for wait_id in sorted(header.streams):
-        binding = header.streams[wait_id]
-        _put_uvarint(out, wait_id)
-        _put_stream_key(out, binding.stream_key)
-        _put_cursor(out, binding.start_cursor)
-        _put_str(out, binding.backend_name)
-        _put_str(out, binding.provider_id)
-        _put_uvarint(out, binding.provider_format_version)
+    _put_bindings(out, header.streams)
+    return bytes(out)
+
+
+def encode_bindings(streams: Mapping[int, StreamBinding]) -> bytes:
+    """Bindings for waits that were registered after the header was emitted.
+
+    The same body as the header frame under a different tag. A second *header*
+    frame would have been ambiguous -- it also carries the schema version, and
+    a decoder would have to decide whether the later one replaced the earlier --
+    whereas a bindings frame says exactly one thing: these waits exist too.
+    """
+    out = bytearray()
+    out.append(_FRAME_BINDINGS)
+    _put_bindings(out, streams)
     return bytes(out)
 
 
@@ -425,31 +494,27 @@ def decode_annotation(data: bytes) -> Annotation:
 
     if reader.byte() != _FRAME_HEADER:
         raise AnnotationDecodeError("an annotation must begin with its header frame")
-    streams = {}
-    for _ in range(reader.uvarint()):
-        # Read into locals rather than nesting the calls in the constructor:
-        # argument evaluation order is not the thing that should decide which
-        # field a byte lands in.
-        wait_id = reader.uvarint()
-        stream_key = reader.stream_key()
-        start_cursor = reader.cursor()
-        backend_name = reader.string()
-        provider_id = reader.string()
-        provider_format_version = reader.uvarint()
-        streams[wait_id] = StreamBinding(
-            stream_key,
-            start_cursor,
-            backend_name,
-            provider_id,
-            provider_format_version,
-        )
-    header = AnnotationHeader(streams, schema_version)
+    streams = reader.bindings()
 
     segments: list[Segment] = []
     terminal: dict[int, Cursor] | None = None
     while not reader.exhausted:
         frame = reader.byte()
-        if frame == _FRAME_SEGMENT:
+        if frame == _FRAME_BINDINGS:
+            if terminal is not None:
+                raise AnnotationDecodeError("a bindings frame follows the terminal")
+            for wait_id, binding in reader.bindings().items():
+                if wait_id in streams:
+                    # A wait is bound once. A second binding for the same id
+                    # would leave replay choosing between two stream keys, and
+                    # whichever it chose could be the one the records were not
+                    # written to.
+                    raise AnnotationDecodeError(
+                        f"external stream wait {wait_id} is bound twice in one "
+                        "annotation"
+                    )
+                streams[wait_id] = binding
+        elif frame == _FRAME_SEGMENT:
             if terminal is not None:
                 raise AnnotationDecodeError("a segment frame follows the terminal")
             runs = []
@@ -478,7 +543,9 @@ def decode_annotation(data: bytes) -> Annotation:
         else:
             raise AnnotationDecodeError(f"unknown frame tag {frame:#x}")
 
-    return Annotation(header, tuple(segments), terminal)
+    return Annotation(
+        AnnotationHeader(streams, schema_version), tuple(segments), terminal
+    )
 
 
 # --- accumulation and the byte budget ---------------------------------------
@@ -533,6 +600,20 @@ class AnnotationAccumulator:
     def accumulated(self) -> bytes:
         """Everything emitted so far, concatenated -- what Core now holds."""
         return b"".join(self._emitted)
+
+    def add_bindings(self, streams: Mapping[int, StreamBinding]) -> bytes:
+        """Encodes bindings for waits registered after the header went out.
+
+        Its own frame rather than an amended header: Core appends the deltas it
+        is given and never rewrites what it already holds, so the only way a
+        binding decided later can reach the marker is to be appended after the
+        bytes that preceded it.
+        """
+        if self._terminated:
+            raise ValueError("cannot bind a wait after the terminal")
+        if not streams:
+            raise ValueError("a bindings frame binds at least one wait")
+        return self._emit(encode_bindings(streams))
 
     def add_segment(self, segment: Segment) -> bytes:
         """Encodes one activation's segment and returns it as a delta."""
