@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from datetime import timedelta
 from typing import Any
 
@@ -22,6 +23,8 @@ from temporalio.contrib.external_workflow_streams._api import (
 )
 from temporalio.contrib.external_workflow_streams._backend import StreamKey
 from temporalio.contrib.external_workflow_streams._codec import StreamPayloadCodec
+from temporalio.contrib.external_workflow_streams._errors import StreamDecodeError
+from temporalio.contrib.external_workflow_streams._manager import PreparedRecord
 from temporalio.contrib.external_workflow_streams._record import (
     RecordKind,
     StreamRecord,
@@ -442,56 +445,46 @@ async def test_a_record_buffered_after_blocking_begins_still_resolves(
 # --- consumption is committed only once a value exists ------------------------
 
 
-class GatedCodec:
-    """A codec whose first ``decode`` suspends until the test releases it.
+class FailingCodec:
+    """A converter mismatch: the stream is fine, the configuration is not.
 
-    A ``DataConverter`` may carry a payload codec, so ``decode`` is genuinely
-    async and genuinely interruptible. What matters is what the subscription's
-    bookkeeping says while it is suspended, and what it says if it never
-    finishes.
+    Fails in :meth:`convert`, the half that runs on the Workflow thread, since
+    that is where a type hint meets a payload the producer did not write.
     """
 
     def __init__(self, value_type: type | None = str) -> None:
         self._inner = StreamPayloadCodec(
             temporalio.converter.DataConverter.default, value_type
         )
-        self.entered = asyncio.Event()
-        self.release = asyncio.Event()
         self.calls = 0
 
-    async def decode(self, payload: bytes) -> Any:
-        self.calls += 1
-        if self.calls == 1:
-            self.entered.set()
-            await self.release.wait()
-        return await self._inner.decode(payload)
+    def parse_unprepared(self, payload: bytes) -> Any:
+        return self._inner.parse_unprepared(payload)
 
-
-class FailingCodec:
-    """A converter mismatch: the stream is fine, the configuration is not."""
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    async def decode(self, payload: bytes) -> Any:
+    def convert(self, prepared: Any) -> Any:
         self.calls += 1
         raise RuntimeError("this converter cannot read this payload")
 
 
 @pytest.mark.asyncio
-async def test_a_cancelled_decode_leaves_the_record_unconsumed(
+async def test_decoding_on_the_workflow_thread_cannot_suspend(
     runtime: FakeRuntime,
 ) -> None:
-    """Consumption is a claim about what Workflow code received.
+    """The Workflow thread converts; it does not await a converter.
 
-    Recording it before the value exists makes the claim false in exactly the
-    case that matters: nothing was yielded, the record is gone from the ready
-    list, and the consumption cursor -- which is what a Continue-As-New
-    successor resumes from -- has already stepped over it.
+    ``DataConverter.decode`` is retrieval, then a user ``PayloadCodec``, then
+    ``from_payloads``. The first two are arbitrary asynchronous work -- a
+    network fetch, a KMS round trip -- and the Worker awaits them on its own
+    loop before a record is buffered, exactly as it does for every other payload
+    an activation carries. What is left here is the third, which needs the
+    topic's type and performs no I/O.
+
+    Asserted structurally as well as behaviourally, because the property is
+    structural: a coroutine on this path is a suspension point inside
+    ``activate()``, and a suspension point is where I/O, a synthesized Workflow
+    command, or a deadlock timeout can appear.
     """
     codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
-    gated = GatedCodec()
-    runtime.codec = gated
     subscription = external_stream.topic(
         "tokens", backend="tokens-redis", type=str
     ).subscribe()
@@ -499,22 +492,56 @@ async def test_a_cancelled_decode_leaves_the_record_unconsumed(
         StreamRecord(RecordKind.DATA, await codec.encode("a"), "s", 0)
     ]
 
+    assert not inspect.iscoroutinefunction(ExternalStreamSubscription._decode), (
+        "decoding a record awaits on the Workflow thread, so a payload codec "
+        "or an external payload fetch runs inside activate()"
+    )
+
+    record = runtime.buffers[subscription.wait_id][0]
+    subscription._fill()
+    assert subscription._decode(record) == "a"
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_delivery_leaves_the_record_unconsumed(
+    runtime: FakeRuntime,
+) -> None:
+    """Consumption is a claim about what Workflow code received.
+
+    Decoding no longer suspends, so the one place a cancellation can still land
+    between a record arriving and Workflow code receiving it is the readiness
+    wait. A cancellation there -- a stream raced against a timer, most often --
+    must leave the record exactly where a later pass finds it: recording
+    consumption for a value nothing yielded makes the claim false in the case
+    that matters, because the consumption cursor is what a Continue-As-New
+    successor resumes from.
+    """
+    codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
+    subscription = external_stream.topic(
+        "tokens", backend="tokens-redis", type=str
+    ).subscribe()
+
     iterator = subscription.__aiter__()
     pending = asyncio.ensure_future(iterator.__anext__())
-    await asyncio.wait_for(gated.entered.wait(), 1)
+    # Blocked: nothing is buffered yet, and only Core can say when to look.
+    await asyncio.sleep(0.05)
+    assert not pending.done()
+
+    # Buffered while the wait is outstanding, then cancelled before the
+    # readiness that would have delivered it.
+    runtime.buffers[subscription.wait_id] = [
+        StreamRecord(RecordKind.DATA, await codec.encode("a"), "s", 0)
+    ]
     pending.cancel()
     with pytest.raises(asyncio.CancelledError):
         await pending
 
     assert runtime.consumed == [], (
-        "the record was committed as consumed while its value did not yet "
-        "exist; a Continue-As-New successor would resume past a record the "
-        "Workflow never received"
+        "a cancelled wait recorded a consumption, so the cursor claims the "
+        "Workflow received a record it never saw"
     )
 
-    # And it is still there to be taken: the buffer it came out of is empty, so
-    # if the subscription did not keep it, nothing else has it.
-    gated.release.set()
+    # And it is still there to be taken.
     assert await asyncio.wait_for(subscription.__aiter__().__anext__(), 1) == "a"
     assert [wait_id for wait_id, _ in runtime.consumed] == [subscription.wait_id]
 
@@ -537,10 +564,83 @@ async def test_a_failed_decode_leaves_the_record_unconsumed(
         StreamRecord(RecordKind.DATA, await codec.encode("a"), "s", 0)
     ]
 
-    with pytest.raises(RuntimeError, match="cannot read this payload"):
+    with pytest.raises(StreamDecodeError, match="could not be decoded"):
         await subscription.__aiter__().__anext__()
 
     assert runtime.consumed == [], (
         "a record whose decode raised was marked consumed, so the value is lost "
         "and the cursor claims the Workflow received it"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_preparation_failure_is_raised_where_the_record_would_arrive(
+    runtime: FakeRuntime,
+) -> None:
+    """A codec that fails on the Worker's loop still fails *this* Workflow.
+
+    Preparation happens in the watcher, which has no Workflow Task to fail and
+    no Workflow to tell -- and which may be preparing a record the Workflow
+    never asks for. So the failure travels with the record and is raised by the
+    delivery that would have yielded its value, as the taxonomy's third row:
+    the bytes are intact and the consumer's converter cannot read them.
+
+    Raised, and *not* consumed: nothing was received, so the cursor must not say
+    otherwise.
+    """
+    codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
+    subscription = external_stream.topic(
+        "tokens", backend="tokens-redis", type=str
+    ).subscribe()
+    runtime.buffers[subscription.wait_id] = [
+        PreparedRecord.of(
+            StreamRecord(RecordKind.DATA, await codec.encode("a"), "s", 0),
+            None,
+            RuntimeError("the codec could not decrypt this payload"),
+        )
+    ]
+
+    with pytest.raises(StreamDecodeError, match="could not be decoded") as caught:
+        await subscription.__aiter__().__anext__()
+    assert isinstance(caught.value.__cause__, RuntimeError)
+
+    assert runtime.consumed == [], (
+        "a record whose preparation failed was marked consumed, so the cursor "
+        "claims the Workflow received a value that never existed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unprepared_record_is_refused_rather_than_decoded_late(
+    runtime: FakeRuntime,
+) -> None:
+    """A codec-bearing converter has an asynchronous half that must have run.
+
+    If a record reaches the Workflow thread without it, running it here is the
+    defect this split exists to remove, and converting the raw bytes anyway
+    would hand Workflow code whatever the codec's output happens to look like.
+    Refused instead -- and refused as a decode failure, because that is what the
+    Workflow can be told.
+    """
+
+    class NeverDecodes(temporalio.converter.PayloadCodec):
+        async def encode(self, payloads: Any) -> Any:
+            return list(payloads)
+
+        async def decode(self, payloads: Any) -> Any:
+            raise AssertionError("the Workflow thread ran a payload codec")
+
+    plain = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
+    runtime.codec = StreamPayloadCodec(
+        temporalio.converter.DataConverter(payload_codec=NeverDecodes()), str
+    )
+    subscription = external_stream.topic(
+        "tokens", backend="tokens-redis", type=str
+    ).subscribe()
+    runtime.buffers[subscription.wait_id] = [
+        StreamRecord(RecordKind.DATA, await plain.encode("a"), "s", 0)
+    ]
+
+    with pytest.raises(StreamDecodeError, match="could not be decoded"):
+        await subscription.__aiter__().__anext__()
+    assert runtime.consumed == []

@@ -15,6 +15,9 @@ from datetime import timedelta
 import pytest
 
 from temporalio.contrib.external_workflow_streams._backend import StreamKey
+from temporalio.contrib.external_workflow_streams._errors import (
+    StreamStorageError,
+)
 from temporalio.contrib.external_workflow_streams._manager import (
     ReadinessResult,
     StreamSubscriptionManager,
@@ -931,8 +934,13 @@ async def test_a_failed_park_leaves_no_externally_visible_half(failing: str) -> 
             run_id=RUN_ID, wait_id=2, stream_key=second, backend_name="tokens"
         )
 
-        with pytest.raises(ConnectionError):
+        # Reported as the taxonomy's transient row -- a backend that is
+        # unreachable is nothing for an operator to do anything about -- with
+        # the provider's own error kept as the cause, so the log still says
+        # which call failed and why.
+        with pytest.raises(StreamStorageError) as failure:
             await manager.prepare_park(RUN_ID, 4, {1: BEGINNING, 2: BEGINNING})
+        assert isinstance(failure.value.__cause__, ConnectionError)
 
         assert await backend.parked_wait_ids(first) == [], (
             "the park failed, and wait 1's intent is still in the backend "

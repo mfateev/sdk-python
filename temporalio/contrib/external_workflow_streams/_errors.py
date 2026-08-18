@@ -136,6 +136,28 @@ class StreamMetrics:
             ),
         )
 
+    def counter_for(
+        self, error_type_name: str
+    ) -> temporalio.common.MetricCounter | None:
+        """The counter for an error class *name*, or ``None`` for anything else.
+
+        By name, because the side that reports these has only a name: a failure
+        raised on the Workflow thread is converted inside ``activate()``, and
+        what the Worker gets back is a completion whose application failure
+        carries the exception's class name. Keeping the mapping here rather than
+        at that call site is what stops the two from drifting apart -- the same
+        reason :meth:`record` exists for the side that still holds the
+        exception.
+
+        ``None`` for every other failure, which is what keeps row four --
+        ordinary nondeterminism -- and plain Workflow bugs out of these series.
+        """
+        return {
+            StreamIntegrityError.__name__: self.integrity,
+            StreamDecodeError.__name__: self.decode,
+            StreamStorageError.__name__: self.storage,
+        }.get(error_type_name)
+
     def record(self, error: BaseException) -> None:
         """Increments the counter matching ``error``'s class, if any."""
         if isinstance(error, StreamIntegrityError):

@@ -16,6 +16,7 @@ from types import TracebackType
 from typing import Any
 
 import temporalio.api.common.v1
+import temporalio.api.enums.v1
 import temporalio.bridge.proto.common
 import temporalio.bridge.proto.workflow_activation
 import temporalio.bridge.proto.workflow_completion
@@ -175,10 +176,13 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         #: call rather than anything the bridge can do -- Core cannot signal a
         #: Workflow on this Worker's behalf.
         self._client = client
-        self._shutdown_wake_failed_counter = metric_meter.create_counter(
-            "external_stream_shutdown_wake_failed",
-            "Wake Signals owed at Worker shutdown that could not be acknowledged",
-        )
+        # The taxonomy's counters, created from its own module rather than
+        # here: P18 names them, documents them, and knows which error class
+        # belongs to which one. A counter created ad hoc here is a second
+        # definition of a name an operator alerts on.
+        from temporalio.contrib.external_workflow_streams._errors import StreamMetrics
+
+        self._stream_metrics = StreamMetrics.create(metric_meter)
         self._external_stream_manager: Any = None
 
         self._workflow_failure_exception_types = workflow_failure_exception_types
@@ -567,6 +571,26 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
                     completion.failed.failure.message = (
                         f"Failed converting activation exception: {inner_err}"
                     )
+
+        # One place for every failed completion, however it was reached. An
+        # external stream failure arrives two ways -- raised out here by a
+        # runtime-only job, or raised on the Workflow thread by a delivery and
+        # already turned into a failure by `activate()` -- and both must carry
+        # the same cause and increment the same counter.
+        if self._external_stream_backends and completion.HasField("failed"):
+            try:
+                self._note_external_stream_failure(completion)
+            except Exception:
+                # Reporting a failure may not *become* one. This runs outside
+                # the block that turns an exception into a failed completion,
+                # so anything raised here would escape with the completion
+                # unsent -- turning a Workflow Task failure the server can see
+                # into a Workflow Task timeout it cannot explain.
+                logger.exception(
+                    "Failed classifying an external stream failure on workflow "
+                    "with run ID %s",
+                    act.run_id,
+                )
 
         completion.run_id = act.run_id
 
@@ -995,6 +1019,16 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             assert self._external_stream_backends is not None
             self._external_stream_manager = StreamSubscriptionManager(
                 backends=self._external_stream_backends,
+                # The Worker's converter, for the **asynchronous half** of
+                # decoding a record: external-payload retrieval and the user's
+                # PayloadCodec. Both are arbitrary asynchronous work and neither
+                # needs the topic's declared type, so both belong out here on
+                # this loop -- the same place `decode_activation` awaits them
+                # for every other payload an activation carries. Without this
+                # the Workflow thread awaits them inside `activate()`, which
+                # performs I/O in a deterministic event loop and puts a user
+                # codec under the 2-second deadlock timeout.
+                data_converter=self._data_converter,
                 notify_ready=self._bridge_worker().notify_external_stream_ready,
                 # A Worker whose Run cannot take local readiness owes the same
                 # Signal a producer owes. Without this the record sits buffered
@@ -1021,6 +1055,53 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             )
         return self._external_stream_manager
 
+    def _note_external_stream_failure(
+        self,
+        completion: temporalio.bridge.proto.workflow_completion.WorkflowActivationCompletion,
+    ) -> None:
+        """Applies the external stream failure taxonomy to a failed completion.
+
+        Three of the taxonomy's four rows are Workflow Task failures that differ
+        from every other Workflow Task failure -- and from each other -- only in
+        **the error type and the metric**. The server retries a failed Workflow
+        Task regardless of cause, so nothing about the retry distinguishes a
+        backend outage that will clear on its own from integrity loss that needs
+        an operator, or from a converter mismatch that needs a code change.
+        This is what makes those rows tellable apart:
+
+        - ``force_cause`` is set to the external-storage cause, which is what
+          separates all three from an ordinary Workflow bug in server-side
+          Workflow Task failure reporting;
+        - the matching counter, and only the matching counter, is incremented,
+          so an alert on integrity loss is not diluted by a backend outage.
+
+        Row four -- the annotation not matching the subscriptions Workflow code
+        creates -- is deliberately absent: it is ordinary nondeterminism, gets
+        no stream cause and no stream counter, and is fixed by versioning the
+        Workflow rather than by touching the backend.
+
+        The failure is inspected rather than the exception, because half of
+        these failures never exist as an exception out here: a decode that
+        raises on the Workflow thread is converted inside ``activate()``, and
+        what comes back is a completion. The application failure type is the
+        exception's class name, and the chain is walked because the raising
+        frame may have wrapped it.
+        """
+        failure = completion.failed.failure
+        counter = None
+        while True:
+            counter = self._stream_metrics.counter_for(
+                failure.application_failure_info.type
+            )
+            if counter is not None or not failure.HasField("cause"):
+                break
+            failure = failure.cause
+        if counter is None:
+            return
+
+        completion.failed.force_cause = temporalio.api.enums.v1.WorkflowTaskFailedCause.WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE
+        counter.add(1)
+
     def _record_shutdown_wake_failed(self, subscription: Any) -> None:
         """Counts a shutdown wake that could not be acknowledged.
 
@@ -1028,7 +1109,7 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         nothing distinguishes that from a producer having nothing to say -- so it
         gets a metric rather than only a log line.
         """
-        self._shutdown_wake_failed_counter.add(
+        self._stream_metrics.shutdown_wake_failed.add(
             1,
             {
                 "namespace": self._namespace,

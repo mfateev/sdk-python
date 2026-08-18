@@ -8,10 +8,16 @@ actually connected to each other, which is the only thing isolation cannot show.
 from __future__ import annotations
 
 import asyncio
+import threading
 import uuid
+from collections.abc import Sequence
 from datetime import timedelta
 
 import pytest
+
+import temporalio.api.common.v1
+import temporalio.api.enums.v1
+import temporalio.converter
 
 from temporalio import workflow
 from temporalio.client import Client
@@ -20,7 +26,19 @@ from temporalio.contrib.external_workflow_streams._record import (
     RecordKind,
     StreamRecord,
 )
+from temporalio.contrib.external_workflow_streams._errors import (
+    METRIC_DECODE,
+    METRIC_INTEGRITY,
+    METRIC_STORAGE,
+)
+from temporalio.contrib.external_workflow_streams._record import Offset
+from temporalio.contrib.external_workflow_streams._wake import (
+    WakeRequest,
+    send_wake_signal,
+)
+from temporalio.runtime import MetricBuffer, Runtime, TelemetryConfig
 from temporalio.service import RPCError, RPCStatusCode
+from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 from tests.contrib.external_workflow_streams.memory_backend import MemoryStreamBackend
 
@@ -852,3 +870,491 @@ async def test_a_clean_shutdown_sweeps_and_tears_down_the_manager(
                 pass
         if not worker_task.done():
             worker_task.cancel()
+
+
+# --- P19 / ADR-011: decoding is Worker-side work, not Workflow-thread work ---
+
+#: What the probe codec saw each time it decoded a stream record: the thread it
+#: ran on, and the module the running event loop's class comes from. Both are
+#: recorded because either one alone is arguable -- a Workflow's deterministic
+#: loop is identified by its class, and the executor thread by its name.
+_decode_sites: list[tuple[str, str]] = []
+
+#: Marks the one payload this probe reacts to, so ordinary activation payloads
+#: -- arguments, results, headers -- are passed through untouched and cannot be
+#: mistaken for a stream record's decode.
+_STREAM_SENTINEL = b"external-stream-decode-probe"
+
+#: Longer than the Worker's 2-second deadlock timeout. A codec is user code and
+#: may legitimately take this long: it can be fetching an external payload or
+#: talking to a KMS. Awaited on the Worker's loop it costs nothing but latency;
+#: awaited on the Workflow thread it is either a deadlocked Workflow Task or a
+#: Workflow command synthesized out of a codec's internals.
+_SLOW_DECODE = timedelta(seconds=2.5)
+
+
+class ProbeCodec(temporalio.converter.PayloadCodec):
+    """A pass-through codec that reports where the stream record was decoded.
+
+    Only the record carrying :py:data:`_STREAM_SENTINEL` is treated specially,
+    so the Worker's own ``decode_activation`` work -- which is *supposed* to run
+    on the Worker's loop -- adds no observations of its own.
+    """
+
+    async def encode(
+        self, payloads: Sequence[temporalio.api.common.v1.Payload]
+    ) -> list[temporalio.api.common.v1.Payload]:
+        return list(payloads)
+
+    def __init__(self, delay: float | None = None) -> None:
+        self.delay = _SLOW_DECODE.total_seconds() if delay is None else delay
+
+    async def decode(
+        self, payloads: Sequence[temporalio.api.common.v1.Payload]
+    ) -> list[temporalio.api.common.v1.Payload]:
+        for payload in payloads:
+            if _STREAM_SENTINEL not in payload.data:
+                continue
+            loop = asyncio.get_running_loop()
+            _decode_sites.append(
+                (threading.current_thread().name, type(loop).__module__)
+            )
+            # Real asynchronous work, of the length a codec is allowed to
+            # take: an external-payload fetch or a KMS round trip is I/O, and
+            # the Worker's loop is where the Worker awaits every other
+            # payload's codec.
+            await asyncio.sleep(self.delay)
+        return list(payloads)
+
+
+async def test_a_slow_codec_decodes_off_the_workflow_thread(
+    client: Client, backend: MemoryStreamBackend
+) -> None:
+    """A stream record's payload codec must not run inside ``activate()``.
+
+    ``DataConverter.decode`` is three things: an external-payload retrieval, a
+    user ``PayloadCodec``, and a payload *converter*. The first two are
+    arbitrary asynchronous work -- a network fetch, a KMS round trip -- and the
+    Worker awaits them for every ordinary activation payload *before* handing
+    the activation to the Workflow executor, precisely so that no Workflow Task
+    can be failed by them. Only the third, a synchronous conversion, belongs on
+    the Workflow thread.
+
+    A stream record is a payload like any other, so the same split has to hold
+    for it: by the time a record reaches ``activate()`` its codec has already
+    run on the Worker's loop, and the Workflow thread does nothing but convert
+    already-prepared bytes into a value.
+
+    Running the codec on the Workflow thread instead is wrong three ways at
+    once, and the assertions below name them: the awaited work happens inside a
+    deterministic event loop that cannot perform I/O, it can exceed the
+    2-second deadlock timeout and fail the Workflow Task for a perfectly
+    healthy codec, and anything the codec awaits is synthesized as Workflow
+    commands.
+    """
+    _decode_sites.clear()
+    config = client.config()
+    config["data_converter"] = temporalio.converter.DataConverter(
+        payload_codec=ProbeCodec()
+    )
+    codec_client = Client(**config)
+
+    task_queue = f"tq-{uuid.uuid4()}"
+    async with Worker(
+        codec_client,
+        task_queue=task_queue,
+        workflows=[CountTokensWorkflow],
+        external_stream_backends={"tokens-memory": backend},
+    ):
+        handle = await codec_client.start_workflow(
+            CountTokensWorkflow.run,
+            1,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=task_queue,
+        )
+        description = await handle.describe()
+        key = StreamKey(
+            client.namespace,
+            handle.id,
+            description.raw_description.workflow_execution_info.first_run_id,
+            "tokens",
+        )
+
+        # Published after the Workflow is already blocked on its subscription,
+        # so the record arrives through the live wake path rather than sitting
+        # in a buffer the first activation happens to find.
+        await asyncio.sleep(1)
+        from temporalio.contrib.external_workflow_streams._codec import (
+            StreamPayloadCodec,
+        )
+
+        producer_codec = StreamPayloadCodec(codec_client.data_converter, str)
+        await backend.append(
+            key,
+            StreamRecord(
+                RecordKind.DATA,
+                await producer_codec.encode(_STREAM_SENTINEL.decode()),
+                "producer",
+                0,
+            ),
+        )
+
+        # A Workflow Task failed by a deadlock is *retried*, and every retry
+        # re-decodes the same record and deadlocks again, so a Workflow that
+        # never returns is the visible form of that failure.
+        assert await asyncio.wait_for(handle.result(), 30) == 1
+
+    assert _decode_sites, (
+        "the probe codec never saw the stream record, so this test proved "
+        "nothing about where decoding runs"
+    )
+    for thread_name, loop_module in _decode_sites:
+        assert not thread_name.startswith("temporal_workflow_"), (
+            f"the stream record's codec ran on the Workflow executor thread "
+            f"({thread_name}): arbitrary async work inside activate(), under "
+            "the 2-second deadlock timeout"
+        )
+        assert loop_module != "temporalio.worker._workflow_instance", (
+            "the stream record's codec was awaited on the Workflow's "
+            "deterministic event loop, which performs no I/O and turns every "
+            "await into a Workflow command"
+        )
+
+    # The codec's own awaits must not have become Workflow commands. A timer in
+    # History here is not a slow Workflow -- it is a Workflow whose History
+    # depends on what a codec did internally, and replay reproduces it only for
+    # as long as the codec behaves identically.
+    events = [e async for e in handle.fetch_history_events()]
+    assert not [e for e in events if e.HasField("timer_started_event_attributes")], (
+        "the codec's await was turned into a Workflow timer command"
+    )
+
+
+async def test_a_replayed_record_is_prepared_off_the_workflow_thread(
+    env: WorkflowEnvironment,
+) -> None:
+    """Replay delivers down the same drain, so it prepares the same way.
+
+    A replayed record never passes a watcher: its bytes are read and validated
+    when the replay job is prepared, before the Workflow thread runs at all. If
+    preparation happened only in the watcher, replay would hand raw producer
+    bytes to a Workflow whose converter has a codec -- and the choice would be
+    between running that codec inside ``activate()`` and yielding whatever the
+    undecoded bytes convert to. Preparing both paths in the same place is what
+    makes replay indistinguishable from live delivery, which is the property the
+    whole buffer design rests on.
+    """
+    _decode_sites.clear()
+    backend = MemoryStreamBackend()
+    client = await env.connect_client(
+        data_converter=temporalio.converter.DataConverter(payload_codec=ProbeCodec(0))
+    )
+    task_queue = f"tq-{uuid.uuid4()}"
+    handle = None
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[ParkedAcrossEvictionWorkflow, FillerWorkflow],
+        external_stream_backends={"tokens-memory": backend},
+        max_cached_workflows=1,
+        max_concurrent_workflow_tasks=2,
+    ):
+        try:
+            handle = await client.start_workflow(
+                ParkedAcrossEvictionWorkflow.run,
+                2,
+                id=f"wf-{uuid.uuid4()}",
+                task_queue=task_queue,
+            )
+            description = await handle.describe()
+            first_run_id = (
+                description.raw_description.workflow_execution_info.first_run_id
+            )
+            key = StreamKey(client.namespace, handle.id, first_run_id, "tokens")
+
+            await _wait_for_markers(handle, 1, "the Run never parked at all")
+            await publish(
+                backend,
+                key,
+                [_STREAM_SENTINEL.decode()],
+                session=f"producer-{uuid.uuid4()}",
+            )
+            await _wait_for_markers(
+                handle,
+                2,
+                "the Run never committed a marker, so nothing would be replayed",
+            )
+
+            # Evicts the Run, so the next Workflow Task replays the marker --
+            # and re-delivers the recorded record through the replay path.
+            await client.execute_workflow(
+                FillerWorkflow.run, id=f"filler-{uuid.uuid4()}", task_queue=task_queue
+            )
+            await publish(backend, key, ["beta"], session=f"producer-{uuid.uuid4()}")
+            await send_wake_signal(
+                client,
+                WakeRequest(
+                    namespace=client.namespace,
+                    workflow_id=handle.id,
+                    first_execution_run_id=first_run_id,
+                    stream_name="tokens",
+                    wait_id=1,
+                    park_generation=0,
+                    sender_identity=f"test-{uuid.uuid4()}",
+                    wake_counter=1,
+                ),
+            )
+
+            assert await asyncio.wait_for(handle.result(), 30) == [
+                _STREAM_SENTINEL.decode(),
+                "beta",
+            ]
+        finally:
+            if handle is not None:
+                try:
+                    await handle.terminate()
+                except Exception:
+                    pass
+
+    assert _decode_sites, "the probe codec never saw the replayed record"
+    for thread_name, loop_module in _decode_sites:
+        assert not thread_name.startswith("temporal_workflow_"), (
+            f"a replayed record's codec ran on the Workflow executor thread "
+            f"({thread_name})"
+        )
+        assert loop_module != "temporalio.worker._workflow_instance", (
+            "a replayed record's codec was awaited on the Workflow's "
+            "deterministic event loop"
+        )
+
+
+# --- P18: the failure taxonomy, connected end to end -------------------------
+
+
+class TaxonomyCodec(temporalio.converter.PayloadCodec):
+    """A pass-through codec that can be made to reject one known value.
+
+    Stands in for the ordinary way row three happens: a consumer whose
+    converter or codec stops matching the producer's, with the stream itself
+    untouched. Scoped to the one sentinel value so the Workflow's own arguments
+    and result -- which travel through this same codec -- are unaffected.
+    """
+
+    def __init__(self) -> None:
+        self.fail = False
+
+    async def encode(
+        self, payloads: Sequence[temporalio.api.common.v1.Payload]
+    ) -> list[temporalio.api.common.v1.Payload]:
+        return list(payloads)
+
+    async def decode(
+        self, payloads: Sequence[temporalio.api.common.v1.Payload]
+    ) -> list[temporalio.api.common.v1.Payload]:
+        if self.fail and any(_TAXONOMY_SENTINEL in p.data for p in payloads):
+            raise RuntimeError("this codec cannot read the producer's payloads")
+        return list(payloads)
+
+
+class UnreachableBackend(MemoryStreamBackend):
+    """A backend whose recorded-range read can be made to fail.
+
+    Only ``read_range`` -- the replay read -- so the live path that wrote the
+    marker is unaffected and the failure lands where row one describes it:
+    reading back a range the marker already committed.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_reads = False
+
+    async def read_range(
+        self, key: StreamKey, first: Offset, last: Offset
+    ) -> list[StreamRecord]:
+        if self.fail_reads:
+            raise ConnectionError("the backend is unreachable")
+        return await super().read_range(key, first, last)
+
+
+_TAXONOMY_SENTINEL = b"taxonomy-sentinel"
+
+#: The three counters, so each case can assert that the other two stayed silent.
+_TAXONOMY_METRICS = (
+    METRIC_STORAGE,
+    METRIC_INTEGRITY,
+    METRIC_DECODE,
+)
+
+
+def _failure_types(failure) -> list[str]:  # type: ignore[no-untyped-def]
+    """Every application failure type in a failure's cause chain."""
+    types = []
+    while True:
+        types.append(failure.application_failure_info.type)
+        if not failure.HasField("cause"):
+            return types
+        failure = failure.cause
+
+
+async def _await_failed_task(handle, message: str, timeout: float = 30):  # type: ignore[no-untyped-def]
+    """The first ``WorkflowTaskFailed`` event, or an assertion naming why not."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        for event in [e async for e in handle.fetch_history_events()]:
+            if event.HasField("workflow_task_failed_event_attributes"):
+                return event.workflow_task_failed_event_attributes
+        await asyncio.sleep(0.3)
+    raise AssertionError(message)
+
+
+@pytest.mark.parametrize(
+    ["row", "error_type", "metric"],
+    [
+        ("storage", "StreamStorageError", METRIC_STORAGE),
+        ("integrity", "StreamIntegrityError", METRIC_INTEGRITY),
+        ("decode", "StreamDecodeError", METRIC_DECODE),
+    ],
+)
+async def test_each_failure_row_is_reported_as_its_own(
+    env: WorkflowEnvironment, row: str, error_type: str, metric: str
+) -> None:
+    """Rows one to three, each reaching an operator as itself.
+
+    All three are Workflow Task failures, and the server retries a Workflow Task
+    failure whatever caused it -- so the retry says nothing about which one
+    happened. What distinguishes them is exactly two things, and this asserts
+    both: the completion carries the **external-storage failure cause**, which
+    separates all three from an ordinary Workflow bug, and **one counter**
+    increments while the other two stay silent, which is what lets an alert on
+    integrity loss mean integrity loss.
+
+    They are reached the way an operator would meet them, through a marker that
+    was written live and then replayed against a backend that has since changed:
+
+    - the recorded range cannot be read at all -- transient, clears itself;
+    - the recorded range reads back short -- the record was trimmed or expired,
+      and an operator has to repair the backend or terminate the Run;
+    - the range reads back exactly as recorded and the consumer's codec cannot
+      decode it -- the stream is undamaged and the configuration is wrong.
+
+    The third is the one the taxonomy is most easily collapsed on, because it
+    is the only one whose failure surfaces from *inside* ``activate()``: the
+    record is prepared on the Worker's loop, its failure travels with it, and
+    the delivery that would have yielded its value raises it.
+    """
+    backend = UnreachableBackend()
+    codec = TaxonomyCodec()
+    buffer = MetricBuffer(10000)
+    runtime = Runtime(telemetry=TelemetryConfig(metrics=buffer))
+    client = await env.connect_client(
+        runtime=runtime,
+        data_converter=temporalio.converter.DataConverter(payload_codec=codec),
+    )
+
+    task_queue = f"tq-{uuid.uuid4()}"
+    handle = None
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[ParkedAcrossEvictionWorkflow, FillerWorkflow],
+        external_stream_backends={"tokens-memory": backend},
+        # One slot, so the filler Workflow evicts the Run under test and the
+        # next Workflow Task has to replay the marker.
+        max_cached_workflows=1,
+        max_concurrent_workflow_tasks=2,
+    ):
+        try:
+            handle = await client.start_workflow(
+                ParkedAcrossEvictionWorkflow.run,
+                2,
+                id=f"wf-{uuid.uuid4()}",
+                task_queue=task_queue,
+            )
+            description = await handle.describe()
+            first_run_id = (
+                description.raw_description.workflow_execution_info.first_run_id
+            )
+            key = StreamKey(client.namespace, handle.id, first_run_id, "tokens")
+
+            await _wait_for_markers(handle, 1, "the Run never parked at all")
+            # Consumed and committed live, so there is a recorded range to
+            # replay -- and the codec is asked for this value twice, once here
+            # while it still works and once on replay.
+            await publish(
+                backend,
+                key,
+                [_TAXONOMY_SENTINEL.decode()],
+                session=f"producer-{uuid.uuid4()}",
+            )
+            await _wait_for_markers(
+                handle,
+                2,
+                "the Run never committed a marker for the record it consumed, "
+                "so there is no recorded range for replay to read",
+            )
+
+            # Evicts the Run: buffers, watchers, and wait set all go with it,
+            # and the next Workflow Task replays the marker.
+            await client.execute_workflow(
+                FillerWorkflow.run, id=f"filler-{uuid.uuid4()}", task_queue=task_queue
+            )
+
+            if row == "storage":
+                backend.fail_reads = True
+            elif row == "integrity":
+                data = [r for r in backend.all_records(key) if not r.is_control]
+                assert data, "nothing was ever appended, so nothing can be lost"
+                assert data[0].offset is not None
+                await backend.delete_for_test(key, data[0].offset)
+            else:
+                codec.fail = True
+
+            # The wake is what creates the Workflow Task that replays.
+            await send_wake_signal(
+                client,
+                WakeRequest(
+                    namespace=client.namespace,
+                    workflow_id=handle.id,
+                    first_execution_run_id=first_run_id,
+                    stream_name="tokens",
+                    wait_id=1,
+                    park_generation=0,
+                    sender_identity=f"test-{uuid.uuid4()}",
+                    wake_counter=1,
+                ),
+            )
+
+            failed = await _await_failed_task(
+                handle,
+                f"the {row} damage produced no Workflow Task failure at all, so "
+                "the Run either never replayed or silently delivered something",
+            )
+        finally:
+            if handle is not None:
+                try:
+                    await handle.terminate()
+                except Exception:
+                    pass
+
+    assert error_type in _failure_types(failed.failure), (
+        f"the {row} failure reached the server as "
+        f"{_failure_types(failed.failure)} rather than as {error_type}, so an "
+        "operator cannot tell which of the three rows happened"
+    )
+    assert (
+        failed.cause
+        == temporalio.api.enums.v1.WorkflowTaskFailedCause.WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE
+    ), (
+        "the Workflow Task failed without the external-storage cause, so it is "
+        "indistinguishable from a bug in the Workflow's own code"
+    )
+
+    counted = {
+        update.metric.name
+        for update in buffer.retrieve_updates()
+        if update.metric.name in _TAXONOMY_METRICS
+    }
+    assert counted == {metric}, (
+        f"the {row} failure incremented {sorted(counted)} rather than only "
+        f"{metric}; an alert on one row must not be diluted by another"
+    )

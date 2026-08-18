@@ -44,23 +44,29 @@ it is not committing it. The manager may only move it *backwards* to
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 from collections import deque
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
+import temporalio.converter
 from temporalio.contrib.external_workflow_streams._annotation import StreamBinding
 from temporalio.contrib.external_workflow_streams._backend import (
     ParkIntent,
     StreamBackend,
     StreamKey,
 )
-from temporalio.contrib.external_workflow_streams._errors import StreamStorageError
+from temporalio.contrib.external_workflow_streams._errors import (
+    StreamError,
+    StreamStorageError,
+)
 from temporalio.contrib.external_workflow_streams._replay import (
     ReplayPlan,
+    ReplaySegment,
     build_replay_plan,
 )
 from temporalio.contrib.external_workflow_streams._record import (
@@ -71,9 +77,44 @@ from temporalio.contrib.external_workflow_streams._record import (
 )
 from temporalio.contrib.external_workflow_streams._wake import new_sender_identity
 
-__all__ = ["ReadinessResult", "StreamSubscriptionManager", "Subscription"]
+__all__ = [
+    "PreparedRecord",
+    "ReadinessResult",
+    "StreamSubscriptionManager",
+    "Subscription",
+]
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _as_storage_failure(what: str) -> Iterator[None]:
+    """Reports a backend failure on an activation path as row one.
+
+    The park handshake is a backend transaction an activation is waiting on, and
+    a backend that is unreachable or erroring is the taxonomy's *transient*
+    row: nothing for an operator to do, and it clears when the backend
+    recovers. Left as whatever the provider raised, it reaches the server as an
+    anonymous Workflow Task failure with no cause and no counter,
+    indistinguishable from a bug in the Workflow's own code.
+
+    Not used for the intent removal a resolve performs, which deliberately logs
+    rather than raises: that one is cleanup on the delivery path, and failing a
+    Workflow Task for it would trade a stale intent for a repeated Workflow
+    Task.
+
+    Anything already classified passes through untouched, so an integrity
+    failure is never relabelled as a transient one.
+    """
+    try:
+        yield
+    except asyncio.CancelledError:
+        raise
+    except StreamError:
+        raise
+    except Exception as err:
+        raise StreamStorageError(f"{what} failed: {err}") from err
+
 
 DEFAULT_BUFFER_SIZE = 256
 """How many records one subscription may hold ahead of the Workflow.
@@ -357,6 +398,79 @@ class Subscription:
         self.reset_to_committed()
 
 
+class PreparedRecord(StreamRecord):
+    """A record whose payload has already had retrieval and codec applied.
+
+    A subclass rather than a field on :py:class:`StreamRecord`, because being
+    prepared is not a property of a record -- it is a property of *this
+    Worker's* handling of one, and a record read by a producer, written by a
+    backend, or compared for idempotency has no such half-state. Everything that
+    reads a record reads the same fields; only the delivery path looks for the
+    two added here.
+
+    ``payload`` is deliberately left as the backend's bytes. Replacing it would
+    make the record no longer equal to what the stream holds, which is what
+    idempotency comparison and integrity validation are expressed in.
+    """
+
+    #: The payload as the payload converter will see it, or ``None`` if
+    #: preparing it raised.
+    prepared_payload: Any = None
+
+    #: What preparing raised, carried rather than raised on the Worker's loop.
+    #: The watcher has no Workflow Task to fail and no Workflow to tell, and a
+    #: record that is never delivered must not fail anything at all -- so the
+    #: error travels with the record and is raised by the delivery that would
+    #: have yielded its value.
+    prepare_error: BaseException | None = None
+
+    def __eq__(self, other: object) -> bool:
+        """Equal to the record it was built from, and to any equal record.
+
+        A frozen dataclass's generated ``__eq__`` compares classes exactly, so
+        without this a prepared record would be unequal to the identical
+        ``StreamRecord`` a caller built to compare against -- and being prepared
+        is a property of this Worker's handling, not of the record. Preparation
+        is deliberately not part of the comparison for the same reason.
+        """
+        if isinstance(other, StreamRecord):
+            return self._fields() == PreparedRecord._fields(other)
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self._fields())
+
+    def _fields(self) -> tuple[Any, ...]:
+        return (
+            self.kind,
+            self.payload,
+            self.producer_session_id,
+            self.sequence,
+            self.offset,
+        )
+
+    @classmethod
+    def of(
+        cls,
+        record: StreamRecord,
+        prepared: Any,
+        error: BaseException | None,
+    ) -> PreparedRecord:
+        out = cls(
+            kind=record.kind,
+            payload=record.payload,
+            producer_session_id=record.producer_session_id,
+            sequence=record.sequence,
+            offset=record.offset,
+        )
+        # `StreamRecord` is frozen, and these two are this subclass's own
+        # fields rather than dataclass fields, so they are set the same way a
+        # frozen dataclass sets anything.
+        object.__setattr__(out, "prepared_payload", prepared)
+        object.__setattr__(out, "prepare_error", error)
+        return out
+
+
 class StreamSubscriptionManager:
     """Every subscription on one Worker, keyed by Run.
 
@@ -374,10 +488,18 @@ class StreamSubscriptionManager:
         run_status: Callable[[str], Awaitable[Any]] | None = None,
         shutdown_wake_failed_metric: Callable[[Any], None] | None = None,
         client_identity: str = "",
+        data_converter: temporalio.converter.DataConverter | None = None,
         buffer_size: int = DEFAULT_BUFFER_SIZE,
         watch_block: timedelta = DEFAULT_WATCH_BLOCK,
     ) -> None:
         self._backends = backends
+        #: The Worker's own converter, used for the **asynchronous half** of
+        #: decoding only -- retrieval and codec, never the payload converter,
+        #: which needs a type only Workflow code knows. Optional so a manager
+        #: can be constructed in isolation; a Worker always supplies it, and a
+        #: record that reaches the Workflow thread unprepared under a converter
+        #: that had something to do is refused there rather than decoded late.
+        self._data_converter = data_converter
         self._notify_ready = notify_ready
         self._send_wake = send_wake
         self._run_status = run_status
@@ -726,6 +848,20 @@ class StreamSubscriptionManager:
 
                 if not records:
                     continue
+
+                # Prepared **before** buffering, so that what the Workflow
+                # thread pops is already a value waiting to be typed. This is
+                # the whole reason the manager holds a converter: a codec
+                # awaited on the Workflow thread performs I/O in a
+                # deterministic event loop.
+                #
+                # And before the epoch check rather than after it, because
+                # preparing awaits: a reposition landing while a user's codec
+                # runs would otherwise slip past a check that had already
+                # passed, and the retracted records would go into the buffer
+                # anyway. The check stays the last thing before the append.
+                prepared = await self._prepare(records)
+
                 if subscription._prefetch_epoch != epoch:
                     # Discarded rather than buffered: these were read from a
                     # position a reposition has since retracted, so they are
@@ -733,10 +869,60 @@ class StreamSubscriptionManager:
                     # reads from the new cursor.
                     continue
 
-                subscription._append(records)
+                subscription._append(prepared)
                 await self._report_ready(subscription)
         except asyncio.CancelledError:
             pass
+
+    async def _prepare(self, records: list[StreamRecord]) -> list[StreamRecord]:
+        """Runs the DataConverter's asynchronous half, here on the Worker's loop.
+
+        Every record is prepared, including ones the Workflow may never take:
+        this is the same bargain the Worker already makes for an activation's
+        payloads, which are decoded in full before the executor sees any of
+        them. The cost of preparing a record that is later discarded is one
+        codec call; the cost of *not* preparing it is that the Workflow thread
+        has to, and the Workflow thread cannot.
+
+        **Nothing raises out of here.** A failure is carried on the record and
+        raised by the delivery that would have yielded its value, which is the
+        only point at which a Workflow exists to be told. Raising here would
+        kill the watcher for the Run -- taking every later record with it -- and
+        would report a failure for a record the Workflow might never have asked
+        for.
+
+        Control records carry no payload by construction, so they pass through.
+        """
+        if self._data_converter is None:
+            return records
+        from temporalio.contrib.external_workflow_streams._codec import (
+            StreamPayloadCodec,
+        )
+
+        # No type: the type belongs to the topic, and the topic belongs to
+        # Workflow code. Nothing out here needs it, because nothing out here
+        # runs the payload converter.
+        codec: StreamPayloadCodec[Any] = StreamPayloadCodec(self._data_converter, None)
+        prepared: list[StreamRecord] = []
+        for record in records:
+            if record.is_control:
+                prepared.append(record)
+                continue
+            try:
+                prepared.append(
+                    PreparedRecord.of(record, await codec.prepare(record.payload), None)
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                logger.debug(
+                    "Preparing external stream record at %s failed; the error "
+                    "travels with the record",
+                    record.offset,
+                    exc_info=True,
+                )
+                prepared.append(PreparedRecord.of(record, None, err))
+        return prepared
 
     async def _report_ready(self, subscription: Subscription) -> None:
         """Tells Core a record is buffered, and acts on which answer comes back.
@@ -876,7 +1062,8 @@ class StreamSubscriptionManager:
         neither.
         """
         async with self._park_lock(run_id):
-            return await self._prepare_park(run_id, park_generation, blocked)
+            with _as_storage_failure("installing external stream park intents"):
+                return await self._prepare_park(run_id, park_generation, blocked)
 
     async def _prepare_park(
         self, run_id: str, park_generation: int, blocked: Mapping[int, Cursor]
@@ -1063,6 +1250,22 @@ class StreamSubscriptionManager:
                 backends[wait_id] = resolved
 
         plan = await build_replay_plan(replay_annotation, backends, stream_keys)
+        # Replay delivers through the same drain the live path does, so it has
+        # to arrive in the same condition: prepared. This is the only chance to
+        # do it -- by the time the segments are delivered, the Workflow thread
+        # is running, and the ranges have already been validated here, so a
+        # decode failure from now on is a converter mismatch rather than
+        # integrity loss (ADR-015).
+        for index, segment in enumerate(plan.segments):
+            plan.segments[index] = ReplaySegment(
+                tuple(
+                    (wait_id, prepared)
+                    for (wait_id, _), prepared in zip(
+                        segment.deliveries,
+                        await self._prepare([r for _, r in segment.deliveries]),
+                    )
+                )
+            )
         self._replay_plans[run_id] = plan
         return plan
 

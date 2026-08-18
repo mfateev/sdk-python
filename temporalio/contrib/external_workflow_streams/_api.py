@@ -29,6 +29,10 @@ from typing import Any, Generic, Protocol
 import temporalio.workflow
 from temporalio.contrib.external_workflow_streams._backend import StreamKey
 from temporalio.contrib.external_workflow_streams._codec import StreamPayloadCodec
+from temporalio.contrib.external_workflow_streams._errors import (
+    StreamError,
+    classify_read_failure,
+)
 from temporalio.contrib.external_workflow_streams._record import (
     StreamRecord,
 )
@@ -386,9 +390,9 @@ async def merge(
                 subscription._commit(record)
                 continue
             # Decoded before consumption is committed, for the same reason as in
-            # `_iterate`: a decode that is cancelled or raises must leave the
-            # record where a later pass can still find it.
-            value = await subscription._decode(record)
+            # `_iterate`: a decode that raises must leave the record where a
+            # later pass can still find it.
+            value = subscription._decode(record)
             subscription._commit(record)
             yield subscription, value
         if not delivered_any:
@@ -510,15 +514,20 @@ class ExternalStreamSubscription(Generic[AnyType]):
                     continue
                 # Decoded first, committed second. Consumption is a claim that
                 # Workflow code *received* this record, and the claim is only
-                # true once a value exists: a decode that is cancelled, or that
-                # raises out of a mismatched converter, never yields anything.
-                # Committing first makes the claim false in exactly that case --
-                # the record leaves the ready list, the buffer it came from is
-                # already empty, and the consumption cursor a Continue-As-New
-                # successor resumes from has stepped over a record nothing ever
-                # saw. Left uncommitted it stays at the head of the ready list
-                # and the next `__anext__` retries it.
-                value = await self._decode(record)
+                # true once a value exists: a decode that raises out of a
+                # mismatched converter never yields anything. Committing first
+                # makes the claim false in exactly that case -- the record
+                # leaves the ready list, the buffer it came from is already
+                # empty, and the consumption cursor a Continue-As-New successor
+                # resumes from has stepped over a record nothing ever saw. Left
+                # uncommitted it stays at the head of the ready list and the
+                # next `__anext__` retries it.
+                #
+                # Synchronous, so there is no longer a point *inside* decoding
+                # at which cancellation can land at all: the record either
+                # becomes a value or raises, and neither outcome can leave the
+                # ready list half-consumed.
+                value = self._decode(record)
                 self._commit(record)
                 yield value
                 continue
@@ -644,10 +653,49 @@ class ExternalStreamSubscription(Generic[AnyType]):
             self._pending_future = None
             self._state.runtime.discard_pending(self._wait_id)
 
-    async def _decode(self, record: StreamRecord) -> AnyType:
+    def _decode(self, record: StreamRecord) -> AnyType:
+        """This record as a value of the topic's declared type.
+
+        **Synchronous, and that is the point.** The Workflow thread runs one
+        half of ``DataConverter.decode`` -- ``from_payloads``, which needs the
+        topic's type and performs no I/O. The other half, external-payload
+        retrieval and the user's ``PayloadCodec``, already ran on the Worker's
+        loop before this record was buffered, exactly as it does for every other
+        payload an activation carries. Awaiting a codec here would perform real
+        I/O inside a deterministic event loop, synthesize Workflow commands out
+        of the codec's internals, and put arbitrary user work under the
+        2-second deadlock timeout.
+
+        Failures of *either* half surface from here, because here is where the
+        record would have become a value. A preparation error carried over from
+        the Worker's loop is raised at the delivery it belongs to rather than
+        where it happened: the watcher has no Workflow to tell, and a record
+        that is never delivered must not fail anything.
+        """
         assert self._state.runtime is not None
         codec = self._state.runtime.codec_for(self._topic.value_type)
-        return await codec.decode(record.payload)
+        prepared = getattr(record, "prepared_payload", None)
+        failed = getattr(record, "prepare_error", None)
+        try:
+            if failed is not None:
+                raise failed
+            if prepared is None:
+                prepared = codec.parse_unprepared(record.payload)
+            return codec.convert(prepared)
+        except StreamError:
+            # Already classified -- a storage failure reaching the payload store
+            # stays row one rather than being relabelled as the consumer's
+            # converter mismatch.
+            raise
+        except Exception as err:
+            # `range_validated=True` for both delivery paths, and for the same
+            # reason. Replay validated the recorded range before this record was
+            # prepared; live delivery read the record out of the backend and the
+            # provider guarantees a record's bytes cannot change once written
+            # (ADR-003). Either way the bytes are the bytes that were written,
+            # so what failed is the consumer's converter -- row three -- and not
+            # the stream (ADR-015).
+            raise classify_read_failure(range_validated=True, cause=err) from err
 
     def close(self) -> None:
         """Ends this subscription: iteration stops and the wait goes away.
