@@ -385,6 +385,335 @@ async def test_an_append_with_no_open_task_wakes_the_workflow(
         )
 
 
+async def test_every_marker_a_run_writes_is_a_complete_annotation(
+    client: Client, backend: MemoryStreamBackend
+) -> None:
+    """Each marker carries its own header and ends with its own terminal.
+
+    A Run that writes two markers is where this can go wrong, and
+    :py:class:`TimerThenConsumeWorkflow` writes exactly two: the completion that
+    carries its timer ends one Workflow Task, and the completion that returns
+    ends the next. Core writes and clears the accumulated annotation on both, so
+    an accumulator that carried its header across the first of them would begin
+    the second annotation at whatever frame came next -- decoded as a schema
+    version, since that is what leads an annotation.
+
+    Decoding every marker independently is the assertion: the annotation is
+    opaque to Core, so nothing between here and History would notice one that
+    cannot be read back, and the failure would surface only on the replay that
+    needed it.
+    """
+    from temporalio.bridge.proto.external_data import ExternalStreamMarkerData
+    from temporalio.contrib.external_workflow_streams._annotation import (
+        decode_annotation,
+    )
+
+    task_queue = f"tq-{uuid.uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[TimerThenConsumeWorkflow],
+        external_stream_backends={"tokens-memory": backend},
+    ):
+        handle = await client.start_workflow(
+            TimerThenConsumeWorkflow.run,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=task_queue,
+        )
+        description = await handle.describe()
+        key = StreamKey(
+            client.namespace,
+            handle.id,
+            description.raw_description.workflow_execution_info.first_run_id,
+            "tokens",
+        )
+        await asyncio.sleep(1)
+        await publish(backend, key, ["first"])
+        await asyncio.sleep(1)
+        await publish(backend, key, ["second"])
+
+        assert await asyncio.wait_for(handle.result(), 60) == ["first", "second"]
+
+        events = [e async for e in handle.fetch_history_events()]
+        markers = [
+            e
+            for e in events
+            if e.HasField("marker_recorded_event_attributes")
+            and e.marker_recorded_event_attributes.marker_name == "core_external_stream"
+        ]
+        assert len(markers) >= 2, (
+            "this Run should write one marker per Workflow Task it ended, and "
+            f"it ended at least two; got {len(markers)}"
+        )
+        # Decoded first, all of them: a marker that lost its header fails here,
+        # and it is the *second* one that loses it, so a per-marker assertion
+        # interleaved with the decoding would stop on the first marker's own
+        # shortcoming and never reach the one under test.
+        annotations = []
+        for index, event in enumerate(markers):
+            data = ExternalStreamMarkerData()
+            data.ParseFromString(
+                event.marker_recorded_event_attributes.details["external_stream"]
+                .payloads[0]
+                .data
+            )
+            annotations.append(decode_annotation(data.replay_annotation))
+
+        for index, annotation in enumerate(annotations):
+            assert annotation.header.streams, (
+                f"marker {index} records no stream in its header, so replay of "
+                "it has nothing to start from"
+            )
+            assert annotation.terminal is not None, (
+                f"marker {index} has no terminal, so nothing in it says where "
+                "the Workflow Task's deliveries stopped (ADR-008)"
+            )
+
+
+@workflow.defn
+class TimerThenFirstRecordWorkflow:
+    """Starts a timer and blocks on the stream in the **same** activation.
+
+    Deliberately distinct from :py:class:`TimerThenConsumeWorkflow`, which
+    consumes a record *before* its timer: that one is quiescent once before the
+    server-bound command ever appears, so its wait set is already registered
+    with Core and only has to survive. Here the very first block rides a
+    completion that carries a timer, so nothing has registered the wait yet --
+    which is the only difference between the two, and the whole case.
+    """
+
+    @workflow.run
+    async def run(self) -> list[str]:
+        tokens = external_stream.with_options(idle_timeout=timedelta(seconds=30)).topic(
+            "tokens", backend="tokens-memory", type=str
+        )
+        iterator = tokens.subscribe().__aiter__()
+        # Long enough that it cannot be what resumes this Workflow. If a record
+        # is ever returned, the stream delivered it.
+        timer = asyncio.ensure_future(asyncio.sleep(600))
+        try:
+            return [await iterator.__anext__()]
+        finally:
+            timer.cancel()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Core registers a wait set only from a WorkflowStreamQuiescent it also "
+        "retains for: `will_retain` gates `begin_external_stream_quiescence`, and "
+        "it is false whenever server-bound commands ride along. Python has no "
+        "other way to register -- the quiescent command is the only channel, and "
+        "an idle timeout of zero is rejected as malformed rather than meaning "
+        "'register these, retain nothing'. Sending the command anyway was tried "
+        "and changes nothing. Fixing this needs Core to register the waits "
+        "independently of the retention decision, which is not a Python change"
+    ),
+)
+async def test_a_first_block_that_rides_a_server_bound_command_is_still_wakeable(
+    client: Client, backend: MemoryStreamBackend
+) -> None:
+    """The wait set has to be registered even by a completion that is reported.
+
+    A completion carrying a timer must not ask for retention -- the server has
+    to be told about the timer -- but the subscriptions it leaves behind are
+    still active, and the wake Signal that covers that window can only resume a
+    Run whose waits Core knows about. Without the registration every append
+    produces a wake Signal, every wake Signal produces a Workflow Task with no
+    jobs in it, and the Workflow is unresumable for the life of the timer.
+    """
+    task_queue = f"tq-{uuid.uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[TimerThenFirstRecordWorkflow],
+        external_stream_backends={"tokens-memory": backend},
+    ):
+        handle = await client.start_workflow(
+            TimerThenFirstRecordWorkflow.run,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=task_queue,
+        )
+        description = await handle.describe()
+        key = StreamKey(
+            client.namespace,
+            handle.id,
+            description.raw_description.workflow_execution_info.first_run_id,
+            "tokens",
+        )
+
+        # Published after the Workflow has settled, so the record arrives with
+        # no open Workflow Task and the wake Signal is the only way in.
+        await asyncio.sleep(1)
+        await publish(backend, key, ["first"])
+
+        try:
+            # Short on purpose: the timer is 600 seconds, so nothing but the
+            # stream can finish this Workflow and a longer wait would only make
+            # a known gap slower to report.
+            assert await asyncio.wait_for(handle.result(), 15) == ["first"]
+        finally:
+            await handle.terminate()
+
+
+def _stream_markers(events: list) -> list:  # type: ignore[type-arg]
+    return [
+        e
+        for e in events
+        if e.HasField("marker_recorded_event_attributes")
+        and e.marker_recorded_event_attributes.marker_name == "core_external_stream"
+    ]
+
+
+async def _wait_for_markers(
+    handle, count: int, message: str, timeout: float = 30
+) -> None:  # type: ignore[no-untyped-def]
+    """Polls until History holds ``count`` stream markers.
+
+    Polled rather than slept: a marker is written when the Workflow Task ends,
+    and waiting a fixed time instead would make every assertion after it a
+    statement about how fast this machine is.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if (
+            len(_stream_markers([e async for e in handle.fetch_history_events()]))
+            >= count
+        ):
+            return
+        await asyncio.sleep(0.3)
+    raise AssertionError(message)
+
+
+@workflow.defn
+class ParkedAcrossEvictionWorkflow:
+    """Consumes records with nothing else to do, so every task ends in a park.
+
+    No timer, no other command: each Workflow Task is retained until the idle
+    timeout parks it, which is what puts a marker in History and leaves the Run
+    parked rather than merely cached. Both are needed here -- the marker is what
+    makes the Run *replay* after eviction, and the park is what makes the wake
+    Signal the only thing that can bring a Workflow Task back.
+    """
+
+    @workflow.run
+    async def run(self, expected: int) -> list[str]:
+        tokens = external_stream.topic("tokens", backend="tokens-memory", type=str)
+        seen: list[str] = []
+        async for token in tokens.subscribe():
+            seen.append(token)
+            if len(seen) >= expected:
+                break
+        return seen
+
+
+@workflow.defn
+class FillerWorkflow:
+    """Occupies the one cache slot, which is what evicts the Run under test."""
+
+    @workflow.run
+    async def run(self) -> str:
+        return "done"
+
+
+async def test_a_replayed_run_re_registers_its_wait_set(
+    client: Client, backend: MemoryStreamBackend
+) -> None:
+    """A Run that comes back through replay has to end replay registered.
+
+    Core's wait set is per-Worker runtime state: it is not in History and it
+    does not survive eviction, so a replayed Run rebuilds it or has none. The
+    only thing that builds it is ``WorkflowStreamQuiescent``, and a completion
+    that reports no progress because it is replaying must still report the
+    snapshot -- what is already in History is the *annotation*, not the
+    registration.
+
+    The Run is deliberately left **parked** before it is evicted, so nothing
+    else can explain the resume: there is no timer to fire, no watcher left
+    alive on this Worker, and no open Workflow Task. A wake Signal creates the
+    replacement task, and everything after that depends on the replayed Run
+    knowing what it is subscribed to. Without it every later readiness is
+    answered as though the Run had no subscriptions at all, each wake produces a
+    Workflow Task with no activation in it, and the record sits in the stream
+    while the Workflow waits.
+    """
+    from temporalio.contrib.external_workflow_streams._wake import (
+        WakeRequest,
+        send_wake_signal,
+    )
+
+    task_queue = f"tq-{uuid.uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[ParkedAcrossEvictionWorkflow, FillerWorkflow],
+        external_stream_backends={"tokens-memory": backend},
+        # One slot, so running anything else evicts the Run under test. Eviction
+        # is what discards the wait set, the watchers, and the buffers, leaving
+        # replay to rebuild all three.
+        max_cached_workflows=1,
+        max_concurrent_workflow_tasks=2,
+    ):
+        handle = await client.start_workflow(
+            ParkedAcrossEvictionWorkflow.run,
+            2,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=task_queue,
+        )
+        description = await handle.describe()
+        first_run_id = description.raw_description.workflow_execution_info.first_run_id
+        key = StreamKey(client.namespace, handle.id, first_run_id, "tokens")
+
+        # Each wait is for a *park*, not for a duration: the record is published
+        # only once the Workflow has actually parked, so it is delivered by a
+        # wake rather than into a Workflow Task that happened to still be open.
+        await _wait_for_markers(handle, 1, "the Run never parked at all")
+
+        # Consumed live, so the Run has a marker to replay from and a cursor
+        # that must be honoured -- a replay that re-delivered "alpha" would show
+        # up in the result rather than in a timeout.
+        await publish(backend, key, ["alpha"])
+        await _wait_for_markers(
+            handle,
+            2,
+            "the Run never parked again after consuming its first record, so it "
+            "was never in the state this case evicts from",
+        )
+
+        # Evicts the Run: its wait set, watchers, and buffers all go with it.
+        await client.execute_workflow(
+            FillerWorkflow.run, id=f"filler-{uuid.uuid4()}", task_queue=task_queue
+        )
+
+        # Appended with nothing on this Worker watching for it, then woken the
+        # way a durable producer wakes a parked Run. The Signal is the only
+        # thing that creates a Workflow Task here, and it carries no records --
+        # so if the replayed Run does not know its own subscription, the
+        # Workflow Task it creates has nothing in it.
+        await publish(backend, key, ["beta"])
+        await send_wake_signal(
+            client,
+            WakeRequest(
+                namespace=client.namespace,
+                workflow_id=handle.id,
+                first_execution_run_id=first_run_id,
+                stream_name="tokens",
+                wait_id=1,
+                park_generation=0,
+                sender_identity=f"test-{uuid.uuid4()}",
+                wake_counter=1,
+            ),
+        )
+
+        try:
+            assert await asyncio.wait_for(handle.result(), 30) == ["alpha", "beta"]
+        finally:
+            try:
+                await handle.terminate()
+            except Exception:
+                pass
+
+
 @workflow.defn
 class FloodedCountWorkflow:
     """Consumes far more records than one activation is allowed to deliver."""

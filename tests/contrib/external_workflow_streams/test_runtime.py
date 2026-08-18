@@ -304,6 +304,53 @@ async def test_deltas_across_activations_concatenate_into_one_annotation(
     assert decoded.terminal == {1: AFTER(Offset("2-0"))}
 
 
+async def test_terminating_an_already_closed_annotation_adds_nothing(
+    runtime: WorkflowStreamRuntime,
+) -> None:
+    """A second terminal for one Workflow Task must not start a second annotation.
+
+    Core can ask for a terminal for a boundary it decided -- a rollover
+    deadline, a shutdown -- on a task whose last completion had already closed
+    the annotation. Creating a fresh header and terminal for that would append a
+    complete second annotation to the one Core is about to write, and the marker
+    would decode as far as the first terminal and fail on the frame after it.
+    """
+    subscribe(runtime, 1)
+    runtime.record_delivery(1, data("1-0"))
+    delta = runtime.take_observation_delta()
+    assert delta is not None
+
+    closed = delta + runtime.add_terminal()
+    again = runtime.add_terminal()
+
+    assert again == b"", "the annotation was already closed; there was nothing to add"
+    decoded = decode_annotation(closed + again)
+    assert decoded.terminal == {1: AFTER(Offset("1-0"))}
+
+
+async def test_a_terminal_after_new_observations_opens_a_fresh_annotation(
+    runtime: WorkflowStreamRuntime,
+) -> None:
+    """The suppression above is about a *closed* annotation, not about the Run.
+
+    Anything observed after the close begins the next annotation, and that one
+    needs its own header and its own terminal like any other.
+    """
+    subscribe(runtime, 1)
+    runtime.record_delivery(1, data("1-0"))
+    first = runtime.take_observation_delta()
+    assert first is not None
+    first += runtime.add_terminal()
+
+    runtime.record_delivery(1, data("2-0"))
+    second = runtime.take_observation_delta()
+    assert second is not None
+    second += runtime.add_terminal()
+
+    assert decode_annotation(first).terminal == {1: AFTER(Offset("1-0"))}
+    assert decode_annotation(second).terminal == {1: AFTER(Offset("2-0"))}
+
+
 async def test_a_new_annotation_starts_from_the_current_cursors(
     runtime: WorkflowStreamRuntime,
 ) -> None:
@@ -522,6 +569,142 @@ async def test_rollover_is_requested_before_the_budget_is_reached(
             runtime.take_observation_delta()
 
         assert delivered > 0
+    finally:
+        await manager.shutdown()
+
+
+# --- the completion path closes every annotation it ends --------------------
+
+
+def _progress_delta(stub: object) -> bytes | None:
+    """The observation delta a completion is carrying, if any."""
+    for command in stub._current_completion.successful.commands:  # type: ignore[attr-defined]
+        if command.HasField("workflow_stream_progress"):
+            return command.workflow_stream_progress.observation_delta
+    return None
+
+
+async def test_a_command_producing_completion_closes_its_annotation(
+    runtime: WorkflowStreamRuntime,
+) -> None:
+    """Two Workflow Tasks in a row, each ended by the Workflow's own command.
+
+    Core writes and clears a marker on each of them, so each delta has to be a
+    whole annotation: its own header, and its own terminal. Carrying the header
+    across the first would leave the second starting at whatever frame came
+    first, and the leading byte of an annotation is read as its schema version
+    -- so the failure is reported as an unsupported version rather than as
+    anything to do with framing.
+    """
+    from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
+    from tests.contrib.external_workflow_streams.test_delivery_budget import (
+        _CompletionStub,
+    )
+
+    subscribe(runtime, 1)
+    runtime.record_delivery(1, data("1-0"))
+    first = _CompletionStub(runtime)
+    first._add_command()  # a timer, an activity: server-bound, so the task ends
+    _WorkflowInstanceImpl._emit_external_stream_commands(first)  # type: ignore[arg-type]
+
+    runtime.record_delivery(1, data("2-0"))
+    second = _CompletionStub(runtime)
+    second._add_command()
+    _WorkflowInstanceImpl._emit_external_stream_commands(second)  # type: ignore[arg-type]
+
+    deltas = {"first": _progress_delta(first), "second": _progress_delta(second)}
+    # Decoded before anything is asserted about them: it is the *second* delta
+    # that loses its header, and asserting per delta as each is decoded would
+    # stop on the first one's own shortcoming instead.
+    decoded = {}
+    for name, delta in deltas.items():
+        assert delta is not None, f"the {name} completion reported no progress"
+        decoded[name] = decode_annotation(delta)
+
+    for name, annotation in decoded.items():
+        assert annotation.header.streams, f"the {name} marker records no stream"
+        assert annotation.terminal is not None, (
+            f"the {name} marker has no terminal, so nothing in it says where "
+            "that Workflow Task's deliveries stopped"
+        )
+
+    assert decoded["second"].terminal == {1: AFTER(Offset("2-0"))}
+
+
+async def test_a_rollover_request_closes_the_annotation_it_splits(
+    backend: MemoryStreamBackend,
+) -> None:
+    """A budget rollover ends the task too, and needs no finalization round trip.
+
+    Core takes ``request_rollover`` as authoritative over the retention the same
+    completion asks for, writes the marker, and forces a replacement task --
+    without asking for a terminal, because the progress command carrying the
+    request is supposed to have carried one. A completion that asked for the
+    split without closing the annotation would produce a marker with no terminal
+    *and* leave the next one headerless.
+    """
+    from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
+    from tests.contrib.external_workflow_streams.test_delivery_budget import (
+        _CompletionStub,
+    )
+
+    manager = StreamSubscriptionManager(
+        backends={"tokens": backend},
+        notify_ready=_notify,
+        watch_block=timedelta(milliseconds=10),
+    )
+    runtime = WorkflowStreamRuntime(
+        manager=manager,
+        backends={"tokens": backend},
+        run_id=RUN_ID,
+        namespace="ns",
+        workflow_id="wf",
+        first_execution_run_id="first",
+        data_converter=temporalio.converter.DataConverter.default,
+        default_idle_timeout=timedelta(seconds=1),
+        max_annotation_bytes=2048,
+    )
+    try:
+        subscribe(runtime, 1)
+        subscribe(runtime, 2, name="tool-events")
+
+        # Accumulated the way Core accumulates, by byte append: the marker
+        # carries every delta of the Workflow Task, not just its last one.
+        accumulated: list[bytes] = []
+        delivered = 0
+        while not runtime.request_rollover:
+            # Alternating, so every delivery is its own run -- the one workload
+            # that cannot be range-compressed and therefore the one that reaches
+            # the cap.
+            for wait_id in (1, 2):
+                delivered += 1
+                runtime.record_delivery(wait_id, data(f"{delivered}-0"))
+            earlier = runtime.take_observation_delta()
+            if earlier is not None:
+                accumulated.append(earlier)
+
+        # The Workflow is still blocked on both streams, so this completion asks
+        # for retention as well -- and the rollover wins over it.
+        stub = _CompletionStub(runtime)
+        _WorkflowInstanceImpl._emit_external_stream_commands(stub)  # type: ignore[arg-type]
+
+        delta = _progress_delta(stub)
+        assert delta is not None, "the completion carried no progress to roll over"
+        accumulated.append(delta)
+        commands = stub._current_completion.successful.commands
+        assert commands[0].workflow_stream_progress.request_rollover, (
+            "the completion did not ask Core to roll the task over"
+        )
+        assert decode_annotation(b"".join(accumulated)).terminal is not None, (
+            "the annotation Core is about to write has no terminal, and the "
+            "rollover path asks for none"
+        )
+
+        # And the next annotation begins from a header of its own.
+        runtime.record_delivery(1, data("9999-0"))
+        following = runtime.take_observation_delta()
+        assert following is not None
+        assert decode_annotation(following).header.streams
     finally:
         await manager.shutdown()
 

@@ -202,53 +202,6 @@ async def wait_until(predicate: Any, timeout: float, message: str) -> None:
 # --- case 29: shutdown in the NoOpenWorkflowTask window -----------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the sweep's wake Signal never reaches the Workflow's History: it is "
-        "sent as a *parked* wake naming a park generation that is already dead, "
-        "and the server deduplicates it against the wake that generation "
-        "already had. "
-        "Nothing removes a confirmed park intent from the backend when the park "
-        "is resolved -- `remove_park_intent` is called only when a recheck "
-        "aborts a park -- so `current_park_generation` still answers 1 long "
-        "after `mark_all_ready_for_wake` cleared it in Core. "
-        "`_send_external_stream_wake` reads that answer, so the sweep builds "
-        "`WakeRequest(park_generation=1)` instead of the unparked "
-        "`park_generation=0` P20 requires. A parked wake's request ID is "
-        "derived from (namespace, workflow id, first execution run id, stream "
-        "name, wait id, park generation) alone -- deliberately, since a "
-        "generation is woken once -- so it comes out byte-identical to the wake "
-        "the watcher already sent for generation 1. Observed by tracing "
-        "`send_wake_signal`: two sends, both `park_generation=1`, one distinct "
-        "request ID between them, and one "
-        "`__temporal_external_stream_wake` event in History, unchanged across "
-        "shutdown. No Workflow Task is created and no second Worker ever sees "
-        "the Run. Were it not deduplicated, Core would reject it anyway: "
-        "`accepts_wake_generation(1)` requires `park_generation == Some(1)`, "
-        "and the wake that resolved the park set it to None. "
-        "This is not the only blocker, and the next reader should not assume it "
-        "is: with `_send_external_stream_wake` forced to `generation = 0` as an "
-        "experiment, the sweep's wake does reach History, the server does "
-        "create a Workflow Task, and a second Worker does take it and replay -- "
-        "and the Run then stalls again. A replayed completion returns early "
-        "from `_emit_external_stream_commands`, so it sends no "
-        "`WorkflowStreamQuiescent`, and `become_quiescent` is the only thing "
-        "that populates Core's wait set; the handed-over Run therefore ends "
-        "replay with an empty one. Every later wake -- the watcher's, and the "
-        "one for the record published after the handover -- creates a Workflow "
-        "Task that Core completes with no activation at all, exactly as it does "
-        "for a Run that never registered. "
-        "One more fact a reader will trip over: the sweep's own probe answers "
-        "`RunNotFound`, not `NoOpenWorkflowTask`, because the manager sweeps "
-        "after the poller tasks have been awaited and Core has already dropped "
-        "the Run from its cache. The same probe called on the live Worker one "
-        "line earlier answers `NoOpenWorkflowTask`. Both branches owe a wake, so "
-        "this does not change what the sweep does here -- but it does mean the "
-        "probe cannot currently distinguish the `Parked` and `WftOpen` cases "
-        "that P20 asks it to"
-    ),
-)
 @pytest.mark.timeout(180)
 async def test_shutdown_with_no_open_task_hands_the_run_to_another_worker(
     client: Client, backend: MemoryStreamBackend
@@ -436,6 +389,185 @@ async def _in_the_window(probe: Any, run_id: str) -> bool:
     """
     status = await probe(run_id)
     return getattr(status, "value", status) == "NoOpenWorkflowTask"
+
+
+class _InTheWindow:
+    """A Run left cached with a live wait set and no open Workflow Task.
+
+    The state both tests below need, and getting there is neither quick nor
+    obvious: the Workflow must block on the stream *first* so a
+    ``WorkflowStreamQuiescent`` registers the wait set with Core, park, be woken
+    by a record, and only then issue a server-bound command so the Workflow Task
+    ends with the wait set still registered. See
+    :class:`LeftWithNoOpenTaskWorkflow`.
+    """
+
+    def __init__(self, worker: Worker, task: asyncio.Task, handle: Any, key: StreamKey):
+        self.worker = worker
+        self.task = task
+        self.handle = handle
+        self.key = key
+        self.manager = worker._workflow_worker._external_stream_manager
+        self.run_id = next(iter(self.manager._runs))
+
+    async def close(self) -> None:
+        if not self.task.done():
+            self.task.cancel()
+        try:
+            await self.handle.terminate()
+        except Exception:
+            pass
+
+
+async def _leave_a_run_in_the_window(
+    client: Client, backend: MemoryStreamBackend, session: str
+) -> _InTheWindow:
+    task_queue = f"tq-{uuid.uuid4()}"
+    worker = Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[LeftWithNoOpenTaskWorkflow],
+        external_stream_backends={"tokens-memory": backend},
+    )
+    worker_task = asyncio.create_task(worker.run())
+    handle = await client.start_workflow(
+        LeftWithNoOpenTaskWorkflow.run,
+        2,
+        id=f"wf-{uuid.uuid4()}",
+        task_queue=task_queue,
+        task_timeout=timedelta(seconds=10),
+    )
+    key = await stream_key_for(client, handle)
+
+    # The first Workflow Task ends by parking, which is also what registers the
+    # wait set with Core. A record published before that lands on a Run whose
+    # wait set is still empty.
+    await wait_until(
+        lambda: _has_markers(handle),
+        60,
+        "the Run's first Workflow Task never ended, so it never parked and "
+        "never registered a wait set with Core",
+    )
+    await wait_until(
+        lambda: _park_is_installed(backend, key),
+        30,
+        "no park intent was installed, so this Run never confirmed a park and "
+        "there is no resolved park to reason about",
+    )
+
+    await publish(backend, key, ["alpha"], session=session)
+    await wait_until(
+        lambda: _timer_started(handle),
+        60,
+        "the record never reached the Workflow, so the completion that leaves "
+        "the Run in the no-open-task window never happened",
+    )
+
+    manager = worker._workflow_worker._external_stream_manager
+    assert manager is not None, "the manager should exist by now"
+    await wait_until(
+        lambda: _run_is_registered(manager),
+        30,
+        "the manager holds no Run with subscriptions",
+    )
+    return _InTheWindow(worker, worker_task, handle, key)
+
+
+async def _park_is_installed(backend: MemoryStreamBackend, key: StreamKey) -> bool:
+    return bool(await backend.parked_wait_ids(key))
+
+
+@pytest.mark.timeout(180)
+async def test_a_wake_that_resolves_a_park_removes_its_intent(
+    client: Client, backend: MemoryStreamBackend
+) -> None:
+    """The invariant, end to end: an intent outlives its park nowhere.
+
+    The park here is confirmed rather than aborted, and it is resolved the way a
+    live one actually is -- a producer appends, the watcher sends the wake, and
+    Core clears its ``park_generation``. None of that is visible in the backend,
+    so if the manager does not take the intent back out on the resolve, nothing
+    ever will.
+
+    Asserted through ``current_park_generation`` because that is the call the
+    damage comes through. Every wake path asks it: a producer, to decide what its
+    Signal names, and this Worker's own shutdown sweep, to decide whether it owes
+    a parked or an unparked wake. Both get a generation Core has already
+    discarded, and both wakes are then discarded in turn -- the producer's as
+    stale, the sweep's by the server, which sees the request ID of the wake that
+    ended the park.
+    """
+    session = f"resolve-{uuid.uuid4()}"
+    window = await _leave_a_run_in_the_window(client, backend, session)
+    try:
+        assert await backend.parked_wait_ids(window.key) == [], (
+            "the park that the wake Signal resolved still has its intent "
+            "installed in the backend"
+        )
+        for wait_id in (0, 1, 2):
+            assert await backend.current_park_generation(window.key, wait_id) is None, (
+                "a park that is over still reports a generation, so the next "
+                "wake for this wait will name it instead of being the unparked "
+                "wake it owes"
+            )
+    finally:
+        await window.close()
+
+
+@pytest.mark.timeout(180)
+async def test_the_shutdown_probe_is_asked_while_core_still_holds_the_run(
+    client: Client, backend: MemoryStreamBackend
+) -> None:
+    """The sweep's probe has to be asked when its answer still describes something.
+
+    P20 gives the probe four answers and three behaviours: ``WftOpen`` waits for
+    C15b, ``Parked`` owes nothing, and ``NoOpenWorkflowTask``/``RunNotFound``
+    owe the wake. Asked after every activation has been answered, Core has
+    already dropped the Run and only ``RunNotFound`` is reachable -- so the
+    sweep still sends its wake and still looks correct, while a parked Run gets
+    a wake it does not need and a Run holding a Workflow Task gets one that
+    races Core's own shutdown transition.
+
+    This Run is in the ``NoOpenWorkflowTask`` window, which is asserted on the
+    live Worker before shutdown, so a sweep asking at the right moment must see
+    the same thing. The assertion is on what the *sweep* saw, not on what a
+    probe outside it saw, because the ordering is the only thing under test.
+    """
+    session = f"probe-{uuid.uuid4()}"
+    window = await _leave_a_run_in_the_window(client, backend, session)
+    try:
+        real_probe = window.manager._run_status
+        await wait_until(
+            lambda: _in_the_window(real_probe, window.run_id),
+            30,
+            "the Run never reached the no-open-Workflow-Task window, so this "
+            "case is not testing the ordering it names",
+        )
+
+        answers: list[str] = []
+
+        async def recording_probe(probed_run_id: str) -> Any:
+            status = await real_probe(probed_run_id)
+            answers.append(getattr(status, "value", status))
+            return status
+
+        window.manager._run_status = recording_probe
+
+        await asyncio.wait_for(window.worker.shutdown(), 60)
+
+        assert answers, "the sweep never probed at all"
+        assert "RunNotFound" not in answers, (
+            "the sweep probed after Core had already dropped the Run, so its "
+            f"answers were {answers}. Every state P20 distinguishes collapses "
+            "into RunNotFound there: the wake still goes out, so nothing looks "
+            "broken, but the Parked and WftOpen branches are unreachable"
+        )
+        assert answers == ["NoOpenWorkflowTask"], (
+            "the Run was in the no-open-Workflow-Task window immediately before "
+            f"shutdown, and the sweep saw {answers}"
+        )
+    finally:
+        await window.close()
 
 
 # --- case 30: teardown racing finalization ------------------------------------

@@ -2316,6 +2316,11 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         command whose value could depend on the consumed data -- on replay that
         is what guarantees a record is validated before the command derived from
         it is matched.
+
+        The two are separate in *time* as well, which is why replay answers only
+        the second: the annotation is already in History, but the wait set the
+        quiescent command registers is per-Worker runtime state that a replayed
+        Run has to rebuild.
         """
         runtime = self._external_stream_runtime
         if runtime is None or self._deleting:
@@ -2336,6 +2341,28 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
             # resolve instead of park.
             runtime.rearm_readiness()
 
+        # Read before anything is added below, so "what the Workflow itself
+        # produced this activation" stays answerable.
+        commands = self._current_completion.successful.commands
+        produced_commands = len(commands) > 0
+
+        # Retention is asked for only when nothing server-bound rides along. A
+        # completion carrying a timer, activity, child workflow, or signal must
+        # be reported so the server can act on it; the subscriptions stay
+        # registered and the wake Signal covers the window that leaves.
+        #
+        # "Stay registered" is the load-bearing word, and it only holds for a
+        # wait set Core already has: Core registers a wait set from a quiescent
+        # command it also *retains* for, and never from one that accompanies
+        # server-bound commands. A Workflow whose very first block rides such a
+        # completion therefore registers nothing, and no wake can resume it --
+        # see `test_a_first_block_that_rides_a_server_bound_command_is_still_
+        # wakeable`, which is xfailed against that gap. Sending the command here
+        # anyway does not close it; Core has to separate registering from
+        # retaining first.
+        snapshot = None if produced_commands else runtime.quiescent_snapshot()
+        retaining = bool(snapshot)
+
         if self._is_replaying:
             # Every marker for a replayed Workflow Task is already in History,
             # so there is nothing here for Core to write. Re-deriving the
@@ -2349,31 +2376,68 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
             # first one already recorded. A registration alone is enough to
             # trigger that, so it happens even for a stream that never delivered
             # anything.
+            #
+            # The *quiescent* command below is emitted all the same, because it
+            # is not about the annotation at all: it is the only thing that
+            # registers a wait set with Core, and Core's wait set is runtime
+            # state that a replayed Run rebuilds from nothing. A Run handed over
+            # and replayed that reported no snapshot would finish replay with an
+            # empty wait set -- every later readiness answered as though the Run
+            # had no subscriptions, every wake Signal marking nothing ready, and
+            # every Workflow Task it created completing with no activation in
+            # it. That Run is unresumable, with its records sitting in the
+            # stream.
+            #
+            # The cost is that Core starts its idle timer here too, and on
+            # replay it should not run one at all: a replay slower than the idle
+            # timeout can therefore queue a park handshake between two replay
+            # activations. That is a rare timing hazard against a certain and
+            # total failure, so it is the right trade to make from this side --
+            # but removing it needs Core either to hold its timers while
+            # `replaying` or to register the wait set from the marker lookahead
+            # it already reads.
             runtime.start_new_annotation()
-            return
+        else:
+            # Read before the terminal is added: closing the annotation starts a
+            # fresh one, whose accumulator is nowhere near the high-water mark.
+            request_rollover = runtime.request_rollover
+            parts: list[bytes] = []
+            delta = runtime.take_observation_delta()
+            if delta is not None:
+                parts.append(delta)
+            # Both of these end the Workflow Task. Retention is refused outright
+            # for the first; for the second Core takes the rollover as
+            # authoritative *over* a retention request, because the annotation
+            # is the thing that has to stop growing.
+            if runtime.annotation_started and (not retaining or request_rollover):
+                # This completion ends the Workflow Task, so Core writes the
+                # marker for everything accumulated and clears it. Two things
+                # follow, and neither is optional.
+                #
+                # The terminal has to ride *this* delta. Core is
+                # annotation-blind and never manufactures one, and it asks for
+                # one only on the boundaries it decides itself -- so on a
+                # completion Python decided, a marker whose annotation has no
+                # terminal is what gets written, and that is durable and wrong
+                # (ADR-008).
+                #
+                # And the next annotation has to begin from a fresh header. Core
+                # accumulates by byte append, so an accumulator that kept the
+                # header it already emitted would start the *next* marker at
+                # whatever frame came first -- the observed failure is an
+                # annotation beginning with a terminal frame, read back as
+                # "schema version 3".
+                parts.append(runtime.add_terminal())
 
-        # Ordering: the progress command goes in before anything the workflow
-        # itself produced this activation, so it is inserted at the front rather
-        # than appended.
-        commands = self._current_completion.successful.commands
-        produced_commands = len(commands) > 0
+            if parts:
+                progress = temporalio.bridge.proto.workflow_commands.WorkflowCommand()
+                progress.workflow_stream_progress.observation_delta = b"".join(parts)
+                progress.workflow_stream_progress.request_rollover = request_rollover
+                # Inserted at the front rather than appended: the progress
+                # command must precede every command whose value could depend on
+                # the consumed data.
+                commands.insert(0, progress)
 
-        delta = runtime.take_observation_delta()
-        if delta is not None:
-            progress = temporalio.bridge.proto.workflow_commands.WorkflowCommand()
-            progress.workflow_stream_progress.observation_delta = delta
-            progress.workflow_stream_progress.request_rollover = (
-                runtime.request_rollover
-            )
-            commands.insert(0, progress)
-
-        # Retention is asked for only when nothing server-bound rides along. A
-        # completion carrying a timer, activity, child workflow, or signal must
-        # be reported so the server can act on it; the subscriptions stay
-        # registered and the wake Signal covers the window that leaves.
-        if produced_commands:
-            return
-        snapshot = runtime.quiescent_snapshot()
         if not snapshot:
             return
 

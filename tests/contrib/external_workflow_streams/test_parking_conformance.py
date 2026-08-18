@@ -137,6 +137,28 @@ class BlindRecheckBackend(MemoryStreamBackend):
         return False
 
 
+class GenerationOutlivesRemovalBackend(MemoryStreamBackend):
+    """Answers the generation from a remembered value beside the intent.
+
+    The plausible mistake: reading "the current park generation" as a fact about
+    the subscription's history rather than as "is a park outstanding right now".
+    It passes every other parking check -- the intent really is removed, and
+    really does stop being enumerable -- while the one call every wake path
+    actually asks keeps naming a park that is over.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._generations: dict[tuple[StreamKey, int], int] = {}
+
+    async def install_park_intent(self, key: StreamKey, intent: ParkIntent) -> None:
+        await super().install_park_intent(key, intent)
+        self._generations[(key, intent.wait_id)] = intent.park_generation
+
+    async def current_park_generation(self, key: StreamKey, wait_id: int) -> int | None:
+        return self._generations.get((key, wait_id))
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("broken", "check", "reason"),
@@ -164,6 +186,12 @@ class BlindRecheckBackend(MemoryStreamBackend):
             conformance.check_recheck_sees_an_append_past_the_cursor,
             "append/park race is not closed",
             id="recheck-cannot-see-a-late-append",
+        ),
+        pytest.param(
+            GenerationOutlivesRemovalBackend,
+            conformance.check_a_removed_intent_reports_no_generation,
+            "still reports a generation",
+            id="generation-outlives-its-intent",
         ),
     ],
 )

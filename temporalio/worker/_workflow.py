@@ -303,8 +303,32 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             except PollShutdownError:
                 return
 
+    async def probe_external_stream_runs(self) -> None:
+        """Asks Core what state each streaming Run is in. P20's sweep, first half.
+
+        Called by the Worker immediately *before* Core's shutdown is initiated,
+        because that is the last moment the answer exists. An idle cached Run has
+        no pending work, so Core's ``shutdown_done`` is satisfied by the first
+        input after the shutdown token is cancelled and the workflow-state lane
+        ends there; every probe afterwards answers ``RunNotFound``. Since
+        ``RunNotFound`` owes a wake just as ``NoOpenWorkflowTask`` does, a sweep
+        that probes too late still sends its wake and still looks right, while
+        the two answers that mean *don't* send one -- ``Parked``, which needs no
+        wake, and ``WftOpen``, which belongs to C15b -- can no longer occur.
+
+        Only the asking happens here. The wakes are sent from
+        :py:meth:`shutdown_external_streams`, after the pollers have stopped:
+        offering the Run to a task queue this Worker is still polling would be
+        the opposite of a hand-off.
+
+        The manager bounds this with its own short grace period, so a wedged
+        Core cannot delay the stop-polling step.
+        """
+        if self._external_stream_manager is not None:
+            await self._external_stream_manager.probe_runs()
+
     async def shutdown_external_streams(self) -> None:
-        """Sweeps and tears down the external stream manager. P20's entry point.
+        """Sends the owed wakes and tears the manager down. P20's second half.
 
         Called by the Worker once every activation has been dealt with, on
         *both* shutdown paths. It deliberately does not live in
@@ -313,6 +337,11 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         ``Worker.shutdown()`` never sweeps at all, leaving Runs registered,
         watchers running, and buffers and backend connections open in a process
         that is about to exit.
+
+        Here, and not with the probe, because per-Run teardown is driven by
+        ``RemoveFromCache`` and nothing else: a ``FinalizeExternalStreams`` in
+        flight has to be answered before the manager's state for that Run
+        disappears.
 
         It is not folded into eviction either, because an *idle cached Run
         receives no eviction activation at shutdown at all* -- ``shutdown_done``
@@ -841,6 +870,17 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         runtime = self._external_stream_runtimes.get(act.run_id)
         if runtime is None:
             return None
+
+        if any(j.HasField("resolve_external_stream_waits") for j in act.jobs):
+            # Core is telling this Worker the wait set has moved on, which is
+            # also the only notice that a *confirmed* park is over: a wake Signal
+            # and a fresh quiescent snapshot both clear Core's `park_generation`,
+            # and neither is visible in the backend. The intent installed for
+            # that park comes out here, before the Workflow resumes, so nothing
+            # can read a generation that no longer exists -- not a producer
+            # choosing what its wake names, and not this Worker's own shutdown
+            # sweep. The job itself passes through to `_apply` unchanged.
+            await self._stream_manager().resolve_park(act.run_id)
 
         park = next(
             (

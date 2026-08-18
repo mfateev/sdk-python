@@ -549,3 +549,170 @@ async def test_two_workers_sweeps_do_not_deduplicate_each_other(
         "both Workers' sweeps derived the same request ID, so the second "
         "Worker's wake would be deduplicated away and its Run would stall"
     )
+
+
+# --- the park intent's lifetime -----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_resolved_park_leaves_no_intent_behind(harness_factory) -> None:
+    """A park intent exists only while that park is actually outstanding.
+
+    An aborted park was never the only park that ends. A **confirmed** one ends
+    too -- when a wake Signal or a fresh quiescent snapshot clears Core's
+    ``park_generation`` -- and nothing about that is visible in the backend, so
+    only the manager can take the intent back out.
+
+    What a left-behind intent costs is not tidiness. It *is* the answer
+    ``current_park_generation`` gives everyone who asks: a producer choosing what
+    its wake Signal names gets a generation Core has already discarded and its
+    wake is ignored as stale, and the shutdown sweep gets the same answer and
+    sends a parked wake whose request ID -- deliberately independent of the
+    sender -- is byte-identical to the wake that resolved the park in the first
+    place, so the server deduplicates it and no Workflow Task is ever created.
+    """
+    harness = harness_factory(RunStatus.NO_OPEN_WORKFLOW_TASK)
+    key = harness.register()
+
+    confirmed = not await harness.manager.prepare_park(RUN_ID, 1, {1: BEGINNING})
+    assert confirmed, "nothing was appended, so this park must have confirmed"
+    assert await harness.backend.current_park_generation(key, 1) == 1
+
+    await harness.manager.resolve_park(RUN_ID)
+
+    assert await harness.backend.park_intent(key, 1) is None, (
+        "the intent of a park that is over is still installed"
+    )
+    assert await harness.backend.current_park_generation(key, 1) is None, (
+        "a resolved park still reports a generation, so the next wake -- a "
+        "producer's or the shutdown sweep's -- will name a park Core no longer "
+        "recognises instead of the unparked wake it owes"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_resolve_with_no_park_installed_touches_nothing(
+    harness_factory,
+) -> None:
+    """A resolve is the ordinary delivery path, not a rare one.
+
+    Every record delivered live arrives on a resolve activation, so removing
+    intents there unconditionally would put a backend write on the hot path for
+    a park that never existed. The manager mirrors what it installed and removes
+    only that.
+    """
+    harness = harness_factory(RunStatus.NO_OPEN_WORKFLOW_TASK)
+    key = harness.register()
+    removals: list[int] = []
+
+    original = harness.backend.remove_park_intent
+
+    async def recording_remove(removed_key, wait_id: int) -> None:  # type: ignore[no-untyped-def]
+        removals.append(wait_id)
+        await original(removed_key, wait_id)
+
+    harness.backend.remove_park_intent = recording_remove  # type: ignore[method-assign]
+
+    await harness.manager.resolve_park(RUN_ID)
+    assert removals == [], "a Run that never parked owes the backend nothing"
+
+    await harness.manager.prepare_park(RUN_ID, 1, {1: BEGINNING})
+    await harness.manager.resolve_park(RUN_ID)
+    await harness.manager.resolve_park(RUN_ID)
+
+    assert removals == [1], (
+        "the intent must come out exactly once: once for the park that was "
+        "installed, and never again for resolves with nothing outstanding"
+    )
+    assert await harness.backend.park_intent(key, 1) is None
+
+
+@pytest.mark.asyncio
+async def test_a_backend_failure_during_removal_leaves_it_owed(
+    harness_factory,
+) -> None:
+    """Cleanup does not get to fail a Workflow Task, and does not give up either.
+
+    A resolve is a delivery activation; raising here would trade a stale intent
+    for a repeated Workflow Task on the healthy path. Swallowing the failure
+    *and* forgetting the intent would be the original defect back again, so the
+    removal stays owed and the next resolve retries it.
+    """
+    harness = harness_factory(RunStatus.NO_OPEN_WORKFLOW_TASK)
+    key = harness.register()
+    await harness.manager.prepare_park(RUN_ID, 1, {1: BEGINNING})
+
+    original = harness.backend.remove_park_intent
+    failures = [True]
+
+    async def flaky_remove(removed_key, wait_id: int) -> None:  # type: ignore[no-untyped-def]
+        if failures:
+            failures.pop()
+            raise ConnectionError("backend unavailable")
+        await original(removed_key, wait_id)
+
+    harness.backend.remove_park_intent = flaky_remove  # type: ignore[method-assign]
+
+    await harness.manager.resolve_park(RUN_ID)
+    assert await harness.backend.current_park_generation(key, 1) == 1
+
+    await harness.manager.resolve_park(RUN_ID)
+    assert await harness.backend.current_park_generation(key, 1) is None, (
+        "a removal that failed once was never retried, so the intent is stale "
+        "for the rest of the Run's life"
+    )
+
+
+# --- when the probe is asked ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_acts_on_what_the_probe_heard(harness_factory) -> None:
+    """The probe and the wakes belong at different moments, so they are separate.
+
+    Core keeps the state the probe reports only until the Worker's shutdown is
+    initiated: an idle cached Run has no pending work, so ``shutdown_done`` is
+    satisfied by the first input after the shutdown token is cancelled and the
+    workflow-state lane ends there. Everything afterwards answers
+    ``RunNotFound``.
+
+    That answer owes a wake, which is what makes the degradation invisible: a
+    sweep that asks too late still sends its wake and still looks correct, while
+    the two answers that mean *do not* send one stop occurring. This Run is
+    parked -- a producer's append reaches it through the ordinary path and it
+    needs nothing from the sweep -- and the sweep must still know that after
+    Core has forgotten.
+    """
+    harness = harness_factory(RunStatus.PARKED)
+    harness.register()
+
+    await harness.manager.probe_runs()
+    harness.status = RunStatus.RUN_NOT_FOUND
+
+    await harness.manager.shutdown()
+
+    assert harness.wakes == [], (
+        "a parked Run was woken on the way out. Its state was read after Core "
+        "had dropped it, so the Parked branch could not be taken"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_run_the_probe_never_reached_is_still_swept(harness_factory) -> None:
+    """Probing early must not become a way to miss a Run.
+
+    A Workflow Task already in flight when the probe ran can still cache a Run
+    afterwards. Nothing is known about it, so it is asked -- and both answers
+    Core has left to give owe a wake.
+    """
+    harness = harness_factory(RunStatus.NO_OPEN_WORKFLOW_TASK)
+
+    await harness.manager.probe_runs()
+    harness.register()
+
+    await harness.manager.shutdown()
+
+    assert harness.wakes == [(RUN_ID, 1)]
+    assert harness.probes == [RUN_ID], (
+        "a Run the probe phase never saw must still be asked about"
+    )

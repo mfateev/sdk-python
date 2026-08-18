@@ -80,6 +80,7 @@ M1_COVERAGE: dict[int, str | tuple[str, ...]] = {
         "test_wake.py::test_one_senders_retry_stays_a_single_wake",
     ),
     28: "external_streams.rs::a_second_worker_reconstructs_the_subscription_from_the_shutdown_marker",
+    29: "test_worker_handoff.py::test_shutdown_with_no_open_task_hands_the_run_to_another_worker",
     30: "test_worker_handoff.py::test_a_finalization_that_cannot_be_answered_writes_no_marker",
     31: "external_streams.rs::an_unwritten_annotation_exists_only_while_a_workflow_task_is_open",
     32: (
@@ -119,9 +120,6 @@ M1_COVERAGE: dict[int, str | tuple[str, ...]] = {
 #: cover. A case is in exactly one of the two maps: claiming a partially covered
 #: case as covered is how a gate stops meaning anything.
 M1_GAPS: dict[int, str] = {
-    29: (
-        "the sweep runs and an unparked wake reaches History, but the second Worker does not pick the Run up; under re-diagnosis, previous reasons having gone stale three times"
-    ),
     36: (
         "an empty stream that parks, is evicted, and replays has no end-to-end test. test_replay_end_to_end.py::test_an_empty_stream_replays_from_its_recorded_boundary covers subscribe-and-replay but neither the park nor the eviction"
     ),

@@ -468,6 +468,15 @@ class _RecordingRuntime:
     def start_new_annotation(self) -> None:
         pass
 
+    @property
+    def annotation_started(self) -> bool:
+        # Nothing was ever accumulated, so there is no annotation to terminate.
+        return False
+
+    @property
+    def request_rollover(self) -> bool:
+        return False
+
 
 @pytest.mark.parametrize("exhausted", [True, False])
 def test_the_completion_rearms_exactly_when_the_budget_was_hit(

@@ -131,6 +131,16 @@ hang on the way out, and a wake that has not been acknowledged by now is better
 reported than waited on indefinitely.
 """
 
+DEFAULT_PROBE_GRACE = timedelta(seconds=2)
+"""How long the probe phase may delay Core's stop-polling step.
+
+Much shorter than the sweep's grace, and for a different reason: the probe is
+purely local -- one message on Core's own serialized input lane per Run -- so it
+is either quick or wedged, and everything it delays is a Worker that has already
+been asked to stop. A Run it does not reach is not lost; it is probed again by
+the sweep, on whatever Core has left to say.
+"""
+
 
 def _status_value(status: Any) -> str:
     return getattr(status, "value", status)
@@ -144,6 +154,9 @@ ReadinessNotifier = Callable[[str, int, int], Awaitable[Any]]
 #: by the producer wake-signal path (P14); until then a subscription simply
 #: records that a wake was owed.
 WakeSender = Callable[["Subscription"], Awaitable[None]]
+
+#: The read-only Run-status probe (C4), returning one of the four run statuses.
+RunStatusProbe = Callable[[str], Awaitable[Any]]
 
 
 def _result_value(result: Any) -> str:
@@ -195,6 +208,17 @@ class Subscription:
     #: than merely logged, so a test can tell "no wake was needed" from "a wake
     #: was needed and dropped".
     wakes_owed: int = 0
+
+    installed_park_generation: int | None = None
+    """The generation of the park intent this manager has in the backend, if any.
+
+    The manager's mirror of one piece of backend state, kept so the invariant
+    *an intent exists only while that park is outstanding* is enforceable from
+    here: the manager is the only installer, so it is the only thing that can
+    know an intent is owed a removal. ``None`` means no intent of ours is
+    installed, and the removal path is then free -- which matters because a
+    resolve activation is the ordinary live-delivery path, not a rare one.
+    """
 
     def __post_init__(self) -> None:
         self._has_room.set()
@@ -359,6 +383,13 @@ class StreamSubscriptionManager:
         # directly.
         self._loop = asyncio.get_event_loop()
         self._shutting_down = False
+        #: Whether the sweep has already run, so `shutdown` can tell "nobody
+        #: swept" -- which it must then do itself -- from "already swept".
+        self._swept = False
+        #: What the probe phase heard, per Run. Recorded rather than acted on,
+        #: because the two halves of the sweep belong at different points of the
+        #: Worker's shutdown -- see `probe_runs`.
+        self._probed: dict[str, str] = {}
 
     # --- registration -------------------------------------------------------
 
@@ -632,6 +663,7 @@ class StreamSubscriptionManager:
                     run_id=run_id,
                 ),
             )
+            subscription.installed_park_generation = park_generation
 
         became_ready = False
         for subscription in subscriptions:
@@ -646,10 +678,61 @@ class StreamSubscriptionManager:
             # would lose that member's record until a producer happened to
             # signal, so every intent installed above comes back out.
             for subscription in subscriptions:
-                await subscription.backend.remove_park_intent(
-                    subscription.stream_key, subscription.wait_id
-                )
+                await self._remove_park_intent(subscription)
         return became_ready
+
+    async def resolve_park(self, run_id: str) -> None:
+        """Removes the intents of a park this Run is no longer sitting in.
+
+        The other half of :meth:`prepare_park`, and the reason the invariant is
+        stated as *an intent exists only while that park is outstanding* rather
+        than as "an aborted park cleans up after itself". An aborted park was
+        only ever the cheaper half: a **confirmed** park ends too, when a wake
+        Signal or a fresh quiescent snapshot clears Core's ``park_generation``,
+        and Core's own state moving on is not something the backend can observe.
+
+        A left-behind intent is not inert, because it is the answer
+        ``current_park_generation`` gives to everyone who asks:
+
+        - a **producer** reads it to decide what its wake Signal names, and a
+          dead generation is precisely the claim Core is designed to discard as
+          stale -- so the producer appends, signals, and the Workflow is never
+          woken by it;
+        - the **shutdown sweep** reads it through the same call, and would send a
+          parked wake where P20 requires the unparked one (ADR-023). Worse than
+          useless there: a parked wake's request ID deliberately ignores sender
+          identity, so it comes out identical to the wake that already resolved
+          that generation and the server deduplicates it away.
+
+        Driven by ``ResolveExternalStreamWaits``, which is Core telling this
+        Worker the wait set has moved on -- the one event that covers both ways a
+        confirmed park ends, and the aborted-in-Core-but-confirmed-in-lang case
+        the recheck cannot see either.
+
+        Failure is logged rather than raised. The removal is cleanup, and turning
+        a momentary backend blip into a failed Workflow Task on the *delivery*
+        path would trade a stale intent for a repeated Workflow Task. The
+        generation stays recorded, so the next resolve retries it.
+        """
+        for subscription in self.subscriptions(run_id):
+            try:
+                await self._remove_park_intent(subscription)
+            except Exception:
+                logger.exception(
+                    "Failed removing the resolved park intent for %s wait %s; "
+                    "it will be retried when this Run's waits next resolve",
+                    subscription.stream_key,
+                    subscription.wait_id,
+                )
+
+    async def _remove_park_intent(self, subscription: Subscription) -> None:
+        """Removes one installed intent, and forgets it only once it is gone."""
+        if subscription.installed_park_generation is None:
+            return
+        await subscription.backend.remove_park_intent(
+            subscription.stream_key, subscription.wait_id
+        )
+        subscription.installed_park_generation = None
 
     async def prepare_replay(self, run_id: str, replay_annotation: bytes) -> ReplayPlan:
         """Reads and validates every recorded range, before any delivery.
@@ -711,19 +794,78 @@ class StreamSubscriptionManager:
         for subscription in self._runs.pop(run_id, {}).values():
             await self._stop(subscription)
 
-    async def shutdown(self, *, grace: timedelta = DEFAULT_SHUTDOWN_GRACE) -> None:
-        """Sweeps every Run that still holds subscriptions, then tears down.
+    async def probe_runs(self, *, grace: timedelta = DEFAULT_PROBE_GRACE) -> None:
+        """Records what state Core says each Run is in. The sweep's first half.
 
-        Per-Run teardown is normally eviction's job, and this is the backstop for
-        Runs eviction never reaches -- an idle cached Run gets no eviction
-        activation at shutdown at all, which is exactly the Run that most needs
-        the sweep: its records are buffered in a process that is about to exit,
-        and nothing else will ever tell the Workflow they arrived.
+        Separated from the wakes because the two halves have opposite timing
+        requirements, and running them together means one of them is wrong:
 
-        Shutdown is never blocked past ``grace``. A wake that could not be
-        acknowledged in time is reported rather than dropped, and never counted
-        as delivered.
+        - the **probe** has to be asked while Core can still answer it. Its whole
+          value is telling ``WftOpen``, ``Parked`` and ``NoOpenWorkflowTask``
+          apart, and all three are statements about a Run Core still holds. Core
+          keeps them only until the Worker's shutdown is initiated: an idle
+          cached Run has no pending work, so ``shutdown_done`` is satisfied by
+          the very first input after the shutdown token is cancelled and the
+          whole workflow-state lane ends. Every probe after that answers
+          ``RunNotFound`` -- which still owes a wake, so the sweep goes on
+          looking correct while its ``Parked`` branch (a Run that needs no wake
+          at all) and its ``WftOpen`` branch (a Run that must be left to C15b
+          rather than raced) have silently stopped being reachable.
+        - the **wakes** must not run there. Sending them before the pollers stop
+          would offer the Run to a task queue this Worker is still polling, which
+          is the opposite of a hand-off, and would hold the stop-polling step
+          open for as long as the server takes to acknowledge them.
+
+        So this runs immediately *before* shutdown is initiated and does nothing
+        but ask and remember, and :meth:`sweep` acts on the answers afterwards.
+        The one thing that costs: a Run recorded as ``NoOpenWorkflowTask`` here
+        may still pick up a Workflow Task from an in-flight poll before the
+        pollers stop, and would then get both C15b's forced replacement and this
+        sweep's wake. That is one extra empty Workflow Task, which this design
+        permits, and it is the cheaper side of the trade -- the alternative is
+        never distinguishing the states at all.
+
+        Bounded by ``grace`` because nothing may make stopping the pollers wait
+        indefinitely. Every Run left unprobed is simply probed again by the
+        sweep, where the answer is whatever Core has left to say.
         """
+        probe = self._run_status
+        if probe is None:
+            return
+        try:
+            await asyncio.wait_for(self._probe_runs(probe), grace.total_seconds())
+        except asyncio.TimeoutError:
+            logger.warning(
+                "External stream shutdown probe did not finish within %s; the "
+                "Runs it did not reach are swept on whatever Core can still say",
+                grace,
+            )
+
+    async def _probe_runs(self, probe: RunStatusProbe) -> None:
+        for run_id in list(self._runs):
+            if not self._runs.get(run_id):
+                continue
+            try:
+                self._probed[run_id] = _status_value(await probe(run_id))
+            except Exception:
+                logger.exception(
+                    "External stream shutdown probe failed for run %s", run_id
+                )
+
+    async def sweep(self, *, grace: timedelta = DEFAULT_SHUTDOWN_GRACE) -> None:
+        """Sends the wakes the probe found owed. The sweep's second half.
+
+        Separate from :meth:`shutdown` so teardown can stay where it belongs --
+        after every activation has been answered, so per-Run teardown remains
+        driven by ``RemoveFromCache`` and a ``FinalizeExternalStreams`` in flight
+        is answered before the Run's state disappears.
+
+        Never blocked past ``grace``. A wake that could not be acknowledged in
+        time is reported rather than dropped, and never counted as delivered.
+        """
+        if self._swept:
+            return
+        self._swept = True
         self._shutting_down = True
         try:
             await asyncio.wait_for(self._sweep(), grace.total_seconds())
@@ -733,11 +875,22 @@ class StreamSubscriptionManager:
                 "tearing down anyway",
                 grace,
             )
+
+    async def shutdown(self, *, grace: timedelta = DEFAULT_SHUTDOWN_GRACE) -> None:
+        """Sweeps every Run that still holds subscriptions, then tears down.
+
+        Per-Run teardown is normally eviction's job, and this is the backstop for
+        Runs eviction never reaches -- an idle cached Run gets no eviction
+        activation at shutdown at all, which is exactly the Run that most needs
+        the sweep: its records are buffered in a process that is about to exit,
+        and nothing else will ever tell the Workflow they arrived.
+        """
+        await self.sweep(grace=grace)
         for run_id in list(self._runs):
             await self.evict_run(run_id)
 
     async def _sweep(self) -> None:
-        """Asks each Run's state and owes a wake only where one is owed.
+        """Acts on each Run's state and owes a wake only where one is owed.
 
         The probe is deliberately **not** the readiness call. Readiness means "a
         record is buffered", so probing with it would assert something false and
@@ -750,13 +903,20 @@ class StreamSubscriptionManager:
             subscriptions = list(self._runs.get(run_id, {}).values())
             if not subscriptions:
                 continue
-            try:
-                status = _status_value(await self._run_status(run_id))
-            except Exception:
-                logger.exception(
-                    "External stream shutdown probe failed for run %s", run_id
-                )
-                continue
+            status = self._probed.pop(run_id, None)
+            if status is None:
+                # Not probed while Core could still answer -- either nothing ran
+                # the probe phase, or this Run was cached from an in-flight poll
+                # after it. Ask anyway rather than guessing: the answer is
+                # whatever Core has left to say, and both answers it can still
+                # give owe a wake.
+                try:
+                    status = _status_value(await self._run_status(run_id))
+                except Exception:
+                    logger.exception(
+                        "External stream shutdown probe failed for run %s", run_id
+                    )
+                    continue
 
             if status == RunStatus.WFT_OPEN:
                 # A Workflow Task is open and Core owns what happens to it

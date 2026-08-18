@@ -91,13 +91,17 @@ class ReplayPlan:
         """Where this marker left each wait it recorded anything for.
 
         What live delivery has to resume from once replay has handed the
-        recorded ranges over. The terminal is the authority where there is one,
-        but **a marker does not always have one**: Core asks for a terminal only
-        when it decides the boundary itself, so a Workflow Task that completed
-        carrying server-bound commands -- a timer, an activity -- writes its
-        marker without one. Falling back to the last recorded delivery per wait
-        is not an approximation; both name the last record the Workflow Task
-        handed over.
+        recorded ranges over. The terminal is the authority, and every marker
+        has one: Core asks for a terminal on the boundaries it decides, and the
+        completion path supplies one on the boundaries Python decides -- a
+        Workflow Task that ended carrying server-bound commands included
+        (ADR-008).
+
+        The fallback to the last recorded delivery per wait is kept for a marker
+        that somehow arrives without one, and it is not an approximation: both
+        name the last record the Workflow Task handed over. What only the
+        terminal can say is where a wait that received *nothing* in its final
+        activation stopped.
 
         A wait the marker recorded nothing for is deliberately absent rather
         than mapped to its start cursor. Nothing was delivered for it, so there

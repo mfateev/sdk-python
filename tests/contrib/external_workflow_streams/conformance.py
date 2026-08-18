@@ -566,6 +566,41 @@ async def check_the_current_generation_is_readable(
     assert await backend.current_park_generation(key, 1) == 7
 
 
+async def check_a_removed_intent_reports_no_generation(
+    backend: StreamBackend, key: StreamKey
+) -> None:
+    """Removing an intent is what ends a park, so it must end what readers see.
+
+    The rule the consumer relies on is *an intent exists only while that park is
+    outstanding*, and the consumer can only hold up its half of it -- installing
+    one when a park is confirmed and removing it when the park is over. The
+    provider's half is that removal is visible through
+    ``current_park_generation``, which is the call every wake path asks and the
+    only thing that distinguishes a live park from none.
+
+    A provider that answered from a remembered "last generation" beside the
+    intent would pass every other check here and still break both readers, in
+    the same direction and invisibly. A producer would name a generation Core
+    has already discarded, and Core ignores exactly that as stale -- so the
+    record is appended, the Signal is sent, and the Workflow is never woken. The
+    consumer's own shutdown sweep would send a parked wake where it owes the
+    unparked one, and a parked wake's request ID ignores sender identity by
+    design, so it arrives byte-identical to the wake that ended the park and the
+    server deduplicates it away.
+    """
+    await backend.install_park_intent(
+        key, ParkIntent(1, BEGINNING, park_generation=4, run_id="run-a")
+    )
+    assert await backend.current_park_generation(key, 1) == 4
+
+    await backend.remove_park_intent(key, 1)
+
+    assert await backend.current_park_generation(key, 1) is None, (
+        "a removed park intent still reports a generation; a wake naming it is "
+        "a claim of a park that is over, which Core discards as stale"
+    )
+
+
 async def check_a_claim_excludes_a_second_producer(
     backend: StreamBackend, key: StreamKey
 ) -> None:
@@ -673,6 +708,7 @@ PARKING_CONFORMANCE_CHECKS: list[Check] = [
     check_recheck_sees_an_append_past_the_cursor,
     check_recheck_of_a_removed_intent_is_false,
     check_the_current_generation_is_readable,
+    check_a_removed_intent_reports_no_generation,
     check_a_claim_excludes_a_second_producer,
     check_a_claim_is_renewable_by_its_holder,
     check_an_expired_claim_is_taken_over,

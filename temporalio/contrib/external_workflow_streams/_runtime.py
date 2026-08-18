@@ -166,6 +166,12 @@ class WorkflowStreamRuntime:
         #: replay of that marker would then never deliver it.
         self._annotation_start: dict[int, Cursor] = {}
         self._accumulator: AnnotationAccumulator | None = None
+        #: Whether this Workflow Task's annotation has already been closed with
+        #: its terminal. Distinct from "no accumulator": one means nothing has
+        #: been written yet and a terminal must create the header for it, the
+        #: other that the annotation is finished and a second terminal would
+        #: append a whole second annotation to the marker.
+        self._annotation_closed = False
         self._pending_deltas: list[bytes] = []
         #: Runs recorded since the current segment opened, in delivery order.
         self._runs: list[Run] = []
@@ -532,7 +538,18 @@ class WorkflowStreamRuntime:
         stream is now", it is where this task's deliveries stopped, which was
         fixed the moment the last activation returned. Refreshing it against the
         backend could name a position replay must not reproduce.
+
+        Returns **no bytes at all** when this Workflow Task's annotation is
+        already closed and nothing has been accumulated since. Core can decide a
+        boundary for a task whose last completion had already ended one -- a
+        rollover deadline or a shutdown landing on a completion that left no
+        subscription blocked -- and answering with a second header and terminal
+        would append a whole second annotation to the one Core is about to
+        write. The marker would then decode as far as the first terminal and
+        fail on the frame after it.
         """
+        if self._annotation_closed and self._accumulator is None:
+            return b""
         accumulator = self._ensure_accumulator()
         terminal = accumulator.add_terminal(
             {
@@ -552,7 +569,20 @@ class WorkflowStreamRuntime:
         # appending past it: Core writes one marker per finalized annotation, and
         # a segment recorded after the terminal could never be read back.
         self.start_new_annotation()
+        self._annotation_closed = True
         return delta
+
+    @property
+    def annotation_started(self) -> bool:
+        """Whether Core is holding accumulated bytes for the current annotation.
+
+        True from the moment the header is emitted, which is what makes it the
+        right question to ask before closing an annotation with its terminal: an
+        annotation nobody has begun has nothing to terminate, and asking for a
+        terminal anyway would create a header and a terminal for a Workflow Task
+        that never touched a stream.
+        """
+        return self._accumulator is not None
 
     @property
     def request_rollover(self) -> bool:
@@ -567,6 +597,7 @@ class WorkflowStreamRuntime:
         other Workflow Task boundary.
         """
         self._accumulator = None
+        self._annotation_closed = False
         self._pending_deltas = []
         self._runs = []
         self._observed_this_activation = False

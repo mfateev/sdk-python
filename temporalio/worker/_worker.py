@@ -894,6 +894,20 @@ class Worker:
             f"Beginning worker shutdown, will wait {graceful_timeout} before cancelling activities"
         )
 
+        # Ask Core what state each streaming Run is in, before shutdown is
+        # initiated. This is the first half of P20's sweep and it has to be here:
+        # an idle cached Run has no pending work, so Core's workflow-state lane
+        # finishes on the first input after the shutdown token is cancelled, and
+        # every Run-status probe from then on answers RunNotFound. That answer
+        # owes a wake just as NoOpenWorkflowTask does, so a sweep that probes
+        # later still sends its wake and still looks correct -- while Parked (no
+        # wake needed) and WftOpen (C15b's, not ours to race) stop being
+        # reachable answers at all. Only the asking happens here; the wakes go
+        # out below, once the pollers have stopped, because offering a Run to a
+        # task queue this Worker is still polling is not a hand-off.
+        if self._workflow_worker:
+            await self._workflow_worker.probe_external_stream_runs()
+
         # Initiate core worker shutdown
         self._bridge_worker.initiate_shutdown()
 
@@ -927,17 +941,20 @@ class Worker:
         if self._nexus_worker:
             await self._nexus_worker.wait_all_completed()
 
-        # Sweep and tear down external stream subscriptions. This is P20's
-        # obligation and it happens here rather than inside the workflow
-        # worker's poll loop because both shutdown paths have to reach it: the
-        # poll drain above only replaces a worker task whose run() raised, so a
-        # clean shutdown would otherwise leave every Run registered, its
-        # watchers running, and its owed wake Signals unsent.
+        # Send the wakes the probe above found owed, then tear down external
+        # stream subscriptions. This is the second half of P20's obligation and
+        # it happens here rather than inside the workflow worker's poll loop
+        # because both shutdown paths have to reach it: the poll drain above only
+        # replaces a worker task whose run() raised, so a clean shutdown would
+        # otherwise leave every Run registered, its watchers running, and its
+        # owed wake Signals unsent.
         #
         # After the wait above, so per-Run teardown stays driven by
         # RemoveFromCache: every activation, eviction included, has been
-        # answered by now. Before finalize_shutdown, because the sweep's
-        # read-only Run-status probe still needs the bridge worker.
+        # answered by now, so a FinalizeExternalStreams in flight was answered
+        # before the manager's state for that Run disappears. Before
+        # finalize_shutdown, because a Run the probe phase never reached is
+        # probed here and that still needs the bridge worker.
         if self._workflow_worker:
             await self._workflow_worker.shutdown_external_streams()
 
