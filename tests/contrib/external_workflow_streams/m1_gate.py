@@ -28,9 +28,9 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-#: The plan lives in the vendored Core checkout, which is the same branch the
-#: Core-side work is on. Reading it from there rather than from a copy is what
-#: makes the count check meaningful -- a copy would drift silently.
+#: The required-test lists live in the vendored Core checkout, which is the same
+#: branch the Core-side work is on. Reading them from there rather than from a
+#: copy is what makes the count check meaningful -- a copy would drift silently.
 PLAN_DIR = (
     Path(__file__).resolve().parents[3]
     / "temporalio"
@@ -38,7 +38,7 @@ PLAN_DIR = (
     / "sdk-core"
     / "arch_docs"
     / "streaming-poc-docs"
-    / "plan"
+    / "required-tests"
 )
 
 TESTS_DIR = Path(__file__).resolve().parent

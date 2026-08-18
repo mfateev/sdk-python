@@ -635,13 +635,18 @@ class WorkflowStreamRuntime:
     def continuation(self) -> Continuation:
         """Where each subscription had got to, for the successor Run.
 
-        The **delivery** cursor, not the prefetch cursor: prefetch is
-        speculative, and starting the new Run past records this one never handed
-        to Workflow code would drop them silently. Not the committed cursor
-        either -- by the time this is read the terminal command is being built,
-        and the observation delta covering these deliveries is committed on that
-        same path (C14b). A continuation taken from the last *marker* would
-        restart the successor at a stale cursor, losing the final segment.
+        The **consumption** cursor, which is the only one of the four positions
+        a successor may resume from.
+
+        Not prefetch, which is speculative. Not delivery: a batch is delivered
+        whole, but a Workflow that stops iterating part-way through has taken
+        only its prefix, and the buffer holding the difference dies with this
+        Run -- so a successor starting from delivery would step silently over
+        records nothing ever showed to Workflow code. Not the committed cursor
+        either: by the time this is read the terminal command is being built,
+        and the observation delta covering these deliveries commits on that same
+        path, so a continuation taken from the last *marker* would restart the
+        successor at a stale cursor and lose the final segment.
         """
         return Continuation(
             cursors={
