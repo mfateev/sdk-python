@@ -27,7 +27,15 @@ from temporalio import workflow
 from temporalio.client import Client
 from temporalio.contrib.external_workflow_streams._annotation import decode_annotation
 from temporalio.contrib.external_workflow_streams._backend import StreamKey
-from temporalio.contrib.external_workflow_streams._record import AFTER, Cursor
+from temporalio.contrib.external_workflow_streams._manager import (
+    ReadinessResult,
+    StreamSubscriptionManager,
+)
+from temporalio.contrib.external_workflow_streams._record import (
+    AFTER,
+    BEGINNING,
+    Cursor,
+)
 from temporalio.worker import Worker
 from tests.contrib.external_workflow_streams.memory_backend import MemoryStreamBackend
 from tests.contrib.external_workflow_streams.test_worker_integration import publish
@@ -827,3 +835,100 @@ async def test_a_finalization_that_cannot_be_answered_writes_no_marker(
         if not worker_a_task.done():
             worker_a_task.cancel()
         await asyncio.sleep(0)
+
+
+# --- the intent the Worker that installed it left behind -----------------------
+
+
+HANDOFF_RUN_ID = "run-handed-over"
+
+
+def _manager_for(backend: MemoryStreamBackend) -> StreamSubscriptionManager:
+    """One Worker's manager, wired with only what the park handshake touches.
+
+    No Core and no Signal path: what is under test here is state that lives in
+    the *backend* and outlives both.
+    """
+
+    async def accepted(run_id: str, wait_id: int, generation: int) -> str:
+        return ReadinessResult.ACCEPTED
+
+    return StreamSubscriptionManager(
+        backends={"tokens-memory": backend},
+        notify_ready=accepted,
+        watch_block=timedelta(milliseconds=10),
+    )
+
+
+async def _nothing_is_parked(backend: MemoryStreamBackend, key: StreamKey) -> bool:
+    return await backend.parked_wait_ids(key) == []
+
+
+async def test_a_park_intent_installed_by_a_previous_worker_is_removed(
+    backend: MemoryStreamBackend,
+) -> None:
+    """The half of the intent invariant that only a hand-off can show.
+
+    ``installed_park_generation`` is a *mirror* of backend state and lives on
+    the Worker that installed the park. The intent is durable and survives
+    eviction, a Workflow Task that moved to another Worker, and shutdown; the
+    mirror survives none of them. So removal keyed on the mirror alone cannot
+    reach exactly the intents that most need reaching -- the ones whose
+    installer is gone -- and the Run is then stranded in a way no later resolve
+    can repair: ``current_park_generation`` keeps answering a generation Core
+    discarded, every producer wake names it and Core discards it as stale, and
+    because a parked wake's request ID ignores sender identity the second such
+    wake is byte-identical to the first and the server deduplicates it away.
+
+    The ordering is the real Worker's: ``ResolveExternalStreamWaits`` is
+    answered *before* user Workflow code runs, so the new Worker has no
+    subscription to resolve against at that point and the reconstructed one
+    arrives afterwards.
+    """
+    key = StreamKey("ns", "wf", "first-run", "tokens")
+
+    worker_a = _manager_for(backend)
+    worker_a.register(
+        run_id=HANDOFF_RUN_ID, wait_id=1, stream_key=key, backend_name="tokens-memory"
+    )
+    confirmed = not await worker_a.prepare_park(HANDOFF_RUN_ID, 7, {1: BEGINNING})
+    assert confirmed, "nothing was appended, so this park must have confirmed"
+    await worker_a.shutdown()
+
+    assert await backend.parked_wait_ids(key) == [1], (
+        "this case is only meaningful if the intent outlived the Worker that "
+        "installed it -- it is durable backend state, not Worker state"
+    )
+
+    worker_b = _manager_for(backend)
+    try:
+        await worker_b.resolve_park(HANDOFF_RUN_ID)
+        worker_b.register(
+            run_id=HANDOFF_RUN_ID,
+            wait_id=1,
+            stream_key=key,
+            backend_name="tokens-memory",
+        )
+
+        await wait_until(
+            lambda: _nothing_is_parked(backend, key),
+            5,
+            "the intent of a park no Worker is sitting in is still installed, "
+            "so the next producer wake names a dead generation instead of the "
+            "unparked wake it owes",
+            interval=0.01,
+        )
+        assert await backend.current_park_generation(key, 1) is None, (
+            "a park that ended with the Worker that confirmed it still reports "
+            "a generation"
+        )
+
+        # What the producer actually asks, in the order it asks it: the record
+        # lands, and then the wake is chosen from what the backend says is
+        # parked. Nothing is, so it is the unparked wake -- which Core always
+        # accepts as a recheck request -- rather than generation 7, which it
+        # discards as stale.
+        await publish(backend, key, ["beta"], session=f"handoff-{uuid.uuid4()}")
+        assert await backend.parked_wait_ids(key) == []
+    finally:
+        await worker_b.shutdown()

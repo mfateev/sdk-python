@@ -412,6 +412,10 @@ class StreamSubscriptionManager:
         #: because the two halves of the sweep belong at different points of the
         #: Worker's shutdown -- see `probe_runs`.
         self._probed: dict[str, str] = {}
+        #: One Run's park-intent work, serialized. See `_park_lock`.
+        self._park_locks: dict[str, asyncio.Lock] = {}
+        #: Strong references to the in-flight registration-time reconciliations.
+        self._reconciliations: set[asyncio.Task[None]] = set()
 
     # --- registration -------------------------------------------------------
 
@@ -462,10 +466,115 @@ class StreamSubscriptionManager:
             watcher.cancel()
 
     def _start_watcher(self, subscription: Subscription) -> None:
-        """Starts a watcher on the manager's own loop."""
+        """Starts a watcher, and reconciles the park state it inherited.
+
+        Both on the manager's own loop, because both are `create_task` calls and
+        `register` runs on the Workflow executor thread.
+        """
         if subscription._cancelled or subscription._watcher is not None:
             return
+        reconcile = self._loop.create_task(self._reconcile_inherited_park(subscription))
+        # Held, because the loop keeps only a weak reference to a running task:
+        # an unreferenced one can be collected mid-await, and this one's whole
+        # job is a backend round trip.
+        self._reconciliations.add(reconcile)
+        reconcile.add_done_callback(self._reconciliations.discard)
         subscription._watcher = self._loop.create_task(self._watch(subscription))
+
+    async def _reconcile_inherited_park(self, subscription: Subscription) -> None:
+        """Removes a park intent this Worker inherited rather than installed.
+
+        `installed_park_generation` is a *mirror* of backend state, and it lives
+        on the Worker that installed the park. The intent it mirrors is durable:
+        it survives eviction, a Workflow Task that moved to another Worker, and
+        shutdown, all of which take the mirror with them. Removal keyed on the
+        mirror alone therefore cannot reach the one class of intent that most
+        needs reaching -- the intents whose installer is gone -- and no later
+        resolve can repair it, because the resolve looks at the same empty
+        mirror.
+
+        Registration is where a Worker learns such an intent exists, and it is
+        also the moment its status is unambiguous. A subscription is registered
+        by user Workflow code running, and no user code runs inside a park
+        (`wft-lifecycle.md`), so an intent found here belongs to a park that is
+        over: the Core that confirmed it has either moved on or gone with the
+        Worker that held it. What leaving it costs is the invariant's whole
+        point -- `current_park_generation` keeps answering a generation Core has
+        discarded, every producer wake names that generation and Core discards
+        it as stale, and because a parked wake's request ID ignores sender
+        identity the second such wake is byte-identical to the first and the
+        server deduplicates it away. The Workflow then waits forever on a record
+        that is durably present.
+
+        Best-effort for the same reason :meth:`resolve_park` is: this is the
+        registration path of a Run that is already running, and a momentary
+        backend failure here must not fail a Workflow Task. The next
+        registration -- the next eviction and pick-up -- asks again.
+        """
+        async with self._park_lock(subscription.run_id):
+            if (
+                subscription._cancelled
+                or subscription.installed_park_generation is not None
+            ):
+                # A park confirmed since this was scheduled is *this* manager's,
+                # and `resolve_park` owns it. Removing it here would take the
+                # intent out from under a park that really is outstanding.
+                return
+            try:
+                inherited = await subscription.backend.park_intent(
+                    subscription.stream_key, subscription.wait_id
+                )
+                if inherited is None:
+                    # The ordinary case, and the reason this is a read before it
+                    # is a write: a Run that never parked owes the backend
+                    # nothing.
+                    return
+                if (
+                    subscription._cancelled
+                    or subscription.installed_park_generation is not None
+                ):
+                    # Asked again across the read, because this Run's state can
+                    # have moved on entirely while it was in flight: evicted and
+                    # picked up again, with a *new* park confirmed for the same
+                    # key. Removing what was found before that would strand the
+                    # park that replaced it.
+                    return
+                logger.info(
+                    "Removing an inherited external stream park intent for %s "
+                    "wait %s: park generation %s was confirmed by a Worker that "
+                    "no longer holds this Run",
+                    subscription.stream_key,
+                    subscription.wait_id,
+                    inherited.park_generation,
+                )
+                await subscription.backend.remove_park_intent(
+                    subscription.stream_key, subscription.wait_id
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Failed removing an inherited park intent for %s wait %s; "
+                    "it will be retried the next time this wait is registered",
+                    subscription.stream_key,
+                    subscription.wait_id,
+                )
+
+    def _park_lock(self, run_id: str) -> asyncio.Lock:
+        """Serializes one Run's park-intent work on the manager's loop.
+
+        The install/recheck handshake, the resolve, and the reconciliation above
+        all read-then-write the same `(stream key, wait_id)` objects, and the
+        reconciliation is scheduled from another thread, so their interleaving
+        is not otherwise constrained. Without this, a reconciliation that
+        overlapped a confirming park could remove the intent that park had just
+        installed -- an unwakeable Run produced by the very code that exists to
+        prevent one.
+        """
+        lock = self._park_locks.get(run_id)
+        if lock is None:
+            lock = self._park_locks[run_id] = asyncio.Lock()
+        return lock
 
     def subscription(self, run_id: str, wait_id: int) -> Subscription | None:
         return self._runs.get(run_id, {}).get(wait_id)
@@ -748,42 +857,124 @@ class StreamSubscriptionManager:
         Returns ``True`` if any stream became ready, which abandons this parking
         generation.
 
+        ``blocked`` **is the park set**, not a lookup table beside one: its keys
+        are the waits Core asked to park, taken from
+        ``PrepareExternalStreamPark.waits``, and its values are their cursor
+        boundaries. The manager's own registration list is a superset -- a
+        subscription that delivered a record and was not awaited again is
+        registered and not blocked -- and parking the superset is wrong in both
+        directions. A recheck for a wait outside the set finds records nothing
+        is waiting on and aborts a legitimate park, which then runs again on the
+        next idle timeout and aborts again; and an intent installed for a wait
+        outside the set is an intent with no park behind it, which is exactly
+        what `backend-contract.md` forbids leaving in a backend.
+
         The order is what closes the append/park race: a producer appends its
         record *before* it observes the park generation, so an append is either
         seen by the recheck below or paired with a wake Signal. Rechecking
         before all the intents were installed would leave a window where it is
         neither.
         """
-        subscriptions = self.subscriptions(run_id)
-        for subscription in subscriptions:
-            await subscription.backend.install_park_intent(
-                subscription.stream_key,
-                ParkIntent(
-                    wait_id=subscription.wait_id,
-                    cursor=blocked.get(
-                        subscription.wait_id, subscription.delivery_cursor
-                    ),
-                    park_generation=park_generation,
-                    run_id=run_id,
-                ),
-            )
-            subscription.installed_park_generation = park_generation
+        async with self._park_lock(run_id):
+            return await self._prepare_park(run_id, park_generation, blocked)
 
-        became_ready = False
-        for subscription in subscriptions:
-            if await subscription.backend.recheck(
-                subscription.stream_key, subscription.wait_id
-            ):
-                became_ready = True
-                break
+    async def _prepare_park(
+        self, run_id: str, park_generation: int, blocked: Mapping[int, Cursor]
+    ) -> bool:
+        """The handshake itself, under this Run's park lock."""
+        subscriptions = [
+            subscription
+            for subscription in self.subscriptions(run_id)
+            if subscription.wait_id in blocked
+        ]
+        missing = set(blocked) - {s.wait_id for s in subscriptions}
+        if missing:
+            # Core is parking a wait this manager no longer holds. Nothing can
+            # be installed for it and there is nothing to recheck; a producer on
+            # that stream finds no intent and sends the unparked wake, which
+            # Core accepts as a recheck request (ADR-023).
+            logger.warning(
+                "Core asked run %s to park waits %s, which this Worker does not "
+                "hold; they are left out of the park set",
+                run_id,
+                sorted(missing),
+            )
+
+        installed: list[Subscription] = []
+        try:
+            for subscription in subscriptions:
+                await subscription.backend.install_park_intent(
+                    subscription.stream_key,
+                    ParkIntent(
+                        wait_id=subscription.wait_id,
+                        cursor=blocked[subscription.wait_id],
+                        park_generation=park_generation,
+                        run_id=run_id,
+                    ),
+                )
+                subscription.installed_park_generation = park_generation
+                installed.append(subscription)
+
+            became_ready = False
+            for subscription in subscriptions:
+                if await subscription.backend.recheck(
+                    subscription.stream_key, subscription.wait_id
+                ):
+                    became_ready = True
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A park that failed part-way through is still a park every producer
+            # can see. The activation fails and Core confirms nothing, so those
+            # intents describe a park that does not exist -- and an eviction then
+            # takes the local mirror away while they stay. Rolling back is what
+            # keeps "all-or-nothing across the set" true of the failure path too.
+            # Removal failures are swallowed: the storage error that got here is
+            # the one worth reporting, and anything still installed stays owed
+            # through `installed_park_generation` for the next resolve to retry.
+            await self._withdraw_park(installed)
+            raise
 
         if became_ready:
             # All-or-nothing: a park confirmed for a set with a ready member
             # would lose that member's record until a producer happened to
             # signal, so every intent installed above comes back out.
-            for subscription in subscriptions:
-                await self._remove_park_intent(subscription)
+            failures = await self._withdraw_park(installed)
+            if failures:
+                # Nothing may report `became_ready` while an intent for that
+                # generation is still installed. Failing the activation retries
+                # the whole Workflow Task, which commits no cursor and loses no
+                # record; the removal stays owed either way.
+                raise failures[0]
         return became_ready
+
+    async def _withdraw_park(
+        self, subscriptions: list[Subscription]
+    ) -> list[Exception]:
+        """Takes every intent one attempted park installed back out.
+
+        Total: every subscription is attempted whatever the others do, because a
+        rollback that stopped at its first failure would leave behind exactly
+        the orphans it exists to prevent. The failures are returned rather than
+        raised so each caller can decide which error is the one worth reporting.
+        """
+        failures: list[Exception] = []
+        for subscription in subscriptions:
+            try:
+                await self._remove_park_intent(subscription)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                logger.exception(
+                    "Failed removing the park intent for %s wait %s while "
+                    "withdrawing an unconfirmed park; it stays owed and the "
+                    "next resolve retries it",
+                    subscription.stream_key,
+                    subscription.wait_id,
+                )
+                failures.append(err)
+        return failures
 
     async def resolve_park(self, run_id: str) -> None:
         """Removes the intents of a park this Run is no longer sitting in.
@@ -808,6 +999,12 @@ class StreamSubscriptionManager:
           identity, so it comes out identical to the wake that already resolved
           that generation and the server deduplicates it away.
 
+        This is the half for parks *this* manager installed, and it is only
+        half. An intent whose installer is gone -- evicted, moved to another
+        Worker, shut down -- leaves no mirror here to remove it by, and is taken
+        out by :meth:`_reconcile_inherited_park` when the wait is registered
+        again instead.
+
         Driven by ``ResolveExternalStreamWaits``, which is Core telling this
         Worker the wait set has moved on -- the one event that covers both ways a
         confirmed park ends, and the aborted-in-Core-but-confirmed-in-lang case
@@ -818,16 +1015,17 @@ class StreamSubscriptionManager:
         path would trade a stale intent for a repeated Workflow Task. The
         generation stays recorded, so the next resolve retries it.
         """
-        for subscription in self.subscriptions(run_id):
-            try:
-                await self._remove_park_intent(subscription)
-            except Exception:
-                logger.exception(
-                    "Failed removing the resolved park intent for %s wait %s; "
-                    "it will be retried when this Run's waits next resolve",
-                    subscription.stream_key,
-                    subscription.wait_id,
-                )
+        async with self._park_lock(run_id):
+            for subscription in self.subscriptions(run_id):
+                try:
+                    await self._remove_park_intent(subscription)
+                except Exception:
+                    logger.exception(
+                        "Failed removing the resolved park intent for %s wait %s; "
+                        "it will be retried when this Run's waits next resolve",
+                        subscription.stream_key,
+                        subscription.wait_id,
+                    )
 
     async def _remove_park_intent(self, subscription: Subscription) -> None:
         """Removes one installed intent, and forgets it only once it is gone."""
@@ -940,6 +1138,7 @@ class StreamSubscriptionManager:
         speculative reads that were never committed.
         """
         self._replay_plans.pop(run_id, None)
+        self._park_locks.pop(run_id, None)
         for subscription in self._runs.pop(run_id, {}).values():
             await self._stop(subscription)
 

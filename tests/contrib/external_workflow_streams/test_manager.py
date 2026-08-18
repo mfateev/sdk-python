@@ -789,3 +789,155 @@ async def test_a_wake_failure_does_not_kill_the_watcher(
         assert subscription.wakes_owed >= 1, "the wake stays owed for the sweep"
     finally:
         await manager.shutdown()
+
+
+# --- the park handshake's wait set (P19) --------------------------------------
+#
+# One Core activation is constructed here, and only here. The set that gets
+# parked is decided in two places -- the Worker's job handler turns Core's
+# `PrepareExternalStreamPark.waits` into the map it hands over, and the manager
+# installs and rechecks against it -- so a test on either half alone cannot show
+# that the two agree on what Core asked for.
+
+
+def _park_job(run_id: str, quiescence_generation: int, *wait_ids: int):  # type: ignore[no-untyped-def]
+    """The activation Core sends to open a park handshake."""
+    from temporalio.bridge.proto.workflow_activation import WorkflowActivation
+
+    activation = WorkflowActivation()
+    activation.run_id = run_id
+    job = activation.jobs.add().prepare_external_stream_park
+    job.quiescence_generation = quiescence_generation
+    for wait_id in wait_ids:
+        job.waits.add().wait_id = wait_id
+    return activation
+
+
+class _StubRuntime:
+    """The runtime's half of the park path: cursors in, terminal out."""
+
+    def __init__(self, cursors: dict[int, Cursor]) -> None:
+        self._cursors = cursors
+        self.terminals = 0
+
+    def blocked_snapshot(self) -> dict[int, Cursor]:
+        return dict(self._cursors)
+
+    def add_terminal(self) -> bytes:
+        self.terminals += 1
+        return b"terminal"
+
+
+class _StubWorker:
+    """Only the two things ``_handle_external_stream_jobs`` reaches for."""
+
+    def __init__(self, run_id: str, runtime: _StubRuntime, manager: object) -> None:
+        self._external_stream_runtimes = {run_id: runtime}
+        self._manager = manager
+
+    def _stream_manager(self) -> object:
+        return self._manager
+
+
+@pytest.mark.asyncio
+async def test_the_park_set_is_cores_wait_set_and_not_every_registration() -> None:
+    """A registered subscription is not necessarily one Core is parking.
+
+    ``PrepareExternalStreamPark.waits`` is Core's complete *blocked* snapshot.
+    The runtime's own registration list is a superset of it: a subscription that
+    delivered a record and was not awaited again is registered and not blocked,
+    so it is absent from the quiescent snapshot Core parks.
+
+    Parking the superset is wrong in both directions. The recheck for a wait
+    Core is not parking finds that wait's records -- which is *not* news, since
+    nothing is waiting on them -- and aborts a park that was entirely
+    legitimate, so the Workflow Task never parks and the handshake runs again on
+    the next idle timeout, and again. And an intent installed for a wait outside
+    the park set is an intent with no park behind it, which is precisely the
+    thing `backend-contract.md` forbids leaving in a backend.
+    """
+    from temporalio.worker._workflow import _WorkflowWorker
+
+    backend = MemoryStreamBackend()
+    manager = make_manager(backend, RecordingNotifier())
+    parked = StreamKey("ns", "wf", "first-run", "tokens")
+    driving = StreamKey("ns", "wf", "first-run", "tool-events")
+    try:
+        manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=parked, backend_name="tokens"
+        )
+        manager.register(
+            run_id=RUN_ID, wait_id=2, stream_key=driving, backend_name="tokens"
+        )
+        # Wait 2 has a record sitting in it. Workflow code is not blocked on it,
+        # so it is not in the set Core asks to park.
+        await append(backend, driving, b"b")
+
+        runtime = _StubRuntime({1: BEGINNING, 2: BEGINNING})
+        worker = _StubWorker(RUN_ID, runtime, manager)
+        completion = await _WorkflowWorker._handle_external_stream_jobs(
+            worker,  # type: ignore[arg-type]
+            _park_job(RUN_ID, 4, 1),
+            None,  # type: ignore[arg-type]
+        )
+
+        assert completion is not None
+        result = completion.successful.commands[0].external_stream_park_result
+        assert result.WhichOneof("outcome") == "confirmed", (
+            "a wait Core is not parking aborted the park of the wait it is"
+        )
+        assert await backend.park_intent(parked, 1) is not None
+        assert await backend.park_intent(driving, 2) is None, (
+            "an intent was installed for a wait Core never asked to park, so a "
+            "producer on that stream reads a park generation nothing is sitting in"
+        )
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing", ["install", "recheck"])
+async def test_a_failed_park_leaves_no_externally_visible_half(failing: str) -> None:
+    """Parking is all-or-nothing, and a raised activation is not an exception to it.
+
+    Intents are installed one at a time, so any failure part-way through -- the
+    second install, or a recheck once every install has landed -- leaves the
+    completed ones visible to producers while the activation itself fails. Core
+    parks nothing, so those intents describe a park that does not exist; an
+    eviction then takes the local bookkeeping away and nothing can remove them
+    at all.
+    """
+
+    class Failing(MemoryStreamBackend):
+        async def install_park_intent(self, key, intent):  # type: ignore[no-untyped-def]
+            if failing == "install" and intent.wait_id == 2:
+                raise ConnectionError("backend unavailable")
+            return await super().install_park_intent(key, intent)
+
+        async def recheck(self, key, wait_id):  # type: ignore[no-untyped-def]
+            if failing == "recheck":
+                raise ConnectionError("backend unavailable")
+            return await super().recheck(key, wait_id)
+
+    backend = Failing()
+    manager = make_manager(backend, RecordingNotifier())
+    first = StreamKey("ns", "wf", "first-run", "tokens")
+    second = StreamKey("ns", "wf", "first-run", "tool-events")
+    try:
+        manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=first, backend_name="tokens"
+        )
+        manager.register(
+            run_id=RUN_ID, wait_id=2, stream_key=second, backend_name="tokens"
+        )
+
+        with pytest.raises(ConnectionError):
+            await manager.prepare_park(RUN_ID, 4, {1: BEGINNING, 2: BEGINNING})
+
+        assert await backend.parked_wait_ids(first) == [], (
+            "the park failed, and wait 1's intent is still in the backend "
+            "advertising a park Core never confirmed"
+        )
+        assert await backend.parked_wait_ids(second) == []
+    finally:
+        await manager.shutdown()

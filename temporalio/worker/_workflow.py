@@ -943,10 +943,26 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             return completion
 
         assert park is not None
+        # The set to park is **Core's**, not this Worker's registration list.
+        # `park.waits` is the complete blocked snapshot Core is holding the
+        # Workflow Task for; `blocked_snapshot()` is every subscription the
+        # runtime has registered, which is a superset -- a subscription that
+        # delivered a record and was not awaited again is registered and not
+        # blocked. Parking the superset rechecks a wait nothing is waiting on,
+        # so its records abort a park that was entirely legitimate and the
+        # handshake repeats on every idle timeout; and it installs an intent for
+        # a wait Core is not parking, which is an intent with no park behind it.
+        # The runtime supplies only the cursor boundary for each of Core's
+        # waits.
+        snapshot = runtime.blocked_snapshot()
         became_ready = await self._stream_manager().prepare_park(
             act.run_id,
             park.quiescence_generation,
-            runtime.blocked_snapshot(),
+            {
+                wait.wait_id: snapshot[wait.wait_id]
+                for wait in park.waits
+                if wait.wait_id in snapshot
+            },
         )
         command = completion.successful.commands.add()
         command.external_stream_park_result.quiescence_generation = (
