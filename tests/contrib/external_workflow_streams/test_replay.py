@@ -42,6 +42,7 @@ from temporalio.contrib.external_workflow_streams._manager import (
 from temporalio.contrib.external_workflow_streams._record import (
     AFTER,
     BEGINNING,
+    Cursor,
     Offset,
     RecordKind,
     StreamRecord,
@@ -50,6 +51,7 @@ from temporalio.contrib.external_workflow_streams._replay import (
     validate_run,
 )
 from tests.contrib.external_workflow_streams.memory_backend import MemoryStreamBackend
+from tests.contrib.external_workflow_streams.test_replay_end_to_end import publish
 
 RUN_ID = "run-1"
 
@@ -97,6 +99,31 @@ async def append_five(
     return placed
 
 
+def binding(
+    key: StreamKey,
+    start_cursor: Cursor = BEGINNING,
+    *,
+    backend_name: str = "tokens",
+    provider_id: str = MemoryStreamBackend.provider_id,
+    provider_format_version: int = MemoryStreamBackend.provider_format_version,
+) -> StreamBinding:
+    """A binding naming the backend the manager fixture registers.
+
+    Every binding names its own backend and carries that backend's provider
+    identity. Nothing about replay may be derived from an annotation-wide
+    provider label: the API lets each topic name a different backend, and two
+    instances of one provider -- two Redis clusters, or two key prefixes --
+    declare the same id while holding entirely different records.
+    """
+    return StreamBinding(
+        stream_key=key,
+        start_cursor=start_cursor,
+        backend_name=backend_name,
+        provider_id=provider_id,
+        provider_format_version=provider_format_version,
+    )
+
+
 def annotation_for(
     key: StreamKey, placed: list[StreamRecord], control_positions: tuple[int, ...] = ()
 ) -> bytes:
@@ -105,11 +132,7 @@ def annotation_for(
     assert first is not None and last is not None
     return encode_annotation(
         Annotation(
-            header=AnnotationHeader(
-                provider_id="memory",
-                provider_format_version=1,
-                streams={1: StreamBinding(key, BEGINNING)},
-            ),
+            header=AnnotationHeader(streams={1: binding(key)}),
             segments=(
                 Segment(
                     runs=(
@@ -183,7 +206,7 @@ async def test_one_segment_per_recorded_activation(
 
     annotation = encode_annotation(
         Annotation(
-            header=AnnotationHeader("memory", 1, {1: StreamBinding(key, BEGINNING)}),
+            header=AnnotationHeader({1: binding(key)}),
             segments=(
                 Segment(
                     (Run(1, first, placed[1].offset, 2),),  # type: ignore[arg-type]
@@ -307,7 +330,7 @@ async def test_a_marker_naming_an_unknown_wait_is_nondeterminism_not_integrity_l
     placed = await append_five(backend, key)
     annotation = encode_annotation(
         Annotation(
-            header=AnnotationHeader("memory", 1, {}),
+            header=AnnotationHeader({}),
             segments=(
                 Segment(
                     (Run(7, placed[0].offset, placed[-1].offset, 5),),  # type: ignore[arg-type]
@@ -477,10 +500,31 @@ def make_runtime(manager, backend):  # type: ignore[no-untyped-def]
     )
 
 
+class ConsumingStub(DriverStub):
+    """A stub that also takes what the segment holds, as Workflow code does.
+
+    Every record in a run was handed to Workflow code in the activation that run
+    was recorded in, so a stub that drains nothing is not a stand-in for a
+    Workflow -- it is a stand-in for a Workflow that stopped subscribing, which
+    the driver now reports as nondeterminism. Tests that only care about how
+    many drains happened use this; tests that assert *what* each drain saw drain
+    for themselves.
+    """
+
+    def __init__(self, runtime) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(runtime)
+        self._runtime = runtime
+
+    def _run_once(self, *, check_conditions: bool) -> None:
+        super()._run_once(check_conditions=check_conditions)
+        for wait_id in sorted({w for w, _ in self._runtime._replay_ready or []}):
+            self._runtime.drain(wait_id)
+
+
 def drive(runtime) -> DriverStub:  # type: ignore[no-untyped-def]
     from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
 
-    stub = DriverStub(runtime)
+    stub = ConsumingStub(runtime)
     _WorkflowInstanceImpl._apply_replay_external_streams(stub, object())  # type: ignore[arg-type]
     return stub
 
@@ -499,7 +543,7 @@ async def test_the_driver_drains_once_per_recorded_segment(
     placed = await append_five(backend, key)
     annotation = encode_annotation(
         Annotation(
-            header=AnnotationHeader("memory", 1, {1: StreamBinding(key, BEGINNING)}),
+            header=AnnotationHeader({1: binding(key)}),
             segments=(
                 Segment(
                     (Run(1, placed[0].offset, placed[1].offset, 2),),
@@ -539,7 +583,7 @@ async def test_a_drain_sees_only_its_own_segments_records(
     placed = await append_five(backend, key)
     annotation = encode_annotation(
         Annotation(
-            header=AnnotationHeader("memory", 1, {1: StreamBinding(key, BEGINNING)}),
+            header=AnnotationHeader({1: binding(key)}),
             segments=(
                 Segment(
                     (Run(1, placed[0].offset, placed[1].offset, 2),),
@@ -665,7 +709,7 @@ async def test_two_markers_reassemble_in_workflow_task_order(
 
     first_marker = encode_annotation(
         Annotation(
-            header=AnnotationHeader("memory", 1, {1: StreamBinding(key, BEGINNING)}),
+            header=AnnotationHeader({1: binding(key)}),
             segments=(
                 Segment(
                     (Run(1, placed[0].offset, placed[0].offset, 1),),  # type: ignore[arg-type]
@@ -687,9 +731,7 @@ async def test_two_markers_reassemble_in_workflow_task_order(
     second_marker = encode_annotation(
         Annotation(
             header=AnnotationHeader(
-                "memory",
-                1,
-                {1: StreamBinding(key, AFTER(placed[split].offset))},  # type: ignore[arg-type]
+                {1: binding(key, AFTER(placed[split].offset))}  # type: ignore[arg-type]
             ),
             segments=(
                 Segment(
@@ -756,14 +798,7 @@ async def test_one_segment_delivers_each_waits_own_records(
 
     annotation = encode_annotation(
         Annotation(
-            header=AnnotationHeader(
-                "memory",
-                1,
-                {
-                    1: StreamBinding(key, BEGINNING),
-                    2: StreamBinding(other, BEGINNING),
-                },
-            ),
+            header=AnnotationHeader({1: binding(key), 2: binding(other)}),
             segments=(
                 Segment(
                     (
@@ -862,3 +897,351 @@ async def test_live_delivery_after_a_replay_resumes_past_the_marker(
         "the marker's boundary was never committed, so a later reset would "
         "send the subscription back to the start cursor"
     )
+
+
+# --- the annotation must match the subscriptions the Workflow makes ----------
+#
+# Delivery joins a recorded run to a subscription by `wait_id`, and an integer
+# is not an identity. Everything below is row four of the failure taxonomy --
+# nondeterminism, remedied by versioning the Workflow -- and specifically *not*
+# `StreamIntegrityError`, which would send an operator to repair a backend that
+# holds exactly the bytes it was given.
+
+
+async def _one_record(backend: MemoryStreamBackend, key: StreamKey) -> StreamRecord:
+    await publish(backend, key, [f"{key.stream_name}-value"])
+    return backend.all_records(key)[-1]
+
+
+def _single_run_annotation(bindings, runs) -> bytes:  # type: ignore[no-untyped-def]
+    """One segment holding one run per wait, and a terminal that closes it."""
+    return encode_annotation(
+        Annotation(
+            header=AnnotationHeader(bindings),
+            segments=(Segment(tuple(runs), SegmentEndReason.NO_DATA_AVAILABLE),),
+            terminal={run.wait_id: AFTER(run.last_offset) for run in runs},
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_wait_rebound_to_another_stream_is_nondeterminism(
+    manager: StreamSubscriptionManager, backend: MemoryStreamBackend
+) -> None:
+    """Moving wait 1 from one stream to another must fail, not deliver.
+
+    This is the silent failure the whole check exists for: with the join done on
+    ``wait_id`` alone, the left stream's recorded bytes are handed to Workflow
+    code through the right stream's subscription. Nothing anywhere reports it --
+    the range validates, because the records really are where the marker says --
+    and the Workflow proceeds on data it never received.
+
+    The taxonomy puts "annotation does not match the subscriptions made" in the
+    nondeterminism row precisely so the remedy is versioning the Workflow rather
+    than repairing a healthy backend.
+    """
+    left = StreamKey("ns", "wf", uuid.uuid4().hex, "left")
+    right = StreamKey("ns", "wf", uuid.uuid4().hex, "right")
+    recorded = await _one_record(backend, left)
+    await _one_record(backend, right)
+
+    await manager.prepare_replay(
+        RUN_ID,
+        _single_run_annotation(
+            {1: binding(left)},
+            [Run(1, recorded.offset, recorded.offset, 1)],  # type: ignore[arg-type]
+        ),
+    )
+    runtime = make_runtime(manager, backend)
+    # The Workflow's `subscribe()` calls are unchanged in number and order, so
+    # wait 1 is still wait 1 -- it just reads a different stream now.
+    runtime.register(wait_id=1, stream_key=right, backend_name="tokens")
+
+    with pytest.raises(temporalio.workflow.NondeterminismError) as caught:
+        drive(runtime)
+
+    assert not isinstance(caught.value, StreamIntegrityError), (
+        "the backend holds exactly what it was given; this must not be "
+        "reachable through the storage-failure taxonomy"
+    )
+    assert "workflow.patched" in str(caught.value)
+    assert runtime.drain(1) == [], (
+        "the recorded record must never reach the rebound subscription"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_rebinding_made_during_the_replay_activation_is_caught_too(
+    manager: StreamSubscriptionManager, backend: MemoryStreamBackend
+) -> None:
+    """The other order, which is the ordinary one for a Run's first marker.
+
+    An activation carrying both ``InitializeWorkflow`` and
+    ``ReplayExternalStreams`` applies every job before any Workflow code runs,
+    so the ``subscribe()`` call happens *inside* the replay driver's first
+    drain. Checking only what was registered beforehand would find nothing to
+    check on exactly the activation where the first marker is replayed.
+    """
+    left = StreamKey("ns", "wf", uuid.uuid4().hex, "left")
+    right = StreamKey("ns", "wf", uuid.uuid4().hex, "right")
+    recorded = await _one_record(backend, left)
+    await _one_record(backend, right)
+
+    await manager.prepare_replay(
+        RUN_ID,
+        _single_run_annotation(
+            {1: binding(left)},
+            [Run(1, recorded.offset, recorded.offset, 1)],  # type: ignore[arg-type]
+        ),
+    )
+    runtime = make_runtime(manager, backend)
+
+    class LateRegisteringStub(DriverStub):
+        def _run_once(self, *, check_conditions: bool) -> None:
+            super()._run_once(check_conditions=check_conditions)
+            runtime.register(wait_id=1, stream_key=right, backend_name="tokens")
+
+    from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
+
+    with pytest.raises(temporalio.workflow.NondeterminismError, match="workflow"):
+        _WorkflowInstanceImpl._apply_replay_external_streams(  # type: ignore[arg-type]
+            LateRegisteringStub(runtime), object()
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_wait_rebound_to_another_backend_is_nondeterminism(
+    manager: StreamSubscriptionManager, backend: MemoryStreamBackend
+) -> None:
+    """The backend a topic names is Workflow code, so moving it is a code change.
+
+    Same stream name, different store: the records the marker recorded live in
+    the backend that wrote them, and reading a second store because the wait
+    number matched is the same silent substitution as reading a second stream.
+    """
+    key = StreamKey("ns", "wf", uuid.uuid4().hex, "tokens")
+    recorded = await _one_record(backend, key)
+    manager._backends["other"] = MemoryStreamBackend()
+
+    await manager.prepare_replay(
+        RUN_ID,
+        _single_run_annotation(
+            {1: binding(key)},
+            [Run(1, recorded.offset, recorded.offset, 1)],  # type: ignore[arg-type]
+        ),
+    )
+    runtime = make_runtime(manager, backend)
+    runtime._backends = dict(manager._backends)  # type: ignore[attr-defined]
+    runtime.register(wait_id=1, stream_key=key, backend_name="other")
+
+    with pytest.raises(temporalio.workflow.NondeterminismError, match="backend"):
+        drive(runtime)
+
+
+@pytest.mark.asyncio
+async def test_a_removed_subscription_leaves_recorded_deliveries_unconsumed(
+    manager: StreamSubscriptionManager, backend: MemoryStreamBackend
+) -> None:
+    """Records the marker recorded may not be quietly dropped.
+
+    Deleting a ``subscribe()`` call leaves its wait unregistered, so nothing
+    drains it and the prepared deliveries are discarded when the segment is
+    replaced. The Workflow then reaches its next command having consumed less
+    than History says it consumed -- which surfaces later, somewhere else, as an
+    unrelated command mismatch.
+    """
+    left = StreamKey("ns", "wf", uuid.uuid4().hex, "left")
+    right = StreamKey("ns", "wf", uuid.uuid4().hex, "right")
+    left_record = await _one_record(backend, left)
+    right_record = await _one_record(backend, right)
+
+    await manager.prepare_replay(
+        RUN_ID,
+        _single_run_annotation(
+            {1: binding(left), 2: binding(right)},
+            [
+                Run(1, left_record.offset, left_record.offset, 1),  # type: ignore[arg-type]
+                Run(2, right_record.offset, right_record.offset, 1),  # type: ignore[arg-type]
+            ],
+        ),
+    )
+    runtime = make_runtime(manager, backend)
+    # Wait 2's `subscribe()` call is gone; wait 1 is untouched.
+    runtime.register(wait_id=1, stream_key=left, backend_name="tokens")
+
+    class OnlyWaitOneStub(DriverStub):
+        def _run_once(self, *, check_conditions: bool) -> None:
+            super()._run_once(check_conditions=check_conditions)
+            runtime.drain(1)
+
+    from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
+
+    with pytest.raises(temporalio.workflow.NondeterminismError) as caught:
+        _WorkflowInstanceImpl._apply_replay_external_streams(  # type: ignore[arg-type]
+            OnlyWaitOneStub(runtime), object()
+        )
+
+    assert "[2]" in str(caught.value), (
+        f"the error must name the wait whose records went undelivered: {caught.value}"
+    )
+
+
+# --- one wait, one backend instance ------------------------------------------
+
+
+@pytest_asyncio.fixture  # type: ignore[reportUntypedFunctionDecorator]
+async def two_backend_manager():  # type: ignore[no-untyped-def]
+    """Two instances of the *same* provider, registered under two names.
+
+    The configuration a single provider label cannot describe: both declare
+    provider id ``memory``, and they hold entirely different records -- exactly
+    as two Redis clusters, or two key prefixes on one cluster, would.
+    """
+    left, right = MemoryStreamBackend(), MemoryStreamBackend()
+    mgr = StreamSubscriptionManager(
+        backends={"left": left, "right": right},
+        notify_ready=_notify,
+        watch_block=timedelta(milliseconds=10),
+    )
+    yield mgr, left, right
+    await mgr.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_each_waits_range_is_read_from_the_backend_that_owns_it(
+    two_backend_manager,  # type: ignore[no-untyped-def]
+) -> None:
+    """Replay reads a wait's recorded range from the store that wrote it.
+
+    Resolving a wait by searching for the first registered backend declaring the
+    recorded provider id cannot do this: a provider id names an implementation,
+    not a store. The failure is not even clean -- the range simply is not in the
+    instance that was picked, and it is reported as integrity loss against a
+    backend nothing is wrong with.
+
+    Prepared before any subscription exists, which is the real ordering: on
+    replay the Workflow has not run far enough to call ``subscribe()``, so the
+    annotation is the only thing that can say where to read.
+    """
+    manager, left_backend, right_backend = two_backend_manager
+    left = StreamKey("ns", "wf", uuid.uuid4().hex, "tokens")
+    right = StreamKey("ns", "wf", uuid.uuid4().hex, "tokens")
+    left_record = await _one_record(left_backend, left)
+    right_record = await _one_record(right_backend, right)
+
+    plan = await manager.prepare_replay(
+        RUN_ID,
+        _single_run_annotation(
+            {
+                1: binding(left, backend_name="left"),
+                2: binding(right, backend_name="right"),
+            },
+            [
+                Run(1, left_record.offset, left_record.offset, 1),  # type: ignore[arg-type]
+                Run(2, right_record.offset, right_record.offset, 1),  # type: ignore[arg-type]
+            ],
+        ),
+    )
+
+    assert len(left_backend.range_reads) == 1, (
+        f"wait 1 must be read from the instance holding it, got "
+        f"{left_backend.range_reads}"
+    )
+    assert len(right_backend.range_reads) == 1, (
+        "wait 2's range was never read from the instance that owns it; it was "
+        "routed to the other instance, which declares the same provider id"
+    )
+    (segment,) = plan.segments
+    assert [(w, r.offset) for w, r in segment.deliveries] == [
+        (1, left_record.offset),
+        (2, right_record.offset),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_backend_declaring_another_provider_is_refused_before_any_read(
+    two_backend_manager,  # type: ignore[no-untyped-def]
+) -> None:
+    """A name rebound to a different implementation is a deployment problem.
+
+    Neither nondeterminism -- the Workflow is unchanged -- nor integrity loss:
+    the store that wrote the records is simply not the one registered under that
+    name here. It is refused before the read, so an implementation that cannot
+    interpret those offsets never gets to try.
+    """
+    manager, left_backend, _ = two_backend_manager
+    left = StreamKey("ns", "wf", uuid.uuid4().hex, "tokens")
+    record = await _one_record(left_backend, left)
+
+    with pytest.raises(StreamStorageError, match="declares"):
+        await manager.prepare_replay(
+            RUN_ID,
+            _single_run_annotation(
+                {1: binding(left, backend_name="left", provider_id="redis-streams")},
+                [Run(1, record.offset, record.offset, 1)],  # type: ignore[arg-type]
+            ),
+        )
+
+    assert left_backend.range_reads == [], (
+        "the recorded range must not be read through an implementation that "
+        "did not write it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_provider_format_version_is_refused_before_any_read(
+    two_backend_manager,  # type: ignore[no-untyped-def]
+) -> None:
+    """The recorded format version is checked, not merely stored.
+
+    A provider that keeps its id while changing how it lays records out is the
+    case a matching id cannot catch: the offsets read back mean something else,
+    and every one of replay's four range checks would be applied to the wrong
+    interpretation of the bytes.
+    """
+    manager, left_backend, _ = two_backend_manager
+    left = StreamKey("ns", "wf", uuid.uuid4().hex, "tokens")
+    record = await _one_record(left_backend, left)
+
+    with pytest.raises(StreamStorageError, match="format version"):
+        await manager.prepare_replay(
+            RUN_ID,
+            _single_run_annotation(
+                {
+                    1: binding(
+                        left,
+                        backend_name="left",
+                        provider_format_version=(
+                            MemoryStreamBackend.provider_format_version + 1
+                        ),
+                    )
+                },
+                [Run(1, record.offset, record.offset, 1)],  # type: ignore[arg-type]
+            ),
+        )
+
+    assert left_backend.range_reads == []
+
+
+@pytest.mark.asyncio
+async def test_a_marker_naming_an_unregistered_backend_is_nondeterminism(
+    two_backend_manager,  # type: ignore[no-untyped-def]
+) -> None:
+    """A recorded backend name that resolves to nothing is row four as well.
+
+    The name came from Workflow code, so the honest readings are that the
+    Workflow now names a different backend or that this Worker is missing a
+    registration -- neither of which is damage to a store.
+    """
+    manager, left_backend, _ = two_backend_manager
+    left = StreamKey("ns", "wf", uuid.uuid4().hex, "tokens")
+    record = await _one_record(left_backend, left)
+
+    with pytest.raises(temporalio.workflow.NondeterminismError, match="not registered"):
+        await manager.prepare_replay(
+            RUN_ID,
+            _single_run_annotation(
+                {1: binding(left, backend_name="retired")},
+                [Run(1, record.offset, record.offset, 1)],  # type: ignore[arg-type]
+            ),
+        )

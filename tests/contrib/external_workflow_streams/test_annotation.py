@@ -24,6 +24,7 @@ from temporalio.contrib.external_workflow_streams._backend import StreamKey
 from temporalio.contrib.external_workflow_streams._record import (
     AFTER,
     BEGINNING,
+    Cursor,
     Offset,
 )
 
@@ -31,11 +32,25 @@ KEY = StreamKey("ns", "wf", "run-1", "tokens")
 OTHER_KEY = StreamKey("ns", "wf", "run-1", "tool-events")
 
 
-def header(streams: dict[int, StreamBinding] | None = None) -> AnnotationHeader:
-    return AnnotationHeader(
+def binding(key: StreamKey, start_cursor: Cursor = BEGINNING) -> StreamBinding:
+    """A binding naming its own backend, as every real one does.
+
+    The provider identity lives on the binding rather than on the header: one
+    annotation can carry waits on several backends, so a single label could be
+    right for at most one of them.
+    """
+    return StreamBinding(
+        stream_key=key,
+        start_cursor=start_cursor,
+        backend_name="tokens",
         provider_id="redis-streams",
         provider_format_version=1,
-        streams=streams if streams is not None else {1: StreamBinding(KEY, BEGINNING)},
+    )
+
+
+def header(streams: dict[int, StreamBinding] | None = None) -> AnnotationHeader:
+    return AnnotationHeader(
+        streams=streams if streams is not None else {1: binding(KEY)},
     )
 
 
@@ -48,7 +63,7 @@ def offset(ms: int, seq: int = 0) -> Offset:
 
 def test_a_full_annotation_round_trips() -> None:
     annotation = Annotation(
-        header=header({1: StreamBinding(KEY, AFTER(offset(50)))}),
+        header=header({1: binding(KEY, AFTER(offset(50)))}),
         segments=(
             Segment(
                 runs=(Run(1, offset(100), offset(199), 100, (7, 42)),),
@@ -258,7 +273,7 @@ def test_alternating_streams_cost_one_run_per_delivery() -> None:
     runs = tuple(Run(1 + (i % 2), offset(i), offset(i), 1) for i in range(1, 21))
     annotation = Annotation(
         header(
-            {1: StreamBinding(KEY, BEGINNING), 2: StreamBinding(OTHER_KEY, BEGINNING)}
+            {1: binding(KEY), 2: binding(OTHER_KEY)}
         ),
         segments=(Segment(runs, SegmentEndReason.NO_DATA_AVAILABLE),),
         terminal={1: AFTER(offset(19)), 2: AFTER(offset(20))},
@@ -355,7 +370,7 @@ def test_an_alternating_two_stream_batch_asks_for_rollover_rather_than_overflowi
     """
     accumulator = AnnotationAccumulator(
         header(
-            {1: StreamBinding(KEY, BEGINNING), 2: StreamBinding(OTHER_KEY, BEGINNING)}
+            {1: binding(KEY), 2: binding(OTHER_KEY)}
         )
     )
 
@@ -394,11 +409,24 @@ def test_exceeding_the_hard_budget_raises_rather_than_growing() -> None:
 #: A fixed annotation and its exact bytes. Regenerating this to make a test
 #: pass is the mistake it exists to catch: any change here is a wire-format
 #: change, and markers already in History were written by the old encoder.
+#:
+#: This constant was regenerated once, for schema version 2, which moved the
+#: provider identity out of the header and onto each binding. That is allowed
+#: exactly because the feature is private and unreleased -- there is no History
+#: anywhere holding a version-1 marker. `decode_annotation` refuses version 1
+#: rather than reading it, so the regeneration cannot silently reinterpret an
+#: older marker.
 GOLDEN_ANNOTATION = Annotation(
     header=AnnotationHeader(
-        provider_id="redis-streams",
-        provider_format_version=1,
-        streams={1: StreamBinding(StreamKey("ns", "wf", "run-1", "tokens"), BEGINNING)},
+        streams={
+            1: StreamBinding(
+                stream_key=StreamKey("ns", "wf", "run-1", "tokens"),
+                start_cursor=BEGINNING,
+                backend_name="tokens",
+                provider_id="redis-streams",
+                provider_format_version=1,
+            )
+        },
     ),
     segments=(
         Segment(
@@ -413,10 +441,8 @@ GOLDEN_ANNOTATION = Annotation(
 GOLDEN_BYTES = bytes.fromhex(
     "".join(
         [
-            "01",  # schema version 1
+            "02",  # schema version 2
             "01",  # header frame
-            "0d" + "redis-streams".encode().hex(),
-            "01",  # provider format version 1
             "01",  # one stream
             "01",  # wait id 1
             "02" + "ns".encode().hex(),
@@ -424,6 +450,9 @@ GOLDEN_BYTES = bytes.fromhex(
             "05" + "run-1".encode().hex(),
             "06" + "tokens".encode().hex(),
             "00",  # start cursor BEGINNING
+            "06" + "tokens".encode().hex(),  # backend name
+            "0d" + "redis-streams".encode().hex(),  # provider id
+            "01",  # provider format version 1
             "02",  # segment frame
             "01",  # one run
             "01",  # wait id 1

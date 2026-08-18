@@ -185,6 +185,10 @@ class WorkflowStreamRuntime:
         self._pending: dict[int, asyncio.Future[None]] = {}
         #: Non-``None`` only while a recorded segment is being delivered.
         self._replay_ready: list[tuple[int, StreamRecord]] | None = None
+        #: The bindings of the marker currently being replayed. Non-``None``
+        #: only for the length of one replay job, which is what makes a
+        #: registration made during it checkable against what was recorded.
+        self._replay_bindings: dict[int, StreamBinding] | None = None
         #: Records handed to Workflow code since this activation began. Counted
         #: here rather than per subscription because the cap is an *activation*
         #: budget: `merge()` consumes from several subscriptions inside one
@@ -272,6 +276,15 @@ class WorkflowStreamRuntime:
                 f"no external stream backend named {backend_name!r} is registered on "
                 f"this Worker; registered backends are: {known}"
             )
+        if self._replay_bindings is not None:
+            # A subscription made while a marker is being replayed -- which is
+            # every subscription, on the activation that both starts the
+            # Workflow and replays its first marker. Checked before the state
+            # exists, so a mismatch is reported before a single recorded record
+            # can be handed through the wrong subscription.
+            binding = self._replay_bindings.get(wait_id)
+            if binding is not None:
+                self._verify_binding(wait_id, stream_key, backend_name, binding)
         self._subscriptions[wait_id] = _SubscriptionState(
             wait_id=wait_id,
             stream_key=stream_key,
@@ -327,11 +340,109 @@ class WorkflowStreamRuntime:
         """The plan prepared for this Run, if a replay job is being delivered."""
         return self._manager.take_replay_plan(self._run_id)
 
+    def begin_replay(self, bindings: Mapping[int, StreamBinding]) -> None:
+        """Holds the marker's bindings open, and checks the ones already made.
+
+        Delivery joins a recorded run to a subscription by ``wait_id`` alone,
+        and an integer is not an identity: it says nothing about *what* the wait
+        was subscribed to. Without this the same wait number pointing at a
+        different stream quietly delivers the recorded stream's bytes through
+        the new subscription -- the failure taxonomy's row four turned into a
+        silently different stream result, which is the one outcome the design
+        says must never happen.
+
+        Checked here as well as in :meth:`register` because the two moments are
+        different Workflow Tasks' worth of history: a marker replayed after the
+        Workflow has already run past its ``subscribe()`` calls finds the
+        subscriptions in place, and one replayed in the same activation that
+        starts the Workflow finds none of them yet.
+        """
+        self._replay_bindings = dict(bindings)
+        for wait_id, state in sorted(self._subscriptions.items()):
+            binding = self._replay_bindings.get(wait_id)
+            if binding is not None:
+                self._verify_binding(
+                    wait_id, state.stream_key, state.backend_name, binding
+                )
+
+    def _verify_binding(
+        self,
+        wait_id: int,
+        stream_key: StreamKey,
+        backend_name: str,
+        binding: StreamBinding,
+    ) -> None:
+        """Row four, and deliberately not integrity loss.
+
+        Both fields compared here were chosen by Workflow code -- the stream the
+        topic names and the backend it names it on -- so a difference means the
+        code moved, not that anything is wrong with the backend. Reporting it as
+        integrity loss would send an operator to repair a store that is fine.
+
+        Only the **stream name** is compared, not the whole key. The other three
+        components -- namespace, Workflow id, first execution Run id -- are the
+        Run's identity rather than anything the code chose, and a replay harness
+        legitimately supplies its own: `Replayer` runs under `ReplayNamespace`,
+        so comparing the full key would report every replayed history as
+        nondeterministic. The key is still *recorded* whole, because replay has
+        to read the ranges it names.
+
+        The start cursor is **not** compared. It is the position the wait stood
+        at when that Workflow Task opened, not a property of the subscription,
+        so for every marker after a Run's first it legitimately differs from the
+        cursor the subscription was registered with. What guards the cursor
+        across Runs is ADR-022's continuation check in :meth:`restored_start`.
+        """
+        if stream_key.stream_name != binding.stream_key.stream_name:
+            raise temporalio.workflow.NondeterminismError(
+                f"the marker records external stream wait {wait_id} on stream "
+                f"{binding.stream_key.stream_name!r}, but this Workflow "
+                f"subscribes it to {stream_key.stream_name!r}. A subscribe() "
+                "call was inserted, removed, or reordered, which renumbers "
+                "every later wait; gate the change behind workflow.patched() "
+                "exactly as an inserted timer would be."
+            )
+        if backend_name != binding.backend_name:
+            raise temporalio.workflow.NondeterminismError(
+                f"the marker records external stream wait {wait_id} against "
+                f"backend {binding.backend_name!r}, but this Workflow subscribes "
+                f"it against {backend_name!r}. The recorded records live in the "
+                "backend that wrote them; gate the change behind "
+                "workflow.patched() exactly as an inserted timer would be."
+            )
+
     def begin_replay_segment(
         self, deliveries: Sequence[tuple[int, StreamRecord]]
     ) -> None:
         """Makes one recorded segment the only thing a drain can see."""
+        self._verify_replay_consumed()
         self._replay_ready = list(deliveries)
+
+    def verify_replay_consumed(self) -> None:
+        """Every recorded delivery must have reached Workflow code.
+
+        A record in a run was handed to Workflow code during the activation the
+        run was recorded in, so a replay that leaves one behind is running
+        different code. The common way to get here is a removed ``subscribe()``
+        call: its wait is never registered, nothing ever drains it, and the
+        marker's records for it would otherwise be discarded in silence -- the
+        Workflow reaching its next command having consumed less than History
+        says it consumed.
+        """
+        self._verify_replay_consumed()
+
+    def _verify_replay_consumed(self) -> None:
+        if not self._replay_ready:
+            return
+        wait_ids = sorted({wait_id for wait_id, _ in self._replay_ready})
+        raise temporalio.workflow.NondeterminismError(
+            f"the marker records {len(self._replay_ready)} delivery(s) for "
+            f"external stream wait(s) {wait_ids} that this Workflow never took. "
+            "A subscribe() call was removed, reordered, or is no longer "
+            "consumed, which leaves recorded records undelivered; gate the "
+            "change behind workflow.patched() exactly as a removed timer would "
+            "be."
+        )
 
     def reposition_after_replay(self, boundaries: Mapping[int, Cursor]) -> None:
         """Moves the manager's cursors to what the replayed marker committed.
@@ -361,6 +472,7 @@ class WorkflowStreamRuntime:
         marker's failure into a Workflow that silently never receives again.
         """
         self._replay_ready = None
+        self._replay_bindings = None
 
     def codec_for(self, value_type: type | None) -> StreamPayloadCodec[Any]:
         return StreamPayloadCodec(self._data_converter, value_type)
@@ -699,29 +811,38 @@ class WorkflowStreamRuntime:
         return self._accumulator
 
     def _header(self) -> AnnotationHeader:
-        provider = self._provider()
+        """One binding per subscription, each naming **its own** backend.
+
+        The provider identity is read from the backend this subscription is
+        actually registered against rather than from a single annotation-wide
+        one. The API lets every topic name a different backend, so a shared
+        label would be right for at most one wait and would send replay to the
+        wrong store for all the others.
+        """
         for state in self._subscriptions.values():
             state.announced = True
         return AnnotationHeader(
-            provider_id=type(provider).provider_id if provider else "",
-            provider_format_version=(
-                type(provider).provider_format_version if provider else 1
-            ),
             streams={
-                wait_id: StreamBinding(
-                    state.stream_key,
-                    self._annotation_start.get(wait_id, state.start_cursor),
-                )
+                wait_id: self._binding(state)
                 for wait_id, state in sorted(self._subscriptions.items())
             },
         )
 
-    def _provider(self) -> StreamBackend | None:
-        for state in self._subscriptions.values():
-            backend = self._backends.get(state.backend_name)
-            if backend is not None:
-                return backend
-        return None
+    def _binding(self, state: _SubscriptionState) -> StreamBinding:
+        backend = self._backends.get(state.backend_name)
+        # `register` refuses an unregistered name, so a missing backend here
+        # would mean the Worker's registration changed under a live Run. Its
+        # provider identity is unknowable rather than empty, so record what the
+        # Workflow named and let replay's own check report the mismatch.
+        return StreamBinding(
+            stream_key=state.stream_key,
+            start_cursor=self._annotation_start.get(state.wait_id, state.start_cursor),
+            backend_name=state.backend_name,
+            provider_id=type(backend).provider_id if backend is not None else "",
+            provider_format_version=(
+                type(backend).provider_format_version if backend is not None else 1
+            ),
+        )
 
     # --- quiescence (P10a) ----------------------------------------------------
 

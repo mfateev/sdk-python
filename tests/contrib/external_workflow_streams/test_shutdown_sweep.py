@@ -551,6 +551,99 @@ async def test_two_workers_sweeps_do_not_deduplicate_each_other(
     )
 
 
+# --- the sweep driven through the Worker's real wake callback -----------------
+
+
+def _worker_wake_callback(manager):  # type: ignore[no-untyped-def]
+    """The Worker's own sender, bound to this manager and nothing else.
+
+    The retry and the metric are the manager's, but whether they can ever run is
+    the callback's: a callback that returns normally after a failed Signal makes
+    an unacknowledged wake indistinguishable from a delivered one, and the loop
+    below exits after its first attempt. Driving the real method is the only way
+    that shows.
+    """
+    from temporalio.worker._workflow import _WorkflowWorker
+
+    worker = object.__new__(_WorkflowWorker)
+    worker._client = object()  # only ever handed to the patched sender
+    worker._external_stream_manager = manager
+    return worker._send_external_stream_wake
+
+
+@pytest.fixture
+def failing_signals(monkeypatch):  # type: ignore[no-untyped-def]
+    """Makes the raw Signal call fail a fixed number of times, and counts it."""
+    import temporalio.contrib.external_workflow_streams._wake as wake_module
+
+    attempts: list[str] = []
+
+    def install(failures: int) -> list[str]:
+        remaining = [failures]
+
+        async def fake_send(
+            client, wake_request, *, producer_session_id: str = ""
+        ) -> str:
+            request_id = wake_request_id(wake_request)
+            attempts.append(request_id)
+            if remaining[0] > 0:
+                remaining[0] -= 1
+                raise ConnectionError("service unavailable")
+            return request_id
+
+        monkeypatch.setattr(wake_module, "send_wake_signal", fake_send)
+        return attempts
+
+    return install
+
+
+@pytest.mark.asyncio
+async def test_a_signal_failure_reaches_the_sweeps_retry(
+    backend: MemoryStreamBackend, failing_signals
+) -> None:
+    """The retry is only real if the callback tells the sweep it failed.
+
+    A callback that logs and returns reports success, the three-attempt loop
+    ends after one call, and the record the Worker was holding is never
+    announced -- while shutdown reports itself clean.
+    """
+    attempts = failing_signals(failures=2)
+    harness = Harness(backend, RunStatus.NO_OPEN_WORKFLOW_TASK)
+    harness.register()
+    harness.manager._send_wake = _worker_wake_callback(harness.manager)
+
+    await harness.manager.shutdown()
+
+    assert len(attempts) == 3, (
+        f"the sweep made {len(attempts)} Signal attempts; a failure the callback "
+        "swallows leaves the retry loop with nothing to retry"
+    )
+    assert len(set(attempts)) == 1, (
+        "the retries must be the same wake, not three separate asks"
+    )
+    assert harness.metric == [], "a wake that eventually succeeded is not a failure"
+    assert harness.manager.shutdown_wake_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_a_wake_that_never_lands_is_retried_then_counted(
+    backend: MemoryStreamBackend, failing_signals
+) -> None:
+    """And the metric fires, which is the only thing that makes giving up acceptable."""
+    attempts = failing_signals(failures=99)
+    harness = Harness(backend, RunStatus.NO_OPEN_WORKFLOW_TASK)
+    harness.register()
+    harness.manager._send_wake = _worker_wake_callback(harness.manager)
+
+    await harness.manager.shutdown()
+
+    assert len(attempts) == SHUTDOWN_WAKE_ATTEMPTS
+    assert harness.metric == ["tokens"], (
+        "the wake was never acknowledged and shutdown reported nothing"
+    )
+    assert harness.manager.shutdown_wake_failures == 1
+
+
 # --- the park intent's lifetime -----------------------------------------------
 
 

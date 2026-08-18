@@ -408,8 +408,15 @@ async def test_a_producer_that_finds_a_wakeable_generation_sends_exactly_one_sig
 
 
 @pytest.mark.asyncio
-async def test_a_producer_that_loses_the_claim_stays_silent() -> None:
-    """The whole purpose of claiming: one Signal per generation, not one per producer."""
+async def test_a_producer_that_loses_the_claim_sends_the_same_wake_anyway() -> None:
+    """A lost claim says someone *intends* to send. It is not evidence one did.
+
+    The Signal goes out either way, and it costs no second Workflow Task: a
+    parked wake's request ID is derived from the generation and ignores sender
+    identity, so both producers issue byte-identical requests that the server
+    deduplicates into one wake. Staying silent here is what strands a parked
+    Workflow when the claim holder crashed between claiming and signalling.
+    """
     backend = MemoryStreamBackend()
     key = StreamKey("ns", "wf-1", "first-run-1", "tokens")
     await park(backend, key, wait_id=1, gen=4)
@@ -421,8 +428,12 @@ async def test_a_producer_that_loses_the_claim_stays_silent() -> None:
     topic = make_producer(backend, client).topic("tokens", type=str)
     await topic.publish("a", wake=False)
 
-    assert await topic.wake() == []
-    assert client.sent == []
+    assert len(await topic.wake()) == 1
+    assert len(client.sent) == 1
+    assert client.sent[0].request_id == wake_request_id(request(park_generation=4)), (
+        "the claim holder's wake and this one must be the same request, or the "
+        "duplicate the claim exists to avoid becomes a second Workflow Task"
+    )
 
 
 @pytest.mark.asyncio
@@ -601,6 +612,45 @@ async def test_publish_completes_only_once_its_wake_is_acknowledged() -> None:
 
     assert offset is not None
     assert len(client.sent) == 1, "publish must not return before it has signalled"
+
+
+@pytest.mark.asyncio
+async def test_publish_acknowledges_the_wake_even_when_another_producer_claimed_it() -> (
+    None
+):
+    """A claim held by a producer that crashed must not report a wake nobody sent.
+
+    The lease permits takeover *after* it expires; it schedules nobody to take
+    over. If this publish is the last producer action -- and here it is the only
+    one -- a claim-based silence leaves the Workflow parked on a durable record
+    with a ``publish()`` that reported success.
+    """
+    backend = MemoryStreamBackend()
+    key = StreamKey("ns", "wf-1", "first-run-1", "tokens")
+    await park(backend, key, wait_id=1, gen=4)
+    # A producer that claimed the generation and then died before signalling.
+    # Its lease is unexpired, so the claim is not takeable.
+    await backend.claim_park_generation(
+        key, 1, 4, claimant="crashed", lease=timedelta(seconds=30)
+    )
+
+    client = RecordingClient()
+    topic = make_producer(backend, client).topic("tokens", type=str)
+
+    offset = await topic.publish("a")
+
+    assert offset is not None
+    assert len(client.sent) == 1, (
+        "publish returned an acknowledged wake that nobody sent; the parked "
+        "Workflow is stranded on a durable record"
+    )
+    envelope = WakeSignal()
+    envelope.ParseFromString(client.sent[0].input.payloads[0].data)
+    assert envelope.park_generation == 4
+    assert client.sent[0].request_id == wake_request_id(request(park_generation=4)), (
+        "the wake the crashed claimant owed and this one are the same request, "
+        "so the server collapses them rather than creating a second task"
+    )
 
 
 @pytest.mark.asyncio

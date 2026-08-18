@@ -869,10 +869,23 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
             return
 
         try:
+            # The bindings first, and before any delivery. A recorded run is
+            # joined to a subscription by `wait_id`, which is an integer and
+            # therefore says nothing about what that wait was subscribed to;
+            # without checking the binding, wait 1 moved from one stream to
+            # another delivers the first stream's recorded bytes through the
+            # second's subscription rather than failing as nondeterminism.
+            runtime.begin_replay(plan.annotation.header.streams)
             for segment in plan.segments:
                 runtime.begin_replay_segment(list(segment.deliveries))
                 runtime.resolve_all_pending()
                 self._run_once(check_conditions=True)
+            # Nothing recorded may be left over. Each of these records was
+            # handed to Workflow code in the activation its run was recorded in,
+            # so a replay that ends holding one has run code that consumes less
+            # than History says was consumed -- what a removed `subscribe()`
+            # call looks like from here.
+            runtime.verify_replay_consumed()
             # The manager knew nothing about this marker while replay was
             # running: its watcher has been reading the very same records from
             # the subscription's start cursor into the live buffer. The next

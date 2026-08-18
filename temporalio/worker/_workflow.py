@@ -1028,10 +1028,23 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         Run of the chain -- which may already be a successor by the time this
         runs.
 
-        Failures are logged and left owed rather than raised: this runs on the
-        Worker's own loop with no Workflow Task to fail, and the watcher retries
-        on its next pass. The request ID is derived from the wake's identity, so
-        the retry is the same wake rather than a second one.
+        A failure is logged **and re-raised to the manager that called this**.
+        There is no Workflow Task to fail out here, so the exception is not a
+        way of reporting anything to a Workflow -- it is how the caller learns
+        the wake was not acknowledged. The shutdown sweep is the caller that
+        acts on it: it retries within its grace period and counts the wake on
+        ``external_stream_shutdown_wake_failed`` when the retries run out.
+        Returning normally instead makes an unacknowledged wake
+        indistinguishable from a delivered one, which ends that retry loop after
+        one attempt and reports a clean shutdown that lost a record.
+
+        The request ID is derived from the wake's identity, so a retry is the
+        same wake rather than a second one -- which is what makes re-sending an
+        attempt that may in fact have arrived safe.
+
+        The manager's live watcher path is the other caller, and it must guard
+        this call itself: an exception escaping ``_report_ready`` ends the
+        watcher task for good.
         """
         from temporalio.contrib.external_workflow_streams._wake import (
             WakeRequest,
@@ -1039,12 +1052,14 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         )
 
         if self._client is None:
-            logger.warning(
-                "An external stream wake Signal is owed but this Worker has no "
-                "client to send it with; the Workflow will wait out its idle "
+            # Raised for the same reason a failed send is: the wake is owed and
+            # will not be sent, and a caller told nothing counts it as
+            # delivered.
+            raise RuntimeError(
+                "an external stream wake Signal is owed but this Worker has no "
+                "client to send it with; the Workflow would wait out its idle "
                 "timeout instead"
             )
-            return
 
         key = subscription.stream_key
         # Read rather than remembered: the park this wake must name is whatever
@@ -1084,6 +1099,7 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
                 key,
                 subscription.wait_id,
             )
+            raise
 
     def _create_external_stream_runtime(
         self,

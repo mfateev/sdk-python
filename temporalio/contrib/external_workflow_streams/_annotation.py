@@ -11,11 +11,21 @@ concatenation, so an annotation is a sequence of self-delimiting **frames**:
 
     annotation := schema_version, header_frame, segment_frame*, terminal_frame
 
-    header  := provider_id, provider_format_version
-             , streams[]                    // wait_id -> (stream_key, start_cursor)
+    header  := streams[]                     // wait_id -> binding
+    binding := (stream_key, start_cursor, backend_name
+               , provider_id, provider_format_version)
     segment := run*, segment_end_reason
     run     := (wait_id, first_offset, last_offset, count, control_positions)
     terminal := blocked_snapshot[]           // wait_id -> BEGINNING | AFTER(offset)
+
+The provider identity is **per wait**, not per annotation. One topic per
+backend is what the API allows, so an annotation-wide provider label cannot say
+which of two registered backends owns a given wait -- and two instances of the
+same provider (two Redis clusters, two key prefixes) share a provider id, so the
+label does not even distinguish them. The binding therefore names the
+Worker-registered ``backend_name`` the Workflow itself chose, and carries the
+provider identity of that backend so replay can refuse to read through an
+implementation that is not the one that wrote the bytes.
 
 Concatenating the deltas of one Workflow Task therefore *is* the annotation,
 with no reassembly step that could disagree with Core's.
@@ -59,11 +69,18 @@ __all__ = [
     "encode_annotation",
 ]
 
-SCHEMA_VERSION: Final = 1
+SCHEMA_VERSION: Final = 2
 """Leads the encoding, so a marker written by an older SDK stays readable.
 
 It is also the extension point that keeps ADR-003's accepted risk bounded: a
 per-record content-hash mode can be added later without a format break.
+
+Version 2 moved the provider identity from the header into each
+:class:`StreamBinding` and added the ``backend_name`` that selects the backend
+instance. No version-1 decoder is kept: the feature is private and unreleased,
+so no marker written by version 1 exists anywhere but in a test fixture. A
+version-1 annotation is rejected by :func:`decode_annotation` rather than
+silently read as though its single provider label applied to every wait.
 """
 
 MAX_ANNOTATION_BYTES: Final = 64 * 1024
@@ -126,15 +143,44 @@ class AnnotationBudgetExceeded(Exception):
 
 @dataclass(frozen=True)
 class StreamBinding:
-    """What a ``wait_id`` was subscribed to, and where it started.
+    """What a ``wait_id`` was subscribed to, where it started, and through what.
 
     ``start_cursor`` is explicit rather than re-derived: it is what makes an
     annotation with no segments at all -- a subscription to an empty stream --
     a complete replay instruction.
+
+    The last three fields are what let replay bind a wait to **one** backend.
+    They divide along who chose them, and that division is what decides how a
+    mismatch is reported:
+
+    - ``stream_key`` and ``backend_name`` are chosen by Workflow code, so a
+      mismatch is row four of the failure taxonomy -- nondeterminism, fixed by
+      versioning the Workflow.
+    - ``provider_id`` and ``provider_format_version`` are properties of whatever
+      the Worker registered under that name, so a mismatch is a deployment
+      problem: the Workflow is unchanged and the backend is undamaged.
     """
 
     stream_key: StreamKey
     start_cursor: Cursor
+    backend_name: str
+    """The Worker-registered name the Workflow's ``topic(backend=...)`` named.
+
+    Recorded because a provider id cannot select an instance: two Redis
+    clusters, or two key prefixes on one cluster, are different stores that
+    declare the same provider. The name is part of the Workflow's own
+    definition, so it is stable across Workers of a deployment in the way a
+    Worker-local object identity never could be.
+    """
+    provider_id: str
+    """The provider the named backend declared when this wait was recorded."""
+    provider_format_version: int
+    """That provider's on-the-wire format version when this wait was recorded.
+
+    Checked on replay rather than merely stored: a backend implementation that
+    keeps its provider id while changing how it lays records out would otherwise
+    be read as though nothing had happened.
+    """
 
 
 @dataclass(frozen=True)
@@ -188,8 +234,14 @@ class Segment:
 
 @dataclass(frozen=True)
 class AnnotationHeader:
-    provider_id: str
-    provider_format_version: int
+    """The bindings, and nothing else.
+
+    There is deliberately no annotation-wide provider here. One existed through
+    schema version 1 and was taken from whichever subscription happened to be
+    registered first, which made it wrong for every other wait in a
+    multi-backend annotation.
+    """
+
     streams: dict[int, StreamBinding] = field(default_factory=dict)
     schema_version: int = SCHEMA_VERSION
 
@@ -306,14 +358,15 @@ def encode_header(header: AnnotationHeader) -> bytes:
     out = bytearray()
     _put_uvarint(out, header.schema_version)
     out.append(_FRAME_HEADER)
-    _put_str(out, header.provider_id)
-    _put_uvarint(out, header.provider_format_version)
     _put_uvarint(out, len(header.streams))
     for wait_id in sorted(header.streams):
         binding = header.streams[wait_id]
         _put_uvarint(out, wait_id)
         _put_stream_key(out, binding.stream_key)
         _put_cursor(out, binding.start_cursor)
+        _put_str(out, binding.backend_name)
+        _put_str(out, binding.provider_id)
+        _put_uvarint(out, binding.provider_format_version)
     return bytes(out)
 
 
@@ -372,15 +425,25 @@ def decode_annotation(data: bytes) -> Annotation:
 
     if reader.byte() != _FRAME_HEADER:
         raise AnnotationDecodeError("an annotation must begin with its header frame")
-    provider_id = reader.string()
-    provider_format_version = reader.uvarint()
     streams = {}
     for _ in range(reader.uvarint()):
+        # Read into locals rather than nesting the calls in the constructor:
+        # argument evaluation order is not the thing that should decide which
+        # field a byte lands in.
         wait_id = reader.uvarint()
-        streams[wait_id] = StreamBinding(reader.stream_key(), reader.cursor())
-    header = AnnotationHeader(
-        provider_id, provider_format_version, streams, schema_version
-    )
+        stream_key = reader.stream_key()
+        start_cursor = reader.cursor()
+        backend_name = reader.string()
+        provider_id = reader.string()
+        provider_format_version = reader.uvarint()
+        streams[wait_id] = StreamBinding(
+            stream_key,
+            start_cursor,
+            backend_name,
+            provider_id,
+            provider_format_version,
+        )
+    header = AnnotationHeader(streams, schema_version)
 
     segments: list[Segment] = []
     terminal: dict[int, Cursor] | None = None

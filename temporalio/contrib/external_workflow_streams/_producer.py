@@ -55,10 +55,10 @@ from temporalio.types import AnyType
 DEFAULT_WAKE_CLAIM_LEASE = timedelta(seconds=30)
 """Long enough to cover a Signal round trip, short enough to recover from a crash.
 
-The lease is what makes a claim safe to take: a producer that dies between
-claiming and signaling strands the generation, and every other producer would
-otherwise conclude the wake was already handled and stay silent -- leaving the
-Workflow parked with data sitting in the stream.
+The lease bounds how long a claim taken by a producer that then died keeps
+saying a wake is in flight. It is not what makes the wake safe -- expiry alone
+schedules nobody to take over, which is why a producer that loses the claim
+signals anyway rather than treating the claim as an acknowledgement.
 """
 
 if TYPE_CHECKING:
@@ -295,11 +295,13 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
         an overwrite.
 
         **Returning means the record is durable and a parked Workflow has been
-        told about it.** That combination is what makes the "durable producer"
-        row of the wakeup-durability boundary true. An append that lands but is
-        never signalled leaves the Workflow parked on data already sitting in the
-        stream, and a ``publish()`` that returned success there would report a
-        delivery that never happened.
+        told about it** -- told by *this* call, which sent the wake itself and
+        had it accepted. It never means that some other producer claimed
+        responsibility for sending one. That combination is what makes the
+        "durable producer" row of the wakeup-durability boundary true. An append
+        that lands but is never signalled leaves the Workflow parked on data
+        already sitting in the stream, and a ``publish()`` that returned success
+        there would report a delivery that never happened.
 
         The wake happens after the append and never instead of it: only
         successfully appended records may trigger wakeup, since a wake for a
@@ -307,10 +309,10 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
 
         Args:
             wake: Set ``False`` to append without waking, then call :meth:`wake`
-                once for the batch. The wake is idempotent either way -- the
-                claim holder re-derives the same request ID and the server
-                deduplicates -- so this saves round trips rather than changing
-                the outcome. The record is durable but **un-signalled** until
+                once for the batch. The wake is idempotent either way --
+                every producer waking one generation derives the same request ID
+                and the server deduplicates -- so this saves round trips rather
+                than changing the outcome. The record is durable but **un-signalled** until
                 that call completes, which is the un-acknowledged state made
                 explicit rather than hidden.
 
@@ -350,12 +352,30 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
         not land produces a Workflow Task that finds nothing.
 
         For each subscription parked on this stream, the current generation is
-        claimed under a renewable lease. Losing the claim means another producer
-        holds it and will send the Signal, so this one stays silent: that is the
-        whole purpose of claiming, and duplicate Signals -- while harmless -- are
-        what it exists to avoid. A provider that cannot lease declares
-        ``supports_leased_claims = False``, always grants, and every producer
-        signals.
+        claimed under a renewable lease -- and the Signal is then sent **whether
+        or not the claim was granted**.
+
+        Losing the claim means another producer *intends* to send. It is not
+        evidence that one did: a lease permits takeover after it expires, but it
+        schedules nobody to take over, so a producer that crashed between
+        claiming and signalling strands the generation until some later producer
+        happens to append again. Staying silent there would leave a parked
+        Workflow on a record already sitting in the stream while this call
+        reported an acknowledged wake. The only recovery open to the caller was
+        to send the wake itself -- exactly what :meth:`retry_wake` does with a
+        pending request -- so this sends it now instead of reporting a failure
+        whose only fix is the same send.
+
+        The duplicate that costs is the one that creates a second Workflow Task,
+        and this is not one: a **parked** wake's request ID is derived from the
+        generation and ignores sender identity, so racing producers issue
+        byte-identical requests and the server deduplicates them into a single
+        wake. A granted claim therefore saves a round trip, not a wakeup. A
+        caller appending a batch saves many more of them with ``wake=False``
+        followed by one :meth:`wake`.
+
+        A provider that cannot lease declares ``supports_leased_claims = False``
+        and always grants, which is now the same behaviour every provider gets.
 
         Subscriptions with no installed intent get an *unparked* wake rather than
         nothing (ADR-023). The Workflow may be cached with no open Workflow Task,
@@ -364,8 +384,8 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
         Workflow.
 
         Returns:
-            The request ID of each Signal sent, which may be empty when every
-            claim was already held elsewhere.
+            The request ID of each Signal sent -- one per parked subscription,
+            or a single unparked wake when nothing on this stream is parked.
 
         Raises:
             WakeNotAcknowledgedError: A Signal failed. The record is durable;
@@ -393,14 +413,19 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
 
         requests: list[WakeRequest] = []
         for wait_id, generation in targets:
-            if generation is not None and not await backend.claim_park_generation(
-                self._stream_key,
-                wait_id,
-                generation,
-                claimant=producer.session_id,
-                lease=lease,
-            ):
-                continue
+            if generation is not None:
+                # Claimed, and then signalled whichever way the claim went. The
+                # claim is how a provider learns a wake is in flight and how an
+                # abandoned one becomes takeable after its lease, so it is still
+                # taken -- but its answer is not an acknowledgement, and the
+                # result is deliberately unused. See this method's docstring.
+                await backend.claim_park_generation(
+                    self._stream_key,
+                    wait_id,
+                    generation,
+                    claimant=producer.session_id,
+                    lease=lease,
+                )
             requests.append(
                 wake_request_for(
                     producer.workflow,

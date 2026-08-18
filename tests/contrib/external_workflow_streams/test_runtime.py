@@ -116,15 +116,18 @@ async def test_a_first_subscription_to_an_empty_stream_still_emits(
 ) -> None:
     """Without this, replay of an empty stream has nowhere to begin.
 
-    The header carries provider identity, stream key, and an explicit start
-    cursor -- none of which is derivable later, because a cursor is never
-    re-derived from mutable backend state.
+    The binding carries the stream key, an explicit start cursor, and the
+    backend that owns the wait -- none of which is derivable later, because a
+    cursor is never re-derived from mutable backend state and a provider label
+    cannot say which registered instance a wait was reading.
     """
     key = subscribe(runtime, 1)
 
     decoded = annotation_of(runtime)
 
-    assert decoded.header.provider_id == "memory"  # type: ignore[attr-defined]
+    binding = decoded.header.streams[1]  # type: ignore[attr-defined]
+    assert binding.provider_id == "memory"
+    assert binding.backend_name == "tokens"
     assert decoded.header.streams[1].stream_key == key  # type: ignore[attr-defined]
     assert decoded.header.streams[1].start_cursor == BEGINNING  # type: ignore[attr-defined]
     assert decoded.terminal == {1: BEGINNING}  # type: ignore[attr-defined]

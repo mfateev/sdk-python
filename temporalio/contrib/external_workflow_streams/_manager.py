@@ -52,11 +52,13 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
+from temporalio.contrib.external_workflow_streams._annotation import StreamBinding
 from temporalio.contrib.external_workflow_streams._backend import (
     ParkIntent,
     StreamBackend,
     StreamKey,
 )
+from temporalio.contrib.external_workflow_streams._errors import StreamStorageError
 from temporalio.contrib.external_workflow_streams._replay import (
     ReplayPlan,
     build_replay_plan,
@@ -744,7 +746,8 @@ class StreamSubscriptionManager:
 
         Subscriptions may not exist yet: on replay the Workflow has not run far
         enough to call ``subscribe()``. The annotation's own header carries the
-        stream key and provider for each wait, which is why it records them.
+        stream key, the backend name, and the provider identity for each wait,
+        which is why it records them.
         """
         from temporalio.contrib.external_workflow_streams._annotation import (
             decode_annotation,
@@ -755,20 +758,64 @@ class StreamSubscriptionManager:
         stream_keys: dict[int, StreamKey] = {}
         for wait_id, binding in annotation.header.streams.items():
             stream_keys[wait_id] = binding.stream_key
-            existing = self.subscription(run_id, wait_id)
-            if existing is not None:
-                backends[wait_id] = existing.backend
-            else:
-                # Matched by declared provider id, since the annotation names a
-                # provider rather than a Worker-local backend name.
-                for backend in self._backends.values():
-                    if type(backend).provider_id == annotation.header.provider_id:
-                        backends[wait_id] = backend
-                        break
+            resolved = self._replay_backend(wait_id, binding)
+            if resolved is not None:
+                backends[wait_id] = resolved
 
         plan = await build_replay_plan(replay_annotation, backends, stream_keys)
         self._replay_plans[run_id] = plan
         return plan
+
+    def _replay_backend(
+        self, wait_id: int, binding: StreamBinding
+    ) -> StreamBackend | None:
+        """The one backend a recorded wait may be read from.
+
+        Selection is by the **name the Workflow itself named**, never by a
+        search for something that declares the recorded provider id. A provider
+        id names an implementation, not a store: two Redis instances -- separate
+        clusters, or one cluster with separate key prefixes -- declare the same
+        id and hold entirely different records, so picking the first match reads
+        one wait's recorded range out of a store that never held it. That does
+        not fail cleanly either; the range simply is not there, and it surfaces
+        as integrity loss against a backend nothing is wrong with.
+
+        Returning ``None`` leaves the wait unresolved, which
+        :func:`build_replay_plan` reports as nondeterminism if the annotation
+        recorded any records for it. That is the right reading of a name the
+        Workflow no longer subscribes: the name is Workflow code.
+        """
+        backend = self._backends.get(binding.backend_name)
+        if backend is None:
+            return None
+
+        # Whether the name still resolves to the *same implementation* is a
+        # deployment question, not a Workflow one: the Workflow is unchanged and
+        # the backend is undamaged, so neither nondeterminism nor integrity loss
+        # describes it. It is reported as a storage failure -- retried, and it
+        # clears when a Worker carrying the recorded implementation picks the
+        # task up -- and it is raised before any read, so an incompatible
+        # implementation never gets to interpret the recorded offsets at all.
+        declared_id = type(backend).provider_id
+        if declared_id != binding.provider_id:
+            raise StreamStorageError(
+                f"external stream wait {wait_id} was recorded against provider "
+                f"{binding.provider_id!r}, but the backend registered on this "
+                f"Worker as {binding.backend_name!r} declares {declared_id!r}. "
+                "This Worker cannot read what that marker recorded; register the "
+                "recorded provider under that name."
+            )
+        declared_version = type(backend).provider_format_version
+        if declared_version != binding.provider_format_version:
+            raise StreamStorageError(
+                f"external stream wait {wait_id} was recorded by provider "
+                f"{binding.provider_id!r} format version "
+                f"{binding.provider_format_version}, but the backend registered "
+                f"as {binding.backend_name!r} implements format version "
+                f"{declared_version}. Reading it would interpret the recorded "
+                "offsets under a format they were not written in."
+            )
+        return backend
 
     def take_replay_plan(self, run_id: str) -> ReplayPlan | None:
         """The prepared plan, consumed once by the delivering activation."""
