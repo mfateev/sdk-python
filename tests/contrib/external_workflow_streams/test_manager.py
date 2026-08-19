@@ -859,6 +859,67 @@ async def test_a_stale_answer_is_re_reported_rather_than_dropped(
         await manager.shutdown()
 
 
+@pytest.mark.parametrize("position", [1, 2, 3])
+@pytest.mark.asyncio
+async def test_a_stale_retry_that_finds_the_run_gone_tears_the_watcher_down(
+    stream_key: StreamKey, position: int
+) -> None:
+    """The retries' answer is the answer, and one of them requires a teardown.
+
+    A first report can race a wait-generation change and be answered `Stale`; the
+    Run can then be evicted before the delayed retry that follows. The retry loop
+    kept only whether *some* attempt was accepted and threw the rest away, so
+    control returned with the original `Stale` still in hand: the owed wake went
+    out (right) and the `RunNotFound` teardown never ran (wrong). What is left
+    behind is a watcher, a buffer, a backend read loop and a `_runs` entry for a
+    Run this Worker no longer owns -- and every later readiness report and wake
+    attempt is made on its behalf.
+
+    Parameterized over which retry discovers the eviction, because nothing makes
+    the first one special.
+    """
+    backend = MemoryStreamBackend()
+
+    class StaleThenGone(RecordingNotifier):
+        async def __call__(self, run_id: str, wait_id: int, generation: int) -> str:
+            self.calls.append((run_id, wait_id, generation))
+            self.notified.set()
+            if len(self.calls) < position + 1:
+                return ReadinessResult.STALE
+            return ReadinessResult.RUN_NOT_FOUND
+
+    notifier = StaleThenGone()
+    wake = CountingWake(failures=0)
+    manager = make_manager(backend, notifier, send_wake=wake)
+    try:
+        subscription = manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+        await append(backend, stream_key, b"a")
+
+        await until(
+            lambda: manager.subscription(RUN_ID, 1) is None,
+            "a `RunNotFound` reached on a stale retry left the subscription in "
+            "`_runs`, so this Worker keeps a watcher, a buffer and a read loop "
+            "for a Run it no longer holds",
+        )
+        assert subscription._cancelled, "the dropped subscription is still live"
+        await until(
+            lambda: subscription._watcher is not None and subscription._watcher.done(),
+            "the watcher for a Run that is gone is still reading from the backend",
+        )
+        assert len(wake.counters) == 1, (
+            "the wake `RunNotFound` requires must still be sent exactly once, "
+            f"got {len(wake.counters)}"
+        )
+        assert len(notifier.calls) == position + 1, (
+            "the retries did not stop at `RunNotFound`; a Run that is gone cannot "
+            "come back, and each further attempt delays the wake the record needs"
+        )
+    finally:
+        await manager.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_a_readiness_transport_failure_does_not_kill_the_watcher(
     stream_key: StreamKey,

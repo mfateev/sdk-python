@@ -1264,7 +1264,18 @@ class StreamSubscriptionManager:
             # in the buffer, so nothing would announce it a second time. A
             # record announced to nobody is a Workflow blocked forever on data
             # it is already holding.
-            if await self._retry_stale(subscription):
+            #
+            # `result` is **replaced** by what the retries ended on, not merely
+            # tested. The five answers differ in what happens to the watcher
+            # afterwards, and a retry can legitimately land on a different one
+            # than the first report did -- the Run can be evicted between the
+            # report that raced a generation change and the delayed retry that
+            # follows it. Keeping the original `Stale` there sent the owed wake
+            # (right) and then skipped the `RunNotFound` teardown (wrong), leaving
+            # a watcher, a buffer, a backend read loop and a Run-map entry alive
+            # for a Run this Worker no longer owns.
+            result = await self._retry_stale(subscription)
+            if result == ReadinessResult.ACCEPTED:
                 return
 
         # Everything left means local readiness could not be delivered, so a
@@ -1331,25 +1342,41 @@ class StreamSubscriptionManager:
                     await asyncio.sleep(READINESS_RETRY_DELAY.total_seconds())
         return ReadinessResult.NO_OPEN_WORKFLOW_TASK
 
-    async def _retry_stale(self, subscription: Subscription) -> bool:
+    async def _retry_stale(self, subscription: Subscription) -> str:
         """Re-reports a stale readiness against the generation Core now holds.
 
-        Returns whether the record ended up announced. A generation moves when
-        the wait re-enters the blocked state, which is Workflow code coming back
-        around to it -- so the report that raced it is answered by the next one.
-        Bounded, because a wait that keeps moving is a Workflow consuming
-        happily, and a wake owed at the end of that costs one empty Workflow
-        Task rather than a silent stall.
+        Returns the result the retries ended on, so the caller can act on it. A
+        Boolean would answer only "was it announced", and the four
+        non-``Accepted`` answers are not interchangeable: they differ in what
+        happens to the watcher, and `RunNotFound` in particular requires the
+        watcher to be torn down. Discarding them left that teardown unreachable
+        from here.
+
+        A generation moves when the wait re-enters the blocked state, which is
+        Workflow code coming back around to it -- so the report that raced it is
+        answered by the next one. Bounded, because a wait that keeps moving is a
+        Workflow consuming happily, and a wake owed at the end of that costs one
+        empty Workflow Task rather than a silent stall.
+
+        `RunNotFound` ends the retries rather than using them up. It is the one
+        answer that cannot change back: the Run is gone from this Worker, so a
+        further report can only be answered the same way, and each attempt costs a
+        delay before the wake this record still needs.
         """
+        result = ReadinessResult.STALE
         for _ in range(STALE_REPORT_ATTEMPTS):
             await asyncio.sleep(STALE_RETRY_DELAY.total_seconds())
             if subscription._cancelled or not subscription.buffered:
-                return True
-            if await self._notify_ready_with_retries(subscription) == (
-                ReadinessResult.ACCEPTED
-            ):
-                return True
-        return False
+                # Nothing left to announce: either the wait is gone or an
+                # activation drained the buffer, which is the record having been
+                # delivered by the very block this report raced. Reported as
+                # `Accepted` because that is what the caller does with it -- stop,
+                # and owe no wake.
+                return ReadinessResult.ACCEPTED
+            result = await self._notify_ready_with_retries(subscription)
+            if result in (ReadinessResult.ACCEPTED, ReadinessResult.RUN_NOT_FOUND):
+                return result
+        return result
 
     # --- the runtime-only jobs' backend work (P19) --------------------------
 

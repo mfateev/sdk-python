@@ -30,6 +30,7 @@ import temporalio.workflow
 from temporalio.contrib.external_workflow_streams._backend import StreamKey
 from temporalio.contrib.external_workflow_streams._codec import StreamPayloadCodec
 from temporalio.contrib.external_workflow_streams._errors import (
+    ConcurrentStreamConsumerError,
     StreamError,
     classify_read_failure,
 )
@@ -455,6 +456,12 @@ async def _await_any_readiness(
     """
     runtime = subscriptions[0]._state.runtime
     assert runtime is not None
+    # Every member is checked before any is registered. A merge that refused
+    # half-way would leave the earlier waits registered and blocked with no
+    # coroutine behind them, which is the state that asks Core to retain a
+    # Workflow Task for nobody.
+    for subscription in subscriptions:
+        subscription._refuse_a_second_waiter()
     futures = []
     for subscription in subscriptions:
         runtime.note_blocked(subscription.wait_id, True)
@@ -502,7 +509,20 @@ async def _await_any_readiness(
 
 
 class ExternalStreamSubscription(Generic[AnyType]):
-    """One subscription's async iterator over decoded values."""
+    """One subscription's async iterator over decoded values.
+
+    **One consumer.** The cursor, the readiness future, and the blocked flag are
+    all the subscription's rather than an iterator's, so two coroutines waiting on
+    it at once is refused with
+    :class:`~temporalio.contrib.external_workflow_streams._errors.ConcurrentStreamConsumerError`
+    rather than served -- see :meth:`_refuse_a_second_waiter` for what sharing
+    them would do. Two consumers of the same *stream* is a supported shape and
+    the way to ask for it is a second ``subscribe()``: delivery is a broadcast
+    (ADR-021), so each wait gets every record and keeps its own cursor.
+
+    Iterating the same subscription again after the previous consumer has stopped
+    is fine, and resumes where it left off.
+    """
 
     def __init__(
         self,
@@ -538,6 +558,11 @@ class ExternalStreamSubscription(Generic[AnyType]):
         return self._topic.options.idle_timeout
 
     def __aiter__(self) -> AsyncIterator[AnyType]:
+        """A fresh generator over the *same* cursor, not an independent view.
+
+        Which is why a second one running concurrently is refused rather than
+        interleaved: see :meth:`_refuse_a_second_waiter`.
+        """
         return self._iterate()
 
     async def _iterate(self) -> AsyncIterator[AnyType]:
@@ -582,9 +607,14 @@ class ExternalStreamSubscription(Generic[AnyType]):
         already here or it is not, and if it is not, only Core can say when to
         look again.
 
-        Bounded by the activation's remaining delivery budget. A drain that took
-        the whole buffer would be handed straight back by a producer that keeps
-        refilling it, and this activation would never return.
+        Bounded by the activation's remaining delivery budget, **and charged
+        against it here**. A drain that took the whole buffer would be handed
+        straight back by a producer that keeps refilling it, and this activation
+        would never return. Charging where the records move rather than where they
+        are later consumed is what makes the bound a reservation: a drain that
+        checked the budget and charged nothing left the same room visible to the
+        next subscription's drain, so two subscriptions consumed in two
+        independent coroutines took the whole budget each.
 
         ``limit`` bounds it further, for a caller that will consume fewer records
         than the budget allows. :py:func:`merge` passes 1: it takes one record
@@ -594,6 +624,11 @@ class ExternalStreamSubscription(Generic[AnyType]):
         out of one has nothing left to announce it.
         """
         if self._ready:
+            # Nothing to check the budget for: these records are already charged
+            # -- by the drain that took them, and again by the `begin_activation`
+            # of any later activation that inherits them, since each activation
+            # pays for what it may hand over. A check here would refuse a record
+            # this activation has already been billed for.
             return
         assert self._state.runtime is not None
         budget = self._state.runtime.delivery_budget_remaining()
@@ -643,11 +678,51 @@ class ExternalStreamSubscription(Generic[AnyType]):
         Called only once the record has actually become a value -- or, for a
         control record, once it has been skipped, which is the whole of what
         receiving one means.
+
+        Spends no delivery budget: the drain that put this record here already
+        did. What it does tell the runtime is that the record has left the ready
+        list, which is what stops the next activation being charged for it.
         """
         assert self._state.runtime is not None
         assert self._ready and self._ready[0] is record
         self._ready.pop(0)
         self._state.runtime.record_consumption(self._wait_id, record)
+
+    def _refuse_a_second_waiter(self) -> None:
+        """Refuses a second coroutine blocking on this subscription.
+
+        One subscription, one consumer. Everything a blocked wait is found
+        through is single-slot -- :attr:`_pending_future` here, and the runtime's
+        pending map keyed by wait id -- so a second waiter does not queue behind
+        the first, it *replaces* it: readiness resolves only the newer future, its
+        ``finally`` removes the map entry, and the older one is left unreachable by
+        the readiness activation and by :meth:`close` alike. That coroutine is
+        stranded for the life of the Run, and the shared blocked flag can even say
+        the wait is no longer blocked while it is still sitting there.
+
+        Refused here, at the point a *second waiter appears*, rather than at
+        ``__aiter__``. Two coroutines inside ``_iterate`` at once is only possible
+        while one of them is suspended, and the only suspension point in there is
+        this wait -- a generator suspended at its ``yield`` is not inside
+        ``_iterate`` at all, it is between ``__anext__`` calls. So this catches
+        every genuinely concurrent consumer, while a guard on the iterator would
+        also refuse the sequential shape that works today: taking some records,
+        breaking out of the loop, and coming back to the same subscription later.
+        A broken-out-of ``async for`` leaves its generator suspended rather than
+        closed, so the iterator-level guard cannot tell that shape from this one
+        (ADR-037).
+        """
+        if self._pending_future is None:
+            return
+        raise ConcurrentStreamConsumerError(
+            f"external stream wait {self._wait_id} already has a coroutine "
+            "blocked on it. A subscription is a single consumer: it has one "
+            "cursor and one readiness future, so a second waiter would replace "
+            "the first and strand it permanently. Iterate one subscription from "
+            "one coroutine, or subscribe again -- a second subscription to the "
+            "same stream is its own wait with its own cursor, and delivery is a "
+            "broadcast."
+        )
 
     async def _await_readiness(self) -> None:
         """Blocks until the readiness activation resolves this wait.
@@ -657,6 +732,7 @@ class ExternalStreamSubscription(Generic[AnyType]):
         arrived.
         """
         assert self._state.runtime is not None
+        self._refuse_a_second_waiter()
         # Entering the blocked state is what the wait generation counts, and is
         # what later makes a readiness notification for *this* block
         # distinguishable from one for a block already resolved.

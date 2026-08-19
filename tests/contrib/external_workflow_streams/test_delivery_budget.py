@@ -30,6 +30,7 @@ import temporalio.converter
 import temporalio.workflow
 from temporalio.contrib.external_workflow_streams import _runtime as _runtime_module
 from temporalio.contrib.external_workflow_streams._annotation import (
+    MAX_ANNOTATION_BYTES,
     SegmentEndReason,
     decode_annotation,
 )
@@ -341,6 +342,157 @@ async def test_merge_blocks_on_every_wait_once_the_budget_is_spent(
         "the complete set must be blocked, not just the stream that happened to "
         "spend the last of the budget"
     )
+    await cancel(task)
+
+
+async def settle_all(
+    tasks: list[asyncio.Task[None]], counted: list[list[Any]], expected: int
+) -> None:
+    """`settle`, over several consumers that share one budget between them."""
+    deadline = time.monotonic() + 5
+    while (
+        sum(len(seen) for seen in counted) < expected
+        and not any(task.done() for task in tasks)
+        and time.monotonic() < deadline
+    ):
+        await asyncio.sleep(0.005)
+    await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_two_independent_consumers_share_one_budget(
+    workflow_instance: FakeInstance, backend: MemoryStreamBackend
+) -> None:
+    """The same property as the merge case, without `merge()` to enforce it.
+
+    `merge()` fills one record at a time, so it spends the budget in the same
+    places it checks it. Two ordinary subscriptions consumed by two ordinary
+    coroutines do not: each one drains a whole batch into its own ready list, and
+    a budget that is *checked* at the drain but *charged* at consumption is no
+    budget at all. The first subscription takes all 256 slots into its private
+    list and yields one, so the second sees 255 still available and takes those,
+    and both then drain lists nothing will check again. Measured at 511 records
+    before either coroutine blocked, and it is `n` times the cap for `n`
+    consumers -- the same deadlock the merge case is about, reached without
+    merging anything.
+    """
+    manager = NeverEmptyManager(await encoded("x"))
+    runtime = make_runtime(manager, backend)
+    _install_runtime(workflow_instance, runtime)
+    runtime.begin_activation()
+    first = external_stream.topic("a", backend="tokens", type=str).subscribe()
+    second = external_stream.topic("b", backend="tokens", type=str).subscribe()
+
+    seen_first: list[str] = []
+    seen_second: list[str] = []
+
+    async def consume_yielding(subscription: Any, seen: list[str]) -> None:
+        # Awaiting after every value is what lets the other coroutine reach its
+        # own drain, which is the whole shape: two private ready lists, filled
+        # from one budget, consumed independently.
+        async for value in subscription:
+            seen.append(value)
+            await asyncio.sleep(0)
+
+    tasks = [
+        asyncio.ensure_future(consume_yielding(first, seen_first)),
+        asyncio.ensure_future(consume_yielding(second, seen_second)),
+    ]
+    await settle_all(tasks, [seen_first, seen_second], MAX_RECORDS_PER_ACTIVATION)
+
+    try:
+        assert len(seen_first) + len(seen_second) == MAX_RECORDS_PER_ACTIVATION, (
+            "two independently consumed subscriptions spent more than one "
+            "activation's budget between them; with enough streams this is the "
+            "activation that never returns"
+        )
+        assert all(not task.done() for task in tasks)
+        assert runtime.delivery_budget_remaining() == 0
+        assert runtime.delivery_budget_exhausted()
+        # Both are blocked, which is what ends the activation. A consumer still
+        # holding a ready list would not be, and the assertion above would have
+        # been reached with records left to hand over.
+        assert runtime.resolve_all_pending() == 2, (
+            "both consumers must be parked on a readiness future once the budget "
+            "is spent, not sitting on a private ready list the cap cannot see"
+        )
+        # And what the activation *recorded* matches what it delivered: the
+        # segment is the schedule replay reproduces, so a cap that bounded
+        # consumption while the annotation recorded delivery bounded the wrong
+        # quantity.
+        delta = runtime.take_observation_delta()
+        assert delta is not None
+        encoded_annotation = delta + runtime.add_terminal()
+        annotation = decode_annotation(encoded_annotation)
+        recorded = sum(
+            run.count for segment in annotation.segments for run in segment.runs
+        )
+        assert recorded == MAX_RECORDS_PER_ACTIVATION
+        # And it still fits. Delivering two speculative batches put both in the
+        # current annotation before the counter caught up, so the same schedule
+        # could also overrun the affordability calculation and turn the intended
+        # rollover into a Workflow Task failure that repeats on every attempt.
+        assert len(encoded_annotation) <= MAX_ANNOTATION_BYTES
+    finally:
+        for task in tasks:
+            await cancel(task)
+
+
+@pytest.mark.asyncio
+async def test_a_carried_over_ready_list_is_charged_to_the_next_activation(
+    workflow_instance: FakeInstance, backend: MemoryStreamBackend
+) -> None:
+    """The same hole from the other side, and the reason the reset is not to zero.
+
+    A batch is delivered whole and consumed one record at a time, so a consumer
+    that stops part-way through leaves the rest in its ready list -- where the
+    next activation takes it with no drain, and so with no budget check. Charging
+    only at the drain would make that remainder free, and it accumulates: one
+    subscription per activation can leave a nearly full list behind, so `n` of
+    them arrive holding `n` times the cap and hand all of it over in one
+    `activate()` call.
+
+    Nothing is redelivered here and no drain is needed, so what the budget must
+    bound is what Workflow code can *take*: the carry-over plus whatever is newly
+    delivered, together, is one cap.
+    """
+    manager = NeverEmptyManager(await encoded("x"))
+    runtime = make_runtime(manager, backend)
+    _install_runtime(workflow_instance, runtime)
+    runtime.begin_activation()
+    subscription = external_stream.topic(
+        "tokens", backend="tokens", type=str
+    ).subscribe()
+
+    # One activation that delivers a whole batch and consumes a single record,
+    # which is the ordinary shape of a consumer that does real work per record:
+    # the loop body blocks on something else and the activation ends.
+    seen: list[str] = []
+    iterator = subscription.__aiter__()
+    seen.append(await iterator.__anext__())
+    assert runtime.delivery_budget_remaining() == 0
+    carried = MAX_RECORDS_PER_ACTIVATION - 1
+
+    runtime.begin_activation()
+
+    assert (
+        runtime.delivery_budget_remaining() == MAX_RECORDS_PER_ACTIVATION - carried
+    ), (
+        f"the next activation was handed a whole fresh budget on top of {carried} "
+        "records already in Workflow code's hands; that remainder is consumed "
+        "with no drain and so with no check, and it accumulates across streams"
+    )
+    # Everything carried over is still handed over -- the records are already here
+    # and refusing them would strand them, since nothing re-announces a record
+    # already popped out of the manager's buffer -- and the whole activation still
+    # totals one cap rather than the carry-over plus another one.
+    task = asyncio.ensure_future(consume(iterator, seen))
+    await settle(task, seen, MAX_RECORDS_PER_ACTIVATION + 1)
+    assert len(seen) - 1 == MAX_RECORDS_PER_ACTIVATION, (
+        "the second activation handed over the carry-over and a fresh cap on top "
+        "of it; what it may hand over is one cap in total"
+    )
+    assert not task.done()
     await cancel(task)
 
 
@@ -932,8 +1084,11 @@ def test_a_wait_the_budget_stopped_is_not_immediately_parkable(
     fenced = runtime.quiescent_snapshot()
     assert fenced is not None and fenced[0].immediately_parkable
 
-    for i in range(MAX_RECORDS_PER_ACTIVATION):
-        runtime.record_consumption(1, record)
+    # Spent through `record_delivery`, which is where the budget is charged: a
+    # record moving into a subscription's ready list is the reservation, and the
+    # consumption that follows it costs nothing.
+    for _ in range(MAX_RECORDS_PER_ACTIVATION):
+        runtime.record_delivery(1, record)
 
     stopped = runtime.quiescent_snapshot()
     assert stopped is not None and not stopped[0].immediately_parkable
@@ -1102,9 +1257,10 @@ async def test_replay_delivers_in_full_even_when_the_live_budget_is_spent(
         "tokens", backend="tokens", type=str
     ).subscribe()
 
-    # Spend the whole live budget first.
+    # Spend the whole live budget first, through the delivery that charges it.
     spent = StreamRecord(RecordKind.DATA, payload, "s", 0).placed_at(Offset("live"))
     for _ in range(MAX_RECORDS_PER_ACTIVATION):
+        runtime.record_delivery(subscription.wait_id, spent)
         runtime.record_consumption(subscription.wait_id, spent)
     assert runtime.delivery_budget_remaining() == 0
 

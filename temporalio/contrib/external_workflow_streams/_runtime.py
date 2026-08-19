@@ -169,6 +169,20 @@ class _SubscriptionState:
     blocked: bool = True
     """Whether Workflow code is currently waiting on this subscription."""
 
+    ready_records: int = 0
+    """Records delivered to this subscription's ready list and not yet consumed.
+
+    What separates :attr:`delivery_cursor` from :attr:`consumption_cursor`, as a
+    count rather than as two boundaries -- until a close drops the ready list,
+    which zeroes this while leaving both cursors where they were. Kept
+    because the per-activation delivery budget has to be charged for records
+    *already in Workflow code's hands* at the start of an activation as well as
+    for the ones it delivers during it: a ready list carried across an activation
+    boundary is consumed with no drain and therefore no budget check, and n
+    subscriptions each carrying one would otherwise let one activation run for n
+    times the cap.
+    """
+
     closed: bool = False
     """Whether Workflow code has ended this subscription.
 
@@ -272,11 +286,12 @@ class WorkflowStreamRuntime:
         #: only for the length of one replay job, which is what makes a
         #: registration made during it checkable against what was recorded.
         self._replay_bindings: dict[int, StreamBinding] | None = None
-        #: Records handed to Workflow code since this activation began. Counted
-        #: here rather than per subscription because the cap is an *activation*
-        #: budget: `merge()` consumes from several subscriptions inside one
-        #: activation, and a per-subscription counter would let n streams run n
-        #: times as long.
+        #: Records this activation has put into Workflow code's hands, whether by
+        #: delivering them or by starting with them already in a ready list.
+        #: Counted here rather than per subscription because the cap is an
+        #: *activation* budget: `merge()` consumes from several subscriptions
+        #: inside one activation, and a per-subscription counter would let n
+        #: streams run n times as long.
         self._delivered_this_activation = 0
 
     # --- the per-activation delivery budget ---------------------------------
@@ -287,8 +302,23 @@ class WorkflowStreamRuntime:
         The budget is per activation because that is the unit the deadlock
         timeout applies to: what must be bounded is how long one ``activate()``
         call can run, not how much a Run receives over its life.
+
+        **Reset to what is already in Workflow code's hands, not to zero.** A
+        batch is delivered whole and consumed one record at a time, so an
+        activation that stops iterating part-way through leaves the rest in the
+        subscription's ready list -- where the *next* activation consumes it with
+        no drain, and so with no budget check of any kind. Zeroing here would make
+        that carried-over remainder free, and it accumulates: one subscription can
+        drain a full batch, consume one record and block elsewhere on every
+        activation in turn, so n subscriptions arrive at an activation holding
+        roughly n times the cap between them and hand all of it over in one
+        `activate()` call. Starting the count at the carry-over makes what an
+        activation may hand over -- carried-over plus newly delivered -- exactly
+        the cap, whatever the schedule.
         """
-        self._delivered_this_activation = 0
+        self._delivered_this_activation = sum(
+            state.ready_records for state in self._subscriptions.values()
+        )
 
     def delivery_budget_remaining(self) -> int:
         """How many more records this activation may hand to Workflow code.
@@ -328,6 +358,16 @@ class WorkflowStreamRuntime:
         exactly the same way, and its rollover ends the Workflow Task rather than
         the activation -- so the successor task has to be told the buffer is not
         empty just as the next activation would have been.
+
+        **Conservative rather than exact**, in both of the ways the count can
+        reach the cap: an activation whose last drain happened to empty the buffer
+        did not stop *because* of the budget, and an activation pre-charged for a
+        carried-over ready list may not have tried to deliver at all. Both
+        over-report, and over-reporting is the safe direction -- a re-arm for an
+        empty buffer is skipped by the manager, and a wait wrongly withheld from
+        immediate parkability is retained for its idle timeout instead of parked.
+        Under-reporting loses records: nothing else announces what a budget left
+        behind.
         """
         return self._replay_ready is None and (
             self._delivered_this_activation >= MAX_RECORDS_PER_ACTIVATION
@@ -913,12 +953,35 @@ class WorkflowStreamRuntime:
         indices go in ``control_positions``. Omitting them would make replay's
         range read find more records than the marker claims and fail as
         integrity loss.
+
+        **Also where the activation's delivery budget is spent.** Delivery is the
+        moment a record leaves the manager's buffer for a subscription's private
+        ready list, and that is what has to be charged rather than the later
+        consumption of it, for two reasons that point the same way. The budget is
+        a *reservation*: a drain that checked the budget and charged nothing let
+        the next subscription's drain see the same room and take it again, so two
+        subscriptions consumed independently -- no `merge()` involved -- delivered
+        twice the cap in one activation, and n of them n times it. And delivery is
+        what the annotation records, so a cap charged at consumption bounded a
+        different quantity than the segment it is supposed to bound: the recorded
+        segment could hold more records than the cap replay will divide it by.
         """
         state = self._subscriptions.get(wait_id)
+        if self._replay_ready is None:
+            # Counted before the guards below so that a record whose subscription
+            # has already gone still costs its budget: the cap has to bound the
+            # activation whatever the bookkeeping says.
+            #
+            # Replayed records are deliberately not counted, not merely not
+            # capped. Counting them would leave the budget spent for any live
+            # delivery later in the same activation, and would make the completion
+            # re-arm readiness on a purely replayed Workflow Task.
+            self._delivered_this_activation += 1
         if state is None or record.offset is None:
             return
 
         state.delivery_cursor = AFTER(record.offset)
+        state.ready_records += 1
         state.fence_reached = record.is_control
 
         if self._replay_ready is not None:
@@ -984,6 +1047,13 @@ class WorkflowStreamRuntime:
             return
         state.closed = True
         state.blocked = False
+        # Whatever was drained but never handed over is dropped rather than
+        # consumed -- that is what leaves the consumption cursor short of it, so a
+        # Continue-As-New successor receives it. It also stops being carry-over the
+        # next activation's budget has to pay for: those records are gone, and a
+        # count left standing would shrink every later activation's budget by the
+        # size of a ready list nobody can consume.
+        state.ready_records = 0
         self._manager.cancel_from_workflow_thread(self._run_id, wait_id)
 
     def note_blocked(self, wait_id: int, blocked: bool) -> None:
@@ -1181,23 +1251,18 @@ class WorkflowStreamRuntime:
         the Workflow never asked for -- which die with the Run, and which a
         successor must therefore still receive.
 
-        Also where the activation's delivery budget is spent, because this is
-        called exactly once per record actually handed over -- unlike delivery,
-        which moves in whole batches, and unlike decoding, which control records
-        skip. Counted before the guards below so that a record whose subscription
-        has already gone still costs its budget: the cap has to bound the
-        activation whatever the bookkeeping says.
+        Not where the delivery budget is spent -- :meth:`record_delivery` is,
+        because the budget has to be reserved by the drain that moves a whole
+        batch into a ready list rather than charged one record at a time
+        afterwards. What this does spend is the *carry-over* the next
+        :meth:`begin_activation` starts its count from: a record consumed here is
+        one the next activation no longer has in hand.
         """
-        if self._replay_ready is None:
-            # Replayed records are deliberately not counted, not merely not
-            # capped. Counting them would leave the budget spent for any live
-            # delivery later in the same activation, and would make the
-            # completion re-arm readiness on a purely replayed Workflow Task.
-            self._delivered_this_activation += 1
         state = self._subscriptions.get(wait_id)
         if state is None or record.offset is None:
             return
         state.consumption_cursor = AFTER(record.offset)
+        state.ready_records = max(0, state.ready_records - 1)
 
     def continuation(self) -> Continuation:
         """Where each subscription had got to, for the successor Run.

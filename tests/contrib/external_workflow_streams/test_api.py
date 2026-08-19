@@ -20,10 +20,14 @@ from temporalio.contrib.external_workflow_streams._api import (
     ExternalStreamTopic,
     _install_runtime,
     external_stream,
+    merge,
 )
 from temporalio.contrib.external_workflow_streams._backend import StreamKey
 from temporalio.contrib.external_workflow_streams._codec import StreamPayloadCodec
-from temporalio.contrib.external_workflow_streams._errors import StreamDecodeError
+from temporalio.contrib.external_workflow_streams._errors import (
+    ConcurrentStreamConsumerError,
+    StreamDecodeError,
+)
 from temporalio.contrib.external_workflow_streams._manager import PreparedRecord
 from temporalio.contrib.external_workflow_streams._record import (
     RecordKind,
@@ -88,7 +92,6 @@ class FakeRuntime:
 
     def record_consumption(self, wait_id: int, record: StreamRecord) -> None:
         self.consumed.append((wait_id, record))
-        self.budget = max(0, self.budget - 1)
 
     def codec_for(self, value_type: type | None) -> StreamPayloadCodec[Any]:
         if self.codec is not None:
@@ -102,6 +105,9 @@ class FakeRuntime:
 
     def record_delivery(self, wait_id: int, record: StreamRecord) -> None:
         self.deliveries.append((wait_id, record))
+        # Charged where the real runtime charges it: the drain that moves a record
+        # into a ready list is the reservation, not the consumption that follows.
+        self.budget = max(0, self.budget - 1)
 
     def note_blocked(self, wait_id: int, blocked: bool) -> None:
         self.blocked.append((wait_id, blocked))
@@ -373,6 +379,119 @@ def test_closing_a_subscription_unsubscribes_it(runtime: FakeRuntime) -> None:
     # the Worker has already dropped this wait.
     subscription.close()
     assert runtime.unsubscribed == [subscription.wait_id]
+
+
+# --- one subscription, one consumer -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_second_coroutine_waiting_on_one_subscription_is_refused(
+    runtime: FakeRuntime,
+) -> None:
+    """Sharing a single-slot wait between two waiters strands one of them forever.
+
+    ``__aiter__`` returns a new generator every time, but everything a blocked
+    wait is found through is the subscription's: one ``_pending_future`` and one
+    entry in the runtime's pending map, keyed by wait id. A second waiter
+    therefore *replaced* the first in both places -- readiness resolved only the
+    newer one, its ``finally`` removed the map entry, and the older future became
+    unreachable by the readiness activation and by ``close()`` alike. Observed as
+    a coroutine still pending after a record had been buffered, readiness
+    resolved, and the subscription closed: permanently stuck, with the shared
+    blocked flag saying the wait was not even blocked.
+    """
+    subscription = external_stream.topic(
+        "tokens", backend="tokens-redis", type=str
+    ).subscribe()
+
+    first = asyncio.ensure_future(subscription.__aiter__().__anext__())
+    await asyncio.sleep(0.05)
+    assert subscription.wait_id in runtime.pending, (
+        "the first consumer has to be registered and blocked before a second one "
+        "can overwrite it"
+    )
+
+    with pytest.raises(ConcurrentStreamConsumerError, match="single consumer"):
+        await subscription.__aiter__().__anext__()
+
+    # The refusal changed nothing about the consumer that was already there.
+    assert runtime.pending[subscription.wait_id] is subscription._pending_future
+    codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
+    runtime.buffers[subscription.wait_id] = [
+        StreamRecord(RecordKind.DATA, await codec.encode("a"), "s", 0)
+    ]
+    runtime.pending[subscription.wait_id].set_result(None)
+
+    assert await asyncio.wait_for(first, 1) == "a"
+    assert not runtime.pending, "the resolved wait was left registered"
+    assert subscription._pending_future is None
+
+
+@pytest.mark.asyncio
+async def test_iterating_again_after_the_first_consumer_stopped_is_allowed(
+    runtime: FakeRuntime,
+) -> None:
+    """The shape the refusal must not catch, which is why it is not on the iterator.
+
+    Taking a few records, doing something else, and coming back to the same
+    subscription is ordinary code, and a ``break`` leaves the generator *suspended*
+    rather than closed -- so a guard that claimed the subscription for an iterator
+    could not tell that shape from two live consumers, and would refuse it.
+    """
+    codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
+    subscription = external_stream.topic(
+        "tokens", backend="tokens-redis", type=str
+    ).subscribe()
+    runtime.buffers[subscription.wait_id] = [
+        StreamRecord(RecordKind.DATA, await codec.encode(value), "s", i)
+        for i, value in enumerate(["a", "b"])
+    ]
+
+    async for value in subscription:
+        assert value == "a"
+        break
+
+    # The abandoned generator is still suspended at its `yield`; nothing closed
+    # it. A second pass must still work, and must resume rather than restart.
+    async for value in subscription:
+        assert value == "b"
+        break
+
+
+@pytest.mark.asyncio
+async def test_a_merge_cannot_take_a_wait_another_consumer_is_blocked_on(
+    runtime: FakeRuntime,
+) -> None:
+    """``merge()`` registers the same single slot, so it is the same defect.
+
+    And it fails *before* registering anything, because a merge that refused
+    half-way would leave its earlier waits blocked with no coroutine behind them
+    -- which is the state that asks Core to retain a Workflow Task for nobody.
+    """
+    first = external_stream.topic("a", backend="tokens-redis", type=str).subscribe()
+    second = external_stream.topic("b", backend="tokens-redis", type=str).subscribe()
+
+    solo = asyncio.ensure_future(second.__aiter__().__anext__())
+    await asyncio.sleep(0.05)
+    assert set(runtime.pending) == {second.wait_id}
+
+    async def consume_merged() -> None:
+        async for _ in merge(first, second):
+            pass
+
+    with pytest.raises(ConcurrentStreamConsumerError):
+        await consume_merged()
+
+    assert set(runtime.pending) == {second.wait_id}, (
+        "the refused merge left a wait registered, or took the one that was "
+        "already blocked"
+    )
+    assert first._pending_future is None
+    solo.cancel()
+    try:
+        await solo
+    except asyncio.CancelledError:
+        pass
 
 
 # --- names --------------------------------------------------------------------

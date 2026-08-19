@@ -9,6 +9,7 @@ are asserted here rather than assumed: the envelope bypasses the user's
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import pathlib
 import re
 import uuid
@@ -23,15 +24,22 @@ from temporalio import workflow
 from temporalio.client import Client
 from temporalio.worker import Worker
 from temporalio.bridge.proto.external_stream.external_stream_pb2 import WakeSignal
-from temporalio.contrib.external_workflow_streams._backend import ParkIntent, StreamKey
+from temporalio.contrib.external_workflow_streams._backend import (
+    AppendConflictError,
+    ParkIntent,
+    StreamKey,
+)
 from temporalio.contrib.external_workflow_streams._producer import (
+    AppendNotAcknowledgedError,
     ExternalStreamProducer,
     WakeNotAcknowledgedError,
     WorkflowChainKey,
 )
 from temporalio.contrib.external_workflow_streams._record import (
     BEGINNING,
+    Offset,
     RecordKind,
+    StreamRecord,
 )
 from temporalio.contrib.external_workflow_streams._wake import (
     UNPARKED_WAKE_GENERATION,
@@ -651,6 +659,507 @@ async def test_a_coordination_failure_after_a_fence_is_still_unacknowledged() ->
     assert len([r for r in records if r.kind == RecordKind.WRITE_FENCE]) == 1, (
         "the stream holds more than the one fence that was written"
     )
+
+
+class BlockingCoordinationBackend(MemoryStreamBackend):
+    """Appends, then blocks once in one named coordination call.
+
+    One-shot, so the recovery the test performs afterwards can get through. The
+    append is never blocked: the record is durable before the block is reached,
+    which is the state the whole contract is about.
+    """
+
+    def __init__(self, blocking: str) -> None:
+        super().__init__()
+        self.blocking = blocking
+        self.reached = asyncio.Event()
+
+    async def _maybe_block(self, name: str) -> None:
+        if name != self.blocking:
+            return
+        self.blocking = ""
+        self.reached.set()
+        await asyncio.Event().wait()
+
+    async def parked_wait_ids(self, key):  # type: ignore[no-untyped-def]
+        await self._maybe_block("parked_wait_ids")
+        return await super().parked_wait_ids(key)
+
+    async def current_park_generation(self, key, wait_id):  # type: ignore[no-untyped-def]
+        await self._maybe_block("current_park_generation")
+        return await super().current_park_generation(key, wait_id)
+
+    async def claim_park_generation(self, key, wait_id, generation, **kwargs):  # type: ignore[no-untyped-def,override]
+        await self._maybe_block("claim_park_generation")
+        return await super().claim_park_generation(key, wait_id, generation, **kwargs)
+
+
+class BlockingClient(RecordingClient):
+    """A client whose first Signal send never completes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reached = asyncio.Event()
+        self.blocking = True
+
+    async def signal_workflow_execution(self, request) -> None:  # type: ignore[no-untyped-def]
+        if self.blocking:
+            self.blocking = False
+            self.reached.set()
+            await asyncio.Event().wait()
+        await super().signal_workflow_execution(request)
+
+
+async def _recover(topic, error: WakeNotAcknowledgedError) -> None:  # type: ignore[no-untyped-def]
+    """The recovery the error names, and only that one."""
+    assert bool(error.pending) != bool(error.restart), (
+        "the error must name exactly one recovery: `pending` to re-send, or "
+        "`restart` to compose a fresh wake. Both or neither leaves the caller "
+        "guessing about a record that is already durable"
+    )
+    if error.pending:
+        await topic.retry_wake(error.pending)
+    else:
+        await topic.wake()
+
+
+@pytest.mark.parametrize(
+    "stage",
+    ["parked_wait_ids", "current_park_generation", "claim_park_generation", "signal"],
+)
+@pytest.mark.asyncio
+async def test_cancellation_after_the_append_is_an_unacknowledged_wake(
+    stage: str,
+) -> None:
+    """Cancellation is not a third outcome, and it must not read like the first.
+
+    ``CancelledError`` is a ``BaseException``, so it passed through every handler
+    on this path -- the coordination block re-raised it deliberately, the Signal
+    loop caught only ``Exception``, and ``publish()`` catches only the
+    durable-but-unacknowledged error. What escaped was a bare ``CancelledError``
+    with no offset, no ``pending`` and no ``restart``: indistinguishable from
+    cancellation *before* the append, and so unrecoverable in both directions. The
+    caller could neither wake the record it did not know about nor re-publish the
+    value safely -- retrying ``publish()`` draws a new sequence number and appends
+    a second record.
+
+    Parameterized over all four post-append stages, because the state they leave
+    is the same and only the recovery differs.
+    """
+    backend = BlockingCoordinationBackend("" if stage == "signal" else stage)
+    signalling = BlockingClient() if stage == "signal" else None
+    client: RecordingClient = signalling or RecordingClient()
+    topic = make_producer(backend, client).topic("tokens", type=str)
+    await park(backend, topic.stream_key, wait_id=1, gen=4)
+    reached = signalling.reached if signalling is not None else backend.reached
+
+    task = asyncio.ensure_future(topic.publish("a"))
+    await asyncio.wait_for(reached.wait(), 2)
+    task.cancel()
+
+    with pytest.raises(WakeNotAcknowledgedError) as caught:
+        await task
+
+    assert caught.value.cancelled, (
+        "the cancellation is reported rather than swallowed: a caller that wants "
+        "to honour it after recovering the wake still has to know it was asked "
+        "to stop"
+    )
+    assert caught.value.offset is not None, (
+        "a cancellation carrying no offset cannot be told apart from one before "
+        "the append, so the caller cannot know whether the value is published"
+    )
+    await _recover(topic, caught.value)
+
+    records = await backend.read_after(topic.stream_key, BEGINNING, max_records=10)
+    assert [r.sequence for r in records if r.kind == RecordKind.DATA] == [0], (
+        "recovering the wake alone left more than the one record that was published"
+    )
+    assert client.sent, "the recovery sent no Signal, so the record stays unannounced"
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_a_fence_is_an_unacknowledged_wake() -> None:
+    """A fence carries the identical contract, and a worse duplicate.
+
+    Retrying ``finish_writing()`` appends a second fence, which reads back as a
+    producer session that ended twice.
+    """
+    backend = BlockingCoordinationBackend("parked_wait_ids")
+    client = RecordingClient()
+    topic = make_producer(backend, client).topic("tokens", type=str)
+    await park(backend, topic.stream_key, wait_id=1, gen=4)
+
+    task = asyncio.ensure_future(topic.finish_writing())
+    await asyncio.wait_for(backend.reached.wait(), 2)
+    task.cancel()
+
+    with pytest.raises(WakeNotAcknowledgedError) as caught:
+        await task
+
+    assert caught.value.cancelled and caught.value.offset is not None
+    await _recover(topic, caught.value)
+
+    records = await backend.read_after(topic.stream_key, BEGINNING, max_records=10)
+    assert len([r for r in records if r.kind == RecordKind.WRITE_FENCE]) == 1, (
+        "the stream holds more than the one fence that was written"
+    )
+
+
+class BlockingEncodeCodec(temporalio.converter.PayloadCodec):
+    """A codec whose first ``encode`` never completes.
+
+    The one place a cancellation is *knowably* pre-append: the record has not
+    been built, let alone handed to the backend, so no provider anywhere can have
+    committed it.
+    """
+
+    def __init__(self) -> None:
+        self.reached = asyncio.Event()
+
+    async def encode(self, payloads):  # type: ignore[no-untyped-def]
+        self.reached.set()
+        await asyncio.Event().wait()
+        return list(payloads)
+
+    async def decode(self, payloads):  # type: ignore[no-untyped-def]
+        return list(payloads)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_before_the_append_stays_a_cancellation() -> None:
+    """The other half of the distinction, without which the first is meaningless.
+
+    Nothing was sent to the backend, so there is nothing to say about a durable
+    record and nothing to recover: reporting an unacknowledged wake here would
+    send the caller to wake a record that does not exist, and refusing a
+    cancellation that costs nothing to honour buys nothing.
+
+    "Before the append" has to mean *before the backend was called*, not merely
+    before it answered. Cancellation while the call is in flight is a different
+    state, and it is the one below (ADR-038).
+    """
+    backend = MemoryStreamBackend()
+    client = RecordingClient()
+    codec = BlockingEncodeCodec()
+    producer = ExternalStreamProducer(
+        backend=backend,
+        workflow=CHAIN,
+        data_converter=dataclasses.replace(
+            temporalio.converter.DataConverter.default, payload_codec=codec
+        ),
+        session_id="session-1",
+        client=client,  # type: ignore[arg-type]
+    )
+    topic = producer.topic("tokens", type=str)
+
+    task = asyncio.ensure_future(topic.publish("a"))
+    await asyncio.wait_for(codec.reached.wait(), 2)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert not await backend.read_after(topic.stream_key, BEGINNING, max_records=10)
+    assert not client.sent
+    assert not producer._unresolved, (
+        "an append that was never made owes no recovery, and holding one would "
+        "block the stream for a record that cannot exist"
+    )
+
+
+# --- the append acknowledgement window ----------------------------------------
+
+
+class CommittingThenBlockingBackend(MemoryStreamBackend):
+    """A backend whose first ``append`` **commits** and then loses its answer.
+
+    This is the shape a remote provider actually has: the Redis backend runs an
+    atomic script server-side and receives its result in a separate client-side
+    step, so a cancellation or a dropped connection between the two leaves a
+    durable record that the caller was never told about. A backend that blocks
+    *before* storing is indistinguishable from this one from the producer's side
+    -- which is the whole reason the window needs an outcome of its own.
+    """
+
+    def __init__(self, fail: BaseException | None = None) -> None:
+        super().__init__()
+        self.committed = asyncio.Event()
+        self.blocking = True
+        self._fail = fail
+
+    async def append(self, key, record):  # type: ignore[no-untyped-def]
+        placed = await super().append(key, record)
+        if self.blocking:
+            self.blocking = False
+            self.committed.set()
+            if self._fail is not None:
+                raise self._fail
+            await asyncio.Event().wait()
+        return placed
+
+
+async def _cancel_after_commit(backend, call):  # type: ignore[no-untyped-def]
+    """Runs ``call`` and cancels it once the backend has committed but not answered."""
+    task = asyncio.ensure_future(call())
+    await asyncio.wait_for(backend.committed.wait(), 2)
+    task.cancel()
+    return task
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_backend_commit_before_append_ack_is_recoverable() -> (
+    None
+):
+    """The record is durable and the caller was never told. Both must be true.
+
+    An ``append()`` that does not return is not an append that did not happen: a
+    backend commits on its own side and only then answers. A bare
+    ``CancelledError`` here says nothing about the record, and the caller's
+    obvious move -- publishing the same value again -- draws a fresh sequence
+    number and puts it in the stream twice.
+
+    So the window gets its own outcome, carrying the exact record, and the
+    recovery re-appends *that* record: byte-identical under the same
+    ``(session_id, sequence)``, which the backend contract makes a no-op
+    returning the original offset.
+    """
+    backend = CommittingThenBlockingBackend()
+    client = RecordingClient()
+    topic = make_producer(backend, client).topic("tokens", type=str)
+
+    task = await _cancel_after_commit(backend, lambda: topic.publish("a", wake=False))
+
+    with pytest.raises(AppendNotAcknowledgedError) as caught:
+        await task
+
+    error = caught.value
+    assert error.cancelled, (
+        "a caller that wants to honour the cancellation after settling the "
+        "append still has to know it was asked to stop"
+    )
+    assert error.record.sequence == 0 and error.record.kind == RecordKind.DATA
+    assert error.record.offset is None, (
+        "the record is carried in the state it was sent in; one carrying an "
+        "offset would mean the append had been acknowledged after all"
+    )
+
+    committed = await backend.read_after(topic.stream_key, BEGINNING, max_records=10)
+    assert [r.sequence for r in committed] == [0], (
+        "the fixture must actually have committed, or this asserts nothing"
+    )
+
+    offset = await topic.resolve_append(error.record, wake=error.wake)
+
+    assert offset == committed[0].offset, (
+        "the recovery must recover the original offset, not mint a second "
+        "position for a record that already had one"
+    )
+    records = await backend.read_after(topic.stream_key, BEGINNING, max_records=10)
+    assert [(r.sequence, r.kind) for r in records] == [(0, RecordKind.DATA)], (
+        "settling the append appended a second copy of a record that had already landed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_lost_append_response_is_recoverable_the_same_way() -> None:
+    """Cancellation is not what makes the window ambiguous -- the commit is.
+
+    A provider exception raised after the server committed carries exactly as
+    little information as a cancellation does, so it must not reach the caller as
+    an ordinary failure either.
+    """
+    backend = CommittingThenBlockingBackend(fail=ConnectionError("connection reset"))
+    client = RecordingClient()
+    topic = make_producer(backend, client).topic("tokens", type=str)
+
+    with pytest.raises(AppendNotAcknowledgedError) as caught:
+        await topic.publish("a", wake=False)
+
+    assert not caught.value.cancelled
+    assert isinstance(caught.value.__cause__, ConnectionError)
+
+    await topic.resolve_append(caught.value.record, wake=False)
+
+    records = await backend.read_after(topic.stream_key, BEGINNING, max_records=10)
+    assert [(r.sequence, r.kind) for r in records] == [(0, RecordKind.DATA)]
+
+
+@pytest.mark.asyncio
+async def test_an_unresolved_append_refuses_the_publish_that_would_duplicate_it() -> (
+    None
+):
+    """The failure the outcome exists to prevent, prevented rather than described.
+
+    A caller that treats the unknown outcome as a failure retries `publish()`,
+    which draws sequence 1 and appends the value a second time. The stream will
+    not take it.
+    """
+    backend = CommittingThenBlockingBackend()
+    client = RecordingClient()
+    topic = make_producer(backend, client).topic("tokens", type=str)
+
+    task = await _cancel_after_commit(backend, lambda: topic.publish("a", wake=False))
+    with pytest.raises(AppendNotAcknowledgedError) as caught:
+        await task
+
+    with pytest.raises(AppendNotAcknowledgedError) as refused:
+        await topic.publish("a", wake=False)
+    assert refused.value.record.idempotency_key == caught.value.record.idempotency_key
+    assert "resolve_append" in str(refused.value)
+
+    with pytest.raises(AppendNotAcknowledgedError):
+        await topic.finish_writing(wake=False)
+
+    records = await backend.read_after(topic.stream_key, BEGINNING, max_records=10)
+    assert [(r.sequence, r.kind) for r in records] == [(0, RecordKind.DATA)], (
+        "the refused publish still appended, which is the duplicate this whole "
+        "outcome exists to prevent"
+    )
+
+    await topic.resolve_append(caught.value.record, wake=False)
+    assert await topic.publish("b", wake=False), (
+        "once the append is settled the stream has to be usable again, or the "
+        "refusal is a permanent wedge rather than a guard"
+    )
+
+
+@pytest.mark.asyncio
+async def test_settling_an_unacknowledged_append_wakes_exactly_once() -> None:
+    """The recovery finishes the call, rather than half of it.
+
+    The wake-enabled form owes both halves: the record's offset and one Signal.
+    Recovering only the append would leave a parked Workflow on a durable record,
+    which is the state the acknowledged-wake contract exists to refuse.
+    """
+    backend = CommittingThenBlockingBackend()
+    client = RecordingClient()
+    topic = make_producer(backend, client).topic("tokens", type=str)
+    await park(backend, topic.stream_key, wait_id=1, gen=4)
+
+    task = await _cancel_after_commit(backend, lambda: topic.publish("a"))
+    with pytest.raises(AppendNotAcknowledgedError) as caught:
+        await task
+
+    assert caught.value.wake, "the recovery has to know the call owed a wake"
+    assert not client.sent, "nothing can have been signalled before the append landed"
+
+    await topic.resolve_append(caught.value.record, wake=caught.value.wake)
+
+    assert len(client.sent) == 1, "the settled record was announced once, or not at all"
+    records = await backend.read_after(topic.stream_key, BEGINNING, max_records=10)
+    assert [(r.sequence, r.kind) for r in records] == [(0, RecordKind.DATA)]
+
+
+@pytest.mark.asyncio
+async def test_an_unacknowledged_fence_settles_to_exactly_one_fence() -> None:
+    """A duplicate fence reads back as a producer session that ended twice."""
+    backend = CommittingThenBlockingBackend()
+    client = RecordingClient()
+    topic = make_producer(backend, client).topic("tokens", type=str)
+
+    task = await _cancel_after_commit(backend, lambda: topic.finish_writing(wake=False))
+    with pytest.raises(AppendNotAcknowledgedError) as caught:
+        await task
+
+    assert caught.value.record.kind == RecordKind.WRITE_FENCE
+    await topic.resolve_append(caught.value.record, wake=False)
+
+    records = await backend.read_after(topic.stream_key, BEGINNING, max_records=10)
+    assert len([r for r in records if r.kind == RecordKind.WRITE_FENCE]) == 1, (
+        "the stream holds more than the one fence that was written"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_conflicting_append_is_a_refusal_not_an_unknown_outcome() -> None:
+    """The one failure the contract lets the producer read as "did not land".
+
+    ``AppendConflictError`` says the key was used with *different* bytes, so this
+    record definitely did not land and re-appending it would raise the identical
+    error. Folding it into the unknown outcome would send the caller to settle an
+    append that has no settlement, and would wedge the stream behind it.
+    """
+
+    class ConflictingBackend(MemoryStreamBackend):
+        async def append(self, key, record):  # type: ignore[no-untyped-def]
+            raise AppendConflictError(record.idempotency_key)
+
+    backend = ConflictingBackend()
+    producer = make_producer(backend, RecordingClient())
+    topic = producer.topic("tokens", type=str)
+
+    with pytest.raises(AppendConflictError):
+        await topic.publish("a", wake=False)
+
+    assert not producer._unresolved
+    with pytest.raises(AppendConflictError):
+        await topic.publish("b", wake=False)
+
+
+@pytest.mark.asyncio
+async def test_settling_an_append_that_never_landed_appends_it_once() -> None:
+    """The other history the same call has to be right for.
+
+    The producer cannot tell the two apart -- that is the premise -- so the
+    recovery has to leave one record whichever one happened.
+    """
+
+    class LosingBackend(MemoryStreamBackend):
+        """Loses its first append entirely, then behaves."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.reached = asyncio.Event()
+
+        async def append(self, key, record):  # type: ignore[no-untyped-def]
+            if not self.reached.is_set():
+                self.reached.set()
+                raise ConnectionError("connection reset before the write")
+            return await super().append(key, record)
+
+    backend = LosingBackend()
+    client = RecordingClient()
+    topic = make_producer(backend, client).topic("tokens", type=str)
+
+    with pytest.raises(AppendNotAcknowledgedError) as caught:
+        await topic.publish("a", wake=False)
+
+    assert not await backend.read_after(topic.stream_key, BEGINNING, max_records=10)
+
+    offset = await topic.resolve_append(caught.value.record, wake=False)
+
+    records = await backend.read_after(topic.stream_key, BEGINNING, max_records=10)
+    assert [(r.sequence, r.offset) for r in records] == [(0, offset)], (
+        "settling an append that had not landed has to land it, under the "
+        "sequence number the interrupted call drew rather than a fresh one"
+    )
+
+
+@pytest.mark.asyncio
+async def test_settling_a_record_from_another_session_is_refused() -> None:
+    """Identity is the whole recovery; a foreign record is a different record."""
+    backend = MemoryStreamBackend()
+    topic = make_producer(backend, RecordingClient()).topic("tokens", type=str)
+    foreign = StreamRecord(
+        kind=RecordKind.DATA,
+        payload=b'"a"',
+        producer_session_id="someone-else",
+        sequence=0,
+    )
+
+    with pytest.raises(ValueError, match="not by this one"):
+        await topic.resolve_append(foreign, wake=False)
+    with pytest.raises(ValueError, match="already carries offset"):
+        await topic.resolve_append(
+            StreamRecord(
+                kind=RecordKind.DATA,
+                payload=b'"a"',
+                producer_session_id="session-1",
+                sequence=0,
+            ).placed_at(Offset("1-1")),
+            wake=False,
+        )
 
 
 @pytest.mark.asyncio

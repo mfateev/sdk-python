@@ -41,6 +41,7 @@ import temporalio.common
 import temporalio.exceptions
 
 __all__ = [
+    "ConcurrentStreamConsumerError",
     "ExternalStreamCapacityError",
     "StreamDecodeError",
     "StreamError",
@@ -111,6 +112,37 @@ class ExternalStreamCapacityError(temporalio.exceptions.ApplicationError):
     def __init__(self, message: str) -> None:
         super().__init__(
             message, type="ExternalStreamCapacityError", non_retryable=True
+        )
+
+
+class ConcurrentStreamConsumerError(temporalio.exceptions.ApplicationError):
+    """A second coroutine tried to wait on a subscription already being waited on.
+
+    A subscription is **one consumer**. It has one cursor, one readiness future,
+    and one entry in the runtime's pending map, so a second coroutine blocking on
+    it replaces the first everywhere the first can be found: readiness resolves
+    the newer waiter, its ``finally`` clears the entry, and the older future
+    becomes unreachable by the readiness activation *and* by ``close()``. The
+    Workflow is then permanently stuck on a future nothing can resolve -- and
+    because the blocked-set state is shared too, Core may not even be retaining a
+    Workflow Task on that coroutine's behalf.
+
+    Not one of the four taxonomy rows above, and for the same reason as
+    :class:`ExternalStreamCapacityError`: this is Workflow code asking for
+    something the design does not offer, not a stream or a converter misbehaving.
+    Non-retryable for the same reason too -- a second consumer is deterministic,
+    so a Workflow Task failure would be retried into the identical failure forever
+    with nothing durable to show why.
+
+    Iterating a subscription again *after* the previous consumer has stopped is
+    not this: the check is on a live waiter rather than on the iterator, so the
+    ordinary shape of taking some records, doing something else, and coming back
+    to the same subscription keeps working (ADR-037).
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            message, type="ConcurrentStreamConsumerError", non_retryable=True
         )
 
 

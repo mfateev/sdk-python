@@ -164,6 +164,43 @@ M1_COVERAGE: dict[int, str | tuple[str, ...]] = {
     # which part of each is covered here and which stays end-to-end.
     70: "test_replay.py::test_a_read_in_flight_across_a_reposition_cannot_be_appended",
     71: "test_replay.py::test_a_replay_activation_never_delivers_a_record_the_marker_omits",
+    # 72-76 are the fourth review's five findings. Four of them are the same shape
+    # as the third round's: a guarantee written for the path it was aimed at and
+    # not for the adjacent one -- a budget spent where it was not reserved, a key
+    # drawn after an await that reorders it, a handler for `Exception` on a path
+    # cancellation also takes, and a retry whose answer was discarded.
+    72: (
+        "test_delivery_budget.py::test_two_independent_consumers_share_one_budget",
+        "test_delivery_budget.py::test_a_carried_over_ready_list_is_charged_to_the_next_activation",
+    ),
+    73: (
+        "test_producer.py::test_concurrent_publishes_take_their_sequence_in_invocation_order",
+        "test_producer.py::test_reordered_encodes_cannot_duplicate_across_two_topics",
+    ),
+    74: (
+        "test_wake.py::test_cancellation_after_the_append_is_an_unacknowledged_wake",
+        "test_wake.py::test_cancellation_after_a_fence_is_an_unacknowledged_wake",
+        "test_wake.py::test_cancellation_before_the_append_stays_a_cancellation",
+    ),
+    75: (
+        "test_api.py::test_a_second_coroutine_waiting_on_one_subscription_is_refused",
+        "test_api.py::test_iterating_again_after_the_first_consumer_stopped_is_allowed",
+        "test_api.py::test_a_merge_cannot_take_a_wait_another_consumer_is_blocked_on",
+    ),
+    76: "test_manager.py::test_a_stale_retry_that_finds_the_run_gone_tears_the_watcher_down",
+    # 77 came out of reviewing case 74's fix, and is the same shape once more: a
+    # recovery written for the boundary it was aimed at -- cancellation after
+    # `append()` returned -- and not for the one just before it, where a remote
+    # backend has already committed and the answer is what was lost.
+    77: (
+        "test_wake.py::test_cancellation_after_backend_commit_before_append_ack_is_recoverable",
+        "test_wake.py::test_a_lost_append_response_is_recoverable_the_same_way",
+        "test_wake.py::test_an_unresolved_append_refuses_the_publish_that_would_duplicate_it",
+        "test_wake.py::test_settling_an_unacknowledged_append_wakes_exactly_once",
+        "test_wake.py::test_an_unacknowledged_fence_settles_to_exactly_one_fence",
+        "test_wake.py::test_settling_an_append_that_never_landed_appends_it_once",
+        "test_wake.py::test_a_conflicting_append_is_a_refusal_not_an_unknown_outcome",
+    ),
 }
 
 #: Case number -> what is still missing, for cases the suite does not fully

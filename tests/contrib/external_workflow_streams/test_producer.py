@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import uuid
 
 import pytest
 
+import temporalio.converter
 from temporalio import activity, workflow
 from temporalio.client import Client
 from temporalio.contrib.external_workflow_streams._backend import (
@@ -275,6 +277,159 @@ async def test_a_retried_attempt_appends_no_duplicate(
     await retried.publish("b", wake=False)
 
     assert len(backend.all_records(key)) == 2
+
+
+class GatedPayloadCodec(temporalio.converter.PayloadCodec):
+    """A codec whose ``encode`` completes only when the test releases that value.
+
+    Stands in for what a real one does: an external payload store or a KMS round
+    trip, which is arbitrary I/O and completes in whatever order the service
+    answers. That order is not stable across Activity attempts, which is the whole
+    point -- so the test drives it explicitly instead of racing it.
+    """
+
+    def __init__(self) -> None:
+        self.arrived: dict[str, asyncio.Event] = {}
+        self.gates: dict[str, asyncio.Event] = {}
+
+    def _for(self, marker: str) -> tuple[asyncio.Event, asyncio.Event]:
+        self.arrived.setdefault(marker, asyncio.Event())
+        self.gates.setdefault(marker, asyncio.Event())
+        return self.arrived[marker], self.gates[marker]
+
+    async def wait_inside(self, marker: str) -> None:
+        """Blocks until this value's encode has started."""
+        arrived, _ = self._for(marker)
+        await asyncio.wait_for(arrived.wait(), 2)
+
+    def release(self, marker: str) -> None:
+        _, gate = self._for(marker)
+        gate.set()
+
+    async def encode(self, payloads):  # type: ignore[no-untyped-def]
+        # The default converter renders a `str` as JSON, so the value is legible
+        # in the payload's bytes and needs no side channel to identify it.
+        marker = payloads[0].data.decode()
+        arrived, gate = self._for(marker)
+        arrived.set()
+        await gate.wait()
+        return list(payloads)
+
+    async def decode(self, payloads):  # type: ignore[no-untyped-def]
+        return list(payloads)
+
+
+def _gated_producer(
+    backend: MemoryStreamBackend, codec: GatedPayloadCodec, session: str
+):  # type: ignore[no-untyped-def]
+    import temporalio.converter
+
+    return ExternalStreamProducer(
+        backend=backend,
+        workflow=WorkflowChainKey("ns", "wf", "run-1"),
+        data_converter=dataclasses.replace(
+            temporalio.converter.DataConverter.default, payload_codec=codec
+        ),
+        session_id=session,
+    )
+
+
+async def test_concurrent_publishes_take_their_sequence_in_invocation_order(
+    backend: MemoryStreamBackend,
+) -> None:
+    """Idempotency may not depend on the order a payload codec answers in.
+
+    ``(session_id, sequence)`` is the idempotency key and a retried Activity
+    reuses the session id on purpose, so the sequence a call draws has to be a
+    property of *the call*. Drawing it after awaiting the encode makes it a
+    property of the encode's completion order instead -- and a codec is allowed to
+    do real I/O, so that order is not stable across attempts. Two concurrent
+    publishes then exchange sequence numbers whenever the store answers the other
+    way round, the backend sees each stable key reused with different bytes, and
+    the retry raises ``AppendConflictError`` on both calls: a valid concurrent
+    Activity made permanently non-retryable by timing alone.
+
+    The two attempts here are byte-identical in what they do and differ only in
+    which encode finishes first.
+    """
+    key = StreamKey("ns", "wf", "run-1", "tokens")
+
+    codec = GatedPayloadCodec()
+    topic = _gated_producer(backend, codec, "attempt-stable").topic("tokens", type=str)
+    first = asyncio.ensure_future(topic.publish("a", wake=False))
+    second = asyncio.ensure_future(topic.publish("b", wake=False))
+    await codec.wait_inside('"a"')
+    await codec.wait_inside('"b"')
+    codec.release('"a"')
+    codec.release('"b"')
+    offsets = [await first, await second]
+
+    # The Activity is retried: a fresh producer, the *same* session id, the same
+    # calls in the same order -- and the store answers in the other order.
+    retry_codec = GatedPayloadCodec()
+    retried = _gated_producer(backend, retry_codec, "attempt-stable").topic(
+        "tokens", type=str
+    )
+    first_again = asyncio.ensure_future(retried.publish("a", wake=False))
+    second_again = asyncio.ensure_future(retried.publish("b", wake=False))
+    await retry_codec.wait_inside('"a"')
+    await retry_codec.wait_inside('"b"')
+    retry_codec.release('"b"')
+    retry_codec.release('"a"')
+
+    assert [await first_again, await second_again] == offsets, (
+        "the retry appended the same values at different offsets, so the two "
+        "attempts disagree about what landed where"
+    )
+    records = backend.all_records(key)
+    assert [r.sequence for r in records] == [0, 1]
+    assert len(records) == 2, "the retry was not idempotent; it appended duplicates"
+
+
+async def test_reordered_encodes_cannot_duplicate_across_two_topics(
+    backend: MemoryStreamBackend,
+) -> None:
+    """The same defect on the other side of the deduplication boundary.
+
+    Deduplication is scoped by stream key, so two publishes to *different* topics
+    that exchange sequence numbers do not collide -- they each land under a key
+    the other stream has never seen, and the retry appends a second record
+    instead of raising. The conflict is the loud failure mode; this one is silent.
+    """
+    tokens_key = StreamKey("ns", "wf", "run-1", "tokens")
+    events_key = StreamKey("ns", "wf", "run-1", "tool-events")
+
+    codec = GatedPayloadCodec()
+    producer = _gated_producer(backend, codec, "attempt-stable")
+    tokens = producer.topic("tokens", type=str)
+    events = producer.topic("tool-events", type=str)
+    first = asyncio.ensure_future(tokens.publish("a", wake=False))
+    second = asyncio.ensure_future(events.publish("b", wake=False))
+    await codec.wait_inside('"a"')
+    await codec.wait_inside('"b"')
+    codec.release('"a"')
+    codec.release('"b"')
+    await first
+    await second
+
+    retry_codec = GatedPayloadCodec()
+    retried = _gated_producer(backend, retry_codec, "attempt-stable")
+    retried_tokens = retried.topic("tokens", type=str)
+    retried_events = retried.topic("tool-events", type=str)
+    first_again = asyncio.ensure_future(retried_tokens.publish("a", wake=False))
+    second_again = asyncio.ensure_future(retried_events.publish("b", wake=False))
+    await retry_codec.wait_inside('"a"')
+    await retry_codec.wait_inside('"b"')
+    retry_codec.release('"b"')
+    retry_codec.release('"a"')
+    await first_again
+    await second_again
+
+    assert len(backend.all_records(tokens_key)) == 1
+    assert len(backend.all_records(events_key)) == 1, (
+        "reversing the encode order appended a duplicate on a topic where the "
+        "swapped key could not collide, so nothing raised"
+    )
 
 
 async def test_republishing_different_content_under_one_key_is_an_error(
