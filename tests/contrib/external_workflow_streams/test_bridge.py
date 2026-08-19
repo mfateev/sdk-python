@@ -29,6 +29,25 @@ def bridge_worker(worker: Worker):  # type: ignore[no-untyped-def]
     return worker._workflow_worker._bridge_worker()  # type: ignore[union-attr]
 
 
+async def _wait_for_first_task_completed(handle, timeout: float = 30) -> None:  # type: ignore[no-untyped-def]
+    """Waits until this Worker has run the Workflow's first task and cached the Run.
+
+    Polled rather than slept: how long a Worker takes to poll, execute, and
+    complete one Workflow Task is a property of the machine, and a fixed wait is a
+    guess about it that a loaded machine invalidates.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        events = [event async for event in handle.fetch_history_events()]
+        if any(e.HasField("workflow_task_completed_event_attributes") for e in events):
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(
+        "the Workflow's first task never completed, so the Run was never cached "
+        "and the probe has no settled state to be repeatable about"
+    )
+
+
 @pytest.fixture
 def unknown_run_id() -> str:
     return f"no-such-run-{uuid.uuid4()}"
@@ -151,7 +170,21 @@ async def test_the_readiness_call_is_safe_from_several_threads(
 
 
 async def test_the_status_probe_is_repeatable(client: Client) -> None:
-    """Asking must change nothing, however many times it is asked."""
+    """Asking must change nothing, however many times it is asked.
+
+    The Run has to be **settled** before the first question, or the test is about
+    something else. `start_workflow` returns when the server accepts the Workflow,
+    which is before this Worker has polled it, run its first Workflow Task, and
+    cached the Run -- and until that has happened the probe honestly answers
+    `RunNotFound`. Answers of `RunNotFound` then `NoOpenWorkflowTask` are Core
+    telling the truth twice about two different states, not a probe that changed
+    something.
+
+    So the first Workflow Task's completion is awaited first. `IdleWorkflow` blocks
+    forever, so after it the Run is cached with no task open, and that state does
+    not move again on its own -- which is what makes "the same answer every time" a
+    property of the probe rather than of the timing.
+    """
     task_queue = f"tq-{uuid.uuid4()}"
     async with Worker(
         client, task_queue=task_queue, workflows=[IdleWorkflow]
@@ -163,6 +196,13 @@ async def test_the_status_probe_is_repeatable(client: Client) -> None:
             description = await handle.describe()
             bridge = bridge_worker(worker)
 
+            await _wait_for_first_task_completed(handle)
+            settled = await bridge.external_stream_run_status(description.run_id)
+            assert settled is ExternalStreamRunStatus.NO_OPEN_WORKFLOW_TASK, (
+                "the Run is cached and blocked with no Workflow Task open, so this "
+                f"is the only honest answer; got {settled}"
+            )
+
             answers = [
                 await bridge.external_stream_run_status(description.run_id)
                 for _ in range(5)
@@ -170,10 +210,6 @@ async def test_the_status_probe_is_repeatable(client: Client) -> None:
 
             # No subscriptions exist, so the honest answer is the same one every
             # time -- and in particular the probe never manufactured a task.
-            assert answers == [answers[0]] * 5
-            assert answers[0] in (
-                ExternalStreamRunStatus.NO_OPEN_WORKFLOW_TASK,
-                ExternalStreamRunStatus.RUN_NOT_FOUND,
-            )
+            assert answers == [settled] * 5
         finally:
             await handle.terminate()
