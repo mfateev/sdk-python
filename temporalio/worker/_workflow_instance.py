@@ -2456,20 +2456,37 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         if runtime is None or self._deleting:
             return
 
-        if runtime.delivery_budget_exhausted():
-            # This activation stopped delivering because it ran out of budget,
-            # not because the streams ran dry, so records are still buffered and
-            # no readiness notification is coming for them -- the watcher moved
-            # its prefetch cursor past them when it buffered them. Re-reporting
-            # readiness is what brings the next activation in.
-            #
-            # Unconditional, and before every early return below: the waits the
-            # budget stopped are marked blocked, so they are in the quiescent
-            # snapshot, and a snapshot is what lets Core start the idle timer and
-            # eventually park. Parking a Workflow Task whose records are already
-            # in the local buffer would be wrong, and this is what makes Core
-            # resolve instead of park.
-            runtime.rearm_readiness()
+        # Records still buffered when an activation ends have no readiness
+        # notification coming: the watcher moved its prefetch cursor past them
+        # when it buffered them, and it only reports again after a *new* non-empty
+        # read. Re-reporting is what brings the next activation in, and it is the
+        # only thing that can.
+        #
+        # **Asked of every completion, not only of one a delivery budget
+        # stopped.** The budget is the obvious way to end an activation with a
+        # full buffer and it is not the only one. Readiness accepted while an
+        # activation was open is kept by Core only if the quiescent snapshot that
+        # follows reports the *same* wait generation: same generation means the
+        # Workflow never saw the record, a bumped one means it drained and
+        # re-blocked. So a record that arrives after this activation's last drain
+        # is accepted at generation G, the wait re-blocks to G+1 on the way out,
+        # and the snapshot legitimately drops a readiness that now refers to a
+        # resolved block. Nothing else announces it, and the Workflow waits
+        # forever on data it is already holding -- until an unrelated later event.
+        # Gating this on the budget left that hole open, and it is a race, so it
+        # showed up as an occasional stall rather than a reproducible one.
+        #
+        # Cheap where it is not needed: the manager skips every subscription whose
+        # buffer is empty, which is the ordinary case, and a redundant report is
+        # answered `Accepted` or `Stale` and retried against the current
+        # generation.
+        #
+        # Before every early return below: the waits involved are marked blocked,
+        # so they are in the quiescent snapshot, and a snapshot is what lets Core
+        # start the idle timer and eventually park. Parking a Workflow Task whose
+        # records are already in the local buffer would be wrong, and this is what
+        # makes Core resolve instead of park.
+        runtime.rearm_readiness()
 
         # Read before anything is added below, so "what the Workflow itself
         # produced this activation" stays answerable.

@@ -717,6 +717,80 @@ async def test_rearming_says_nothing_about_an_empty_buffer() -> None:
         await manager.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_a_record_arriving_after_the_last_drain_is_re_announced() -> None:
+    """The stall this closes, driven through the real manager and completion path.
+
+    A record that arrives after an activation's final drain is announced to Core
+    at the wait generation that was current when the watcher buffered it. The
+    Workflow then re-blocks on the way out of that activation, which bumps the
+    generation -- and Core keeps readiness across a quiescent snapshot only where
+    the generations match, because a bumped one ordinarily means the Workflow
+    drained and re-blocked and the readiness refers to a block already resolved.
+    Here it means the opposite, and Core cannot tell the difference: the record was
+    never seen.
+
+    Nothing else would announce it. The watcher reports only after a *new*
+    non-empty read and its prefetch cursor is already past this record; the idle
+    timer would park a Workflow Task whose data is sitting at the Worker. So the
+    completion has to re-announce, and it has to do so whether or not a delivery
+    budget was involved -- which is what this asserts.
+    """
+    stream_key = StreamKey("ns", "wf", uuid.uuid4().hex, "tokens")
+    backend = MemoryStreamBackend()
+    notifier = RecordingNotifier()
+    manager = StreamSubscriptionManager(
+        backends={"tokens": backend},
+        notify_ready=notifier,
+        watch_block=timedelta(milliseconds=20),
+    )
+    try:
+        runtime = make_runtime(manager, backend)
+        runtime.register(wait_id=1, stream_key=stream_key, backend_name="tokens")
+        # A wait is blocked from creation, so reaching generation 1 means taking a
+        # record and blocking again -- which is the ordinary shape and the one the
+        # generation counter exists for.
+        runtime.note_blocked(1, False)
+        runtime.note_blocked(1, True)
+
+        await backend.append(
+            stream_key, StreamRecord(RecordKind.DATA, await encoded("late"), "s", 0)
+        )
+        await asyncio.wait_for(notifier.notified.wait(), 5)
+        announced_at = list(notifier.calls)
+        assert announced_at and announced_at[-1][2] == 1, (
+            f"the watcher did not announce under generation 1: {announced_at}"
+        )
+        subscription = manager.subscription(RUN_ID, 1)
+        assert subscription is not None
+        assert subscription.buffered == 1, "the record is not buffered at the Worker"
+
+        # This activation delivered nothing -- the record landed after its last
+        # drain -- and the Workflow re-blocks on the way out. That is the
+        # generation bump Core reads as "already resolved".
+        runtime.note_blocked(1, False)
+        runtime.note_blocked(1, True)
+        assert subscription.current_wait_generation() == 2
+
+        before = len(notifier.calls)
+        _WorkflowInstanceImpl._emit_external_stream_commands(  # type: ignore[arg-type]
+            _CompletionStub(runtime)
+        )
+        await asyncio.sleep(0.2)
+
+        assert len(notifier.calls) > before, (
+            "the completion announced nothing, so the record Core dropped the "
+            "readiness for is announced by nobody and the Workflow waits on data "
+            "it is already holding"
+        )
+        assert notifier.calls[-1] == (RUN_ID, 1, 2), (
+            "the re-announcement has to name the *current* generation, or Core "
+            f"discards it for the same reason: {notifier.calls[-1]}"
+        )
+    finally:
+        await manager.shutdown()
+
+
 class _CompletionStub:
     """Just enough of the Workflow instance to drive the completion path.
 
@@ -772,31 +846,50 @@ class _RecordingRuntime:
 
 
 @pytest.mark.parametrize("exhausted", [True, False])
-def test_the_completion_rearms_exactly_when_the_budget_was_hit(
+def test_every_completion_rearms_readiness_not_only_a_budget_stop(
     exhausted: bool,
 ) -> None:
-    """The window between a budget stop and the next activation must be closed.
+    """The window must be closed on **every** completion, budget or not.
 
-    It has to happen on the completion path, unconditionally: the waits the
-    budget stopped are marked blocked, so they enter the quiescent snapshot, and
-    a snapshot is what lets Core start the idle timer and eventually park. A
-    Workflow Task parked with records in the local buffer would wait out an idle
-    timeout for data that had already arrived.
+    It has to happen on the completion path: the waits involved are marked
+    blocked, so they enter the quiescent snapshot, and a snapshot is what lets
+    Core start the idle timer and eventually park. A Workflow Task parked with
+    records in the local buffer would wait out an idle timeout for data that had
+    already arrived.
+
+    Gating it on the budget was a real stall, not a tidiness point, because the
+    budget is not the only way an activation ends with a full buffer. Core keeps
+    readiness accepted during an open activation **only if the quiescent snapshot
+    that follows reports the same wait generation** -- same generation means the
+    Workflow never saw the record, a bumped one means it drained and re-blocked.
+    So a record arriving after this activation's last drain is accepted at
+    generation G, the wait re-blocks to G+1 on the way out, and the snapshot
+    legitimately drops a readiness that now refers to a resolved block. The
+    watcher will not report it again either: it only reports after a *new*
+    non-empty read, and its prefetch cursor is already past that record. Nothing
+    else announces it, so the Workflow waits on data it is already holding.
+
+    The re-arm is cheap where it is not needed -- the manager skips every
+    subscription whose buffer is empty, which is the ordinary case.
     """
     runtime = _RecordingRuntime(exhausted=exhausted)
     stub = _CompletionStub(runtime)
 
     _WorkflowInstanceImpl._emit_external_stream_commands(stub)  # type: ignore[arg-type]
 
-    assert runtime.rearms == (1 if exhausted else 0)
+    assert runtime.rearms == 1, (
+        "a completion that did not hit the delivery budget skipped the re-arm, "
+        "which is the only thing that re-announces a record Core dropped the "
+        "readiness for"
+    )
 
 
 def test_the_completion_rearms_even_when_it_emits_nothing_else() -> None:
     """The early returns below it must not swallow the re-arm.
 
     A completion carrying the Workflow's own commands returns before asking for
-    retention. If the re-arm sat behind that return, a Workflow that hit the
-    budget while also starting a timer would never hear about its records again.
+    retention. If the re-arm sat behind that return, a Workflow with records still
+    buffered while also starting a timer would never hear about them again.
     """
     runtime = _RecordingRuntime(exhausted=True)
     stub = _CompletionStub(runtime)

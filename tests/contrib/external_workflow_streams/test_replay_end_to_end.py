@@ -481,8 +481,147 @@ async def wait_until(predicate, message: str, timeout: float = 15) -> None:  # t
     raise AssertionError(message)
 
 
+async def _stall_diagnosis(client, handle, backend, key, run_id) -> str:  # type: ignore[no-untyped-def]
+    """What the Run, its History, and the stream look like when the resume stalls.
+
+    The failure is a 45-second timeout, and a timeout on its own cannot tell
+    "no Workflow Task was ever created" from "one was created and delivered
+    nothing" -- which are different defects in different components. Each line
+    below separates a pair of them.
+    """
+    lines: list[str] = []
+    try:
+        events = [event async for event in handle.fetch_history_events()]
+        kinds: dict[str, int] = {}
+        for event in events:
+            kinds[event.WhichOneof("attributes") or "?"] = (
+                kinds.get(event.WhichOneof("attributes") or "?", 0) + 1
+            )
+        lines.append(f"history: {len(events)} event(s), {kinds}")
+        # A Workflow Task after the wake is the difference between "the wake never
+        # produced one" and "it did, and the Run delivered nothing".
+        started = [
+            i
+            for i, e in enumerate(events)
+            if e.HasField("workflow_task_started_event_attributes")
+        ]
+        lines.append(f"workflow tasks started at event indices: {started}")
+        failures = [
+            e.workflow_task_failed_event_attributes
+            for e in events
+            if e.HasField("workflow_task_failed_event_attributes")
+        ]
+        lines.append(
+            f"workflow task failures: {[(f.cause, f.failure.message[:200]) for f in failures]}"
+        )
+        lines.append(f"stream markers in history: {len(stream_markers(events))}")
+    except Exception as err:  # noqa: BLE001 -- diagnosis must not mask the failure
+        lines.append(f"history unavailable: {err!r}")
+    try:
+        description = await handle.describe()
+        lines.append(f"workflow status: {description.status}")
+    except Exception as err:  # noqa: BLE001
+        lines.append(f"describe failed: {err!r}")
+    try:
+        records = backend.all_records(key)
+        lines.append(
+            f"stream holds {len(records)} record(s) at "
+            f"{[str(r.offset) for r in records]}"
+        )
+        parked = await backend.parked_wait_ids(key)
+        lines.append(f"parked wait ids: {parked}")
+        for wait_id in parked:
+            intent = await backend.park_intent(key, wait_id)
+            lines.append(f"  wait {wait_id} intent: {intent}")
+    except Exception as err:  # noqa: BLE001
+        lines.append(f"backend state unavailable: {err!r}")
+    lines.append(f"workflow body starts (is_replaying per start): {STARTS.get(run_id)}")
+    lines.append(f"observations for this Run: {observations.executions(run_id)}")
+    # The readiness handshake, which is the only thing that can turn a buffered
+    # record into a Workflow Task. Its answers separate "the watcher never read
+    # the records" from "it read them and Core had nowhere to put them".
+    lines.append(f"readiness calls: {READINESS_TRACE}")
+    for manager, subscription in _live_subscriptions():
+        lines.append(
+            f"subscription {subscription.run_id}/{subscription.wait_id}: "
+            f"buffered={subscription.buffered} "
+            f"committed={subscription.committed_cursor} "
+            f"delivery={subscription.delivery_cursor} "
+            f"prefetch={subscription.prefetch_cursor} "
+            f"generation={subscription.current_wait_generation()} "
+            f"wakes_owed={subscription.wakes_owed} "
+            f"cancelled={subscription._cancelled} "
+            f"watcher_done={None if subscription._watcher is None else subscription._watcher.done()}"
+        )
+        del manager
+    return "Stall diagnosis:\n  " + "\n  ".join(lines)
+
+
+#: Every readiness call the Worker's manager made, with what Core answered.
+READINESS_TRACE: list[tuple[str, int, int, object]] = []
+
+#: Managers alive in this process, so a stalled test can read their state.
+LIVE_MANAGERS: list[object] = []
+
+
+def _live_subscriptions():  # type: ignore[no-untyped-def]
+    """Every subscription still registered on any manager in this process."""
+    found = []
+    for manager in LIVE_MANAGERS:
+        for run_subscriptions in getattr(manager, "_runs", {}).values():
+            for subscription in run_subscriptions.values():
+                found.append((manager, subscription))
+    return found
+
+
+@pytest.fixture
+def trace_readiness(monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
+    """Records what Core answered for every readiness call, and every manager.
+
+    A stall in this file is always "a buffered record never became a Workflow
+    Task", and the readiness answers are where that happens. Without them the
+    failure cannot distinguish a watcher that never read from a Worker that read
+    and was told there was nowhere to deliver.
+    """
+    from temporalio.contrib.external_workflow_streams._manager import (
+        StreamSubscriptionManager,
+    )
+
+    READINESS_TRACE.clear()
+    LIVE_MANAGERS.clear()
+
+    original_init = StreamSubscriptionManager.__init__
+    original_notify = StreamSubscriptionManager._notify_ready_with_retries
+
+    def spy_init(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        original_init(self, *args, **kwargs)
+        LIVE_MANAGERS.append(self)
+
+    async def spy_notify(self, subscription):  # type: ignore[no-untyped-def]
+        result = await original_notify(self, subscription)
+        READINESS_TRACE.append(
+            (
+                subscription.run_id[-8:],
+                subscription.wait_id,
+                subscription.current_wait_generation(),
+                result,
+            )
+        )
+        return result
+
+    monkeypatch.setattr(StreamSubscriptionManager, "__init__", spy_init)
+    monkeypatch.setattr(
+        StreamSubscriptionManager, "_notify_ready_with_retries", spy_notify
+    )
+    yield
+    LIVE_MANAGERS.clear()
+
+
 async def test_an_empty_stream_parked_and_evicted_replays_from_the_recorded_cursor(
-    client: Client, backend: MemoryStreamBackend, monkeypatch: pytest.MonkeyPatch
+    client: Client,
+    backend: MemoryStreamBackend,
+    monkeypatch: pytest.MonkeyPatch,
+    trace_readiness: None,
 ) -> None:
     """The empty boundary, carried across a park, an eviction, and two replays.
 
@@ -634,14 +773,17 @@ async def test_an_empty_stream_parked_and_evicted_replays_from_the_recorded_curs
             live = await asyncio.wait_for(handle.result(), 45)
         except asyncio.TimeoutError:
             # The same finding as the assertion below, which a Run that never
-            # finishes would otherwise report as a bare timeout.
+            # finishes would otherwise report as a bare timeout -- reported with
+            # enough state to tell the two ways it can happen apart, because
+            # "it timed out" sends the next reader back to square one.
             raise AssertionError(
                 "the resumed Run never received the records published while it "
                 "was evicted. They were in the stream before it came back and "
                 "its marker's boundary is the beginning of that stream, so a "
                 "Run starting where the marker says receives both; one that "
                 "resolved its position from live backend state starts at the "
-                "tail and waits for records that are already behind it."
+                "tail and waits for records that are already behind it.\n\n"
+                + await _stall_diagnosis(client, handle, backend, key, run_id)
             ) from None
         history = await handle.fetch_history()
 
