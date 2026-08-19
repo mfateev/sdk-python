@@ -622,6 +622,9 @@ def test_a_wait_the_budget_stopped_is_not_immediately_parkable(
     """
 
     class StubManager:
+        def cancel_from_workflow_thread(self, run_id, wait_id):  # type: ignore[no-untyped-def]
+            pass
+
         def register(self, **kwargs: Any) -> None:
             pass
 
@@ -726,6 +729,9 @@ async def test_a_replay_segment_larger_than_the_budget_is_delivered_in_full(
     count = MAX_RECORDS_PER_ACTIVATION + 44
 
     class StubManager:
+        def cancel_from_workflow_thread(self, run_id, wait_id):  # type: ignore[no-untyped-def]
+            pass
+
         def register(self, **kwargs: Any) -> None:
             pass
 
@@ -788,6 +794,9 @@ async def test_replay_delivers_in_full_even_when_the_live_budget_is_spent(
     count = MAX_RECORDS_PER_ACTIVATION + 44
 
     class StubManager:
+        def cancel_from_workflow_thread(self, run_id, wait_id):  # type: ignore[no-untyped-def]
+            pass
+
         def register(self, **kwargs: Any) -> None:
             pass
 
@@ -853,6 +862,9 @@ def test_a_budget_stop_records_batch_limit(backend: MemoryStreamBackend) -> None
     """
 
     class StubManager:
+        def cancel_from_workflow_thread(self, run_id, wait_id):  # type: ignore[no-untyped-def]
+            pass
+
         def register(self, **kwargs: Any) -> None:
             pass
 
@@ -880,6 +892,9 @@ def test_an_activation_that_ran_out_of_records_still_records_no_data(
     """The other direction, without which "always BATCH_LIMIT" would pass."""
 
     class StubManager:
+        def cancel_from_workflow_thread(self, run_id, wait_id):  # type: ignore[no-untyped-def]
+            pass
+
         def register(self, **kwargs: Any) -> None:
             pass
 

@@ -1326,11 +1326,44 @@ class StreamSubscriptionManager:
 
     # --- teardown -----------------------------------------------------------
 
+    def cancel_from_workflow_thread(self, run_id: str, wait_id: int) -> None:
+        """Schedules :meth:`cancel` from the Workflow thread.
+
+        Workflow code closes a subscription inside the synchronous
+        ``activate()``, on the executor thread, where creating a task is not
+        merely unsafe but silently ineffective: the task is never scheduled, and
+        a watcher that was supposed to stop keeps running with nothing to say so.
+        """
+        self._loop.call_soon_threadsafe(
+            lambda: self._loop.create_task(self.cancel(run_id, wait_id))
+        )
+
     async def cancel(self, run_id: str, wait_id: int) -> None:
-        """Cancels one subscription: drop its buffer, stop its watcher."""
+        """Cancels one subscription: remove its intent, drop its buffer, stop it.
+
+        The intent is removed **here**, not left to the resolve path. That path
+        can afford to log a failure and try again because the subscription stays
+        registered; this one drops it, so nothing later can retry and an intent
+        left behind is left behind for good. A stale intent is what
+        `current_park_generation` answers to every producer that asks, and a
+        producer naming a generation Core has discarded sends a wake Core
+        ignores as stale -- the record is appended, the Signal is sent, and the
+        Workflow is never woken.
+        """
         subscription = self._runs.get(run_id, {}).pop(wait_id, None)
         if subscription is None:
             return
+        async with self._park_lock(run_id):
+            try:
+                await self._remove_park_intent(subscription)
+            except Exception:
+                logger.exception(
+                    "Could not remove the park intent for %s wait %s while "
+                    "cancelling it; it will be reconciled if this Run is "
+                    "registered again",
+                    subscription.stream_key,
+                    subscription.wait_id,
+                )
         await self._stop(subscription)
 
     async def evict_run(self, run_id: str) -> None:

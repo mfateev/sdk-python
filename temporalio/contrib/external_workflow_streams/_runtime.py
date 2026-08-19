@@ -131,6 +131,15 @@ class _SubscriptionState:
     blocked: bool = True
     """Whether Workflow code is currently waiting on this subscription."""
 
+    closed: bool = False
+    """Whether Workflow code has ended this subscription.
+
+    A closed wait keeps its binding and its cursor -- replay and a successor Run
+    both still need them -- but can never be blocked again, so it can never put
+    Core back in the position of retaining a Workflow Task for a wait nothing is
+    awaiting.
+    """
+
 
 class WorkflowStreamRuntime:
     """The handle Workflow code holds, and the observation delta's author."""
@@ -580,10 +589,32 @@ class WorkflowStreamRuntime:
             )
         )
 
+    def unsubscribe(self, wait_id: int) -> None:
+        """Ends a wait, and tells the Worker to stop serving it.
+
+        The subscription's state is **kept**, not removed. Two things are built
+        from it after a wait ends: the annotation header, whose binding replay
+        needs in order to know what the closed wait was reading -- without it a
+        replay of unchanged code fails as though the Workflow never created that
+        wait -- and the Continue-As-New continuation, whose cursor is what stops
+        a successor Run restarting that stream from the beginning. Closing
+        changes exactly one thing about the state: the wait can never be blocked
+        again.
+        """
+        state = self._subscriptions.get(wait_id)
+        if state is None or state.closed:
+            return
+        state.closed = True
+        state.blocked = False
+        self._manager.cancel_from_workflow_thread(self._run_id, wait_id)
+
     def note_blocked(self, wait_id: int, blocked: bool) -> None:
         """Records whether Workflow code is waiting on this subscription."""
         state = self._subscriptions.get(wait_id)
-        if state is None:
+        if state is None or (state.closed and blocked):
+            # A closed wait may leave the blocked set but never re-enter it: the
+            # coroutine that was awaiting it is gone, so retaining a Workflow
+            # Task for it would be retaining for nobody.
             return
         if blocked and not state.blocked:
             # Re-entering the blocked state is what the wait generation counts,

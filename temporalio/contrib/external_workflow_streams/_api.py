@@ -142,6 +142,14 @@ class ExternalStreamRuntime(Protocol):
         """Records whether Workflow code is currently waiting on this wait."""
         ...
 
+    def unsubscribe(self, wait_id: int) -> None:
+        """Ends a wait and stops the Worker serving it.
+
+        Keeps the wait's recorded state -- replay and a Continue-As-New
+        successor both still need it -- and only makes it unblockable.
+        """
+        ...
+
     def register_pending(self, wait_id: int, future: asyncio.Future[None]) -> None:
         """Registers the future the readiness activation will resolve."""
         ...
@@ -717,11 +725,16 @@ class ExternalStreamSubscription(Generic[AnyType]):
           being consumed**, so the consumption cursor still points in front of
           them and a Continue-As-New successor receives them.
 
-        What it cannot do from here is tear down the Worker-side half: the
-        watcher for this wait keeps running and its park intent, if one is
-        installed, stays in the backend. That teardown is the manager's, reached
-        through a runtime hop, and is deliberately left out rather than half
-        done here.
+        The Worker-side half -- stopping this wait's watcher and removing its
+        park intent -- is the manager's, and is reached through the runtime
+        rather than from here, because it has to be scheduled onto the Worker's
+        loop: this runs on the Workflow thread, where creating a task is
+        silently ineffective.
+
+        What closing does **not** do is forget the subscription. Its recorded
+        binding is what replay needs to know what this wait was reading, and its
+        cursor is what stops a Continue-As-New successor restarting the stream
+        from the beginning.
         """
         if self._finished:
             return
@@ -736,6 +749,7 @@ class ExternalStreamSubscription(Generic[AnyType]):
         self._pending_future = None
         if future is not None and not future.done():
             future.set_result(None)
+        runtime.unsubscribe(self._wait_id)
 
 
 #: The entry point Workflow code uses.

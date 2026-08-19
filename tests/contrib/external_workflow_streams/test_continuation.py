@@ -72,6 +72,9 @@ def backend() -> MemoryStreamBackend:
 
 
 class StubManager:
+    def cancel_from_workflow_thread(self, run_id, wait_id):  # type: ignore[no-untyped-def]
+        pass
+
     """Records registrations and starts no watcher.
 
     What these tests are about is the cursor a subscription is registered *with*,
