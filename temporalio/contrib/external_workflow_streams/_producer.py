@@ -182,12 +182,23 @@ class AppendNotAcknowledgedError(Exception):
         self,
         message: str,
         *,
+        stream_key: StreamKey,
         record: StreamRecord,
         wake: bool,
         lease: timedelta,
         cancelled: bool = False,
     ) -> None:
         super().__init__(message)
+        self.stream_key = stream_key
+        """The stream the append was for. Where it must be settled.
+
+        Carried because a record does not name its own stream and the backend's
+        idempotency scope does: `(session_id, sequence)` is unused on every
+        *other* stream, so the same record handed to another topic's
+        ``resolve_append`` would append a second copy there rather than
+        deduplicate. The recovery refuses that, and this is what a caller
+        holding several topics matches on.
+        """
         self.record = record
         """The exact record whose fate is unknown. What ``resolve_append`` takes.
 
@@ -207,6 +218,40 @@ class AppendNotAcknowledgedError(Exception):
         *after* resolving the append, and that is the only order that leaves
         nothing owed.
         """
+
+
+@dataclass(frozen=True)
+class _UnresolvedAppend:
+    """One append whose outcome the producer never learned.
+
+    The *operation*, not just its record. What the interrupted call owed is more
+    than the bytes: whether a wake was due, under which lease, and whether
+    cancellation is still to be honoured once the state is settled. Holding only
+    the record meant a later refusal had to invent those three from whatever call
+    happened to be refused, so a caller following the refusal's own instructions
+    could drop a wake the unresolved record required.
+
+    Keyed by stream because idempotency is scoped per stream: the same
+    ``(session_id, sequence)`` is unused on every other one, so a record settled
+    against the wrong topic appends a second copy rather than deduplicating.
+    """
+
+    stream_key: StreamKey
+    record: StreamRecord
+    wake: bool
+    lease: timedelta
+    cancelled: bool
+
+    def error(self, message: str) -> AppendNotAcknowledgedError:
+        """This operation, reported. Every raise reproduces the same recovery."""
+        return AppendNotAcknowledgedError(
+            message,
+            stream_key=self.stream_key,
+            record=self.record,
+            wake=self.wake,
+            lease=self.lease,
+            cancelled=self.cancelled,
+        )
 
 
 @dataclass(frozen=True)
@@ -304,16 +349,23 @@ class ExternalStreamProducer:
         self._client = client
         self._sequence = 0
         self._wake_counter = 0
-        #: Per stream, the records whose appends never reported an outcome.
+        #: Per stream, the appends that never reported an outcome.
         #:
-        #: Kept because the record *is* the recovery: only these exact bytes
+        #: Kept because the operation *is* the recovery: only these exact bytes
         #: under these exact `(session_id, sequence)` pairs re-append as a no-op
-        #: if the first attempt landed. A list rather than a single slot because
-        #: concurrent publishes to one stream are supported and more than one of
-        #: them can be interrupted; entries are added only when an append fails
-        #: to answer, so a publish that is merely still in flight registers
-        #: nothing and cannot block its own sibling.
-        self._unresolved: dict[StreamKey, list[StreamRecord]] = {}
+        #: if the first attempt landed, and only what the interrupted call owed
+        #: says whether settling it still has a wake to send. A list rather than
+        #: a single slot because concurrent publishes to one stream are supported
+        #: and more than one of them can be interrupted; entries are added only
+        #: when an append fails to answer, so a publish that is merely still in
+        #: flight registers nothing and cannot block its own sibling.
+        #:
+        #: **Per producer instance, deliberately.** This is what binds recovery
+        #: to the object that still holds the session's sequence and wake
+        #: counters; a replacement producer built with the same session id has
+        #: both back at zero and recovers by re-running the same calls instead
+        #: (ADR-038).
+        self._unresolved: dict[StreamKey, list[_UnresolvedAppend]] = {}
 
     @staticmethod
     async def connect(
@@ -421,7 +473,7 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
     def stream_key(self) -> StreamKey:
         return self._stream_key
 
-    def _refuse_while_unresolved(self, *, wake: bool, lease: timedelta) -> None:
+    def _refuse_while_unresolved(self) -> None:
         """Refuses a new append while an earlier one's outcome is unknown.
 
         This is the caller move that duplicates a record, so it is the one the
@@ -431,6 +483,12 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
         way to relate. Refusing also keeps the recovery in order: the unresolved
         record is re-appended before anything is appended behind it.
 
+        The error it raises is **the outstanding operation's**, not this call's.
+        Reporting the refused call's ``wake`` and ``lease`` beside the older
+        call's record would make the error's own instructions wrong: a caller
+        following them settles the record with no wake, and a parked Workflow
+        sits on a durable record nobody announced.
+
         Checked at entry, so a publish already past this point when a sibling
         becomes unresolved still completes -- concurrent publishes have no
         defined order between them to preserve.
@@ -438,17 +496,28 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
         outstanding = self._producer._unresolved.get(self._stream_key)
         if not outstanding:
             return
-        record = outstanding[0]
-        raise AppendNotAcknowledgedError(
-            f"the append of {record.idempotency_key} on stream "
+        pending = outstanding[0]
+        more = (
+            ""
+            if len(outstanding) == 1
+            else f" ({len(outstanding)} appends on this stream are unsettled)"
+        )
+        raise pending.error(
+            f"the append of {pending.record.idempotency_key} on stream "
             f"{self._stream_key} has never been acknowledged, so this stream "
             "will not take another append: a new one draws a fresh sequence "
             "number, and if that record did land the value would be in the "
-            "stream twice. Settle it with resolve_append(`.record`).",
-            record=record,
-            wake=wake,
-            lease=lease,
+            f"stream twice{more}. Settle it with resolve_append(`.record`), "
+            "which owes the wake this error reports rather than the one the "
+            "refused call asked for."
         )
+
+    def _remember(self, pending: _UnresolvedAppend) -> None:
+        """Records an unsettled append, without duplicating a re-interrupted one."""
+        outstanding = self._producer._unresolved.setdefault(self._stream_key, [])
+        if any(held.record == pending.record for held in outstanding):
+            return
+        outstanding.append(pending)
 
     def _forget(self, record: StreamRecord) -> None:
         """Drops a record from the unresolved set, by identity."""
@@ -458,7 +527,7 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
         remaining = [
             held
             for held in outstanding
-            if held.idempotency_key != record.idempotency_key
+            if held.record.idempotency_key != record.idempotency_key
         ]
         if remaining:
             self._producer._unresolved[self._stream_key] = remaining
@@ -488,16 +557,19 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
             self._forget(record)
             raise
         except (Exception, asyncio.CancelledError) as err:
-            producer._unresolved.setdefault(self._stream_key, []).append(record)
-            raise AppendNotAcknowledgedError(
-                f"the append of {record.idempotency_key} did not report an "
-                f"outcome: {err!r}. Whether it landed is unknown -- a backend "
-                "commits before it answers -- so settle it with "
-                "resolve_append(`.record`) rather than by publishing again.",
+            pending = _UnresolvedAppend(
+                stream_key=self._stream_key,
                 record=record,
                 wake=wake,
                 lease=lease,
                 cancelled=isinstance(err, asyncio.CancelledError),
+            )
+            self._remember(pending)
+            raise pending.error(
+                f"the append of {record.idempotency_key} did not report an "
+                f"outcome: {err!r}. Whether it landed is unknown -- a backend "
+                "commits before it answers -- so settle it with "
+                "resolve_append(`.record`) rather than by publishing again."
             ) from err
         assert placed.offset is not None
         self._forget(record)
@@ -518,12 +590,90 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
                 raise
         return placed.offset
 
+    def _outstanding(self, record: StreamRecord) -> _UnresolvedAppend:
+        """This topic's unsettled append for ``record``, or why there is none.
+
+        The lookup **is** the safety check, and it is three checks at once. It
+        binds the recovery to the stream, because a record does not name its own
+        stream and `(session_id, sequence)` is unused on every other one -- so a
+        record settled against the wrong topic appends a second copy of the value
+        rather than deduplicating, and leaves the real stream still blocked. It
+        binds the recovery to the exact bytes, because idempotency is on identity
+        and a re-encoded payload under the same key is an ``AppendConflictError``
+        rather than the no-op this depends on. And it binds the recovery to the
+        producer *instance*, which is the one that still holds the session's
+        sequence and wake counters.
+
+        Every failure is a ``ValueError`` naming which of the three it was, and
+        every one of them is raised before the backend is touched.
+        """
+        if record.offset is not None:
+            raise ValueError(
+                f"record {record.idempotency_key} already carries offset "
+                f"{record.offset}, which means the backend acknowledged it. "
+                "There is nothing unresolved about it; if a wake is still owed, "
+                "that is what wake() and retry_wake() are for."
+            )
+        producer = self._producer
+        for held in producer._unresolved.get(self._stream_key, ()):
+            if held.record == record:
+                return held
+
+        if record.producer_session_id != producer.session_id:
+            raise ValueError(
+                f"record {record.idempotency_key} was written by producer "
+                f"session {record.producer_session_id!r}, not by this one "
+                f"({producer.session_id!r}). Only the session that drew the "
+                "sequence number can re-append under that key; from any other "
+                "session the same bytes are a different record."
+            )
+        elsewhere = [
+            key
+            for key, outstanding in producer._unresolved.items()
+            if any(held.record == record for held in outstanding)
+        ]
+        if elsewhere:
+            raise ValueError(
+                f"record {record.idempotency_key} has an unsettled append on "
+                f"stream {elsewhere[0]}, not on {self._stream_key}. Append "
+                "idempotency is scoped to the stream, so settling it here would "
+                "not deduplicate against the copy that may already be on the "
+                "other stream -- it would append the value a second time, on a "
+                "topic no consumer of it is watching, and leave the first "
+                "stream blocked. Settle it on the topic the error names."
+            )
+        same_key = [
+            held
+            for held in producer._unresolved.get(self._stream_key, ())
+            if held.record.idempotency_key == record.idempotency_key
+        ]
+        if same_key:
+            raise ValueError(
+                f"the unsettled append under {record.idempotency_key} does not "
+                "hold these bytes. Idempotency is on identity, so re-appending "
+                "different content under that key is an AppendConflictError "
+                "rather than the no-op the recovery depends on. Pass the "
+                "`.record` the error carried, unmodified."
+            )
+        raise ValueError(
+            f"this producer has no unsettled append under "
+            f"{record.idempotency_key} on stream {self._stream_key}, so there "
+            "is nothing here to settle. If the producer that made it is gone, "
+            "the recovery is not this call: rebuild the producer with the same "
+            "session id and re-run the same calls in the same order. That "
+            "re-derives the same sequence numbers and re-appends the same "
+            "bytes, which the backend deduplicates -- and unlike this call it "
+            "leaves the new session's own counters correct, where settling here "
+            "would let its next publish reuse a sequence number and its next "
+            "unparked wake reuse a request ID (ADR-038)."
+        )
+
     async def resolve_append(
         self,
         record: StreamRecord,
         *,
-        wake: bool = True,
-        lease: timedelta = DEFAULT_WAKE_CLAIM_LEASE,
+        wake: bool | None = None,
+        lease: timedelta | None = None,
     ) -> Offset:
         """Settles an append :class:`AppendNotAcknowledgedError` left unknown.
 
@@ -535,37 +685,36 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
         now. Either way the stream ends with exactly one copy of the record and
         the caller ends with its offset.
 
+        Must be called on the topic the append was for, from the producer that
+        made it. Both are checked before the backend is touched; see
+        :meth:`_outstanding` for what each one prevents.
+
         The wake runs afterwards on exactly the terms :meth:`publish` describes,
         so a coordination or Signal failure here raises
-        :class:`WakeNotAcknowledgedError` carrying that offset. Pass
-        ``wake=error.wake`` to make the recovery finish what the interrupted call
-        was doing.
+        :class:`WakeNotAcknowledgedError` carrying that offset.
 
         Safe to call repeatedly: if this attempt is itself interrupted, it raises
         :class:`AppendNotAcknowledgedError` again with the same record, and the
         next attempt is the same call.
 
+        Args:
+            record: The ``.record`` the error carried, unmodified.
+            wake: Defaults to **what the interrupted call was going to do**,
+                rather than to ``True``. The recovery finishes that operation, so
+                inventing a wake policy for it is how a fence appended with
+                ``wake=False`` acquires a Signal, and how a record published with
+                ``wake=True`` loses one. Pass a value only to override
+                deliberately.
+            lease: Likewise defaults to the interrupted call's.
+
         Raises:
-            ValueError: The record does not belong to this producer session, or
-                already carries an offset. Both mean the caller is not holding
-                what the error handed it, and appending it would either break the
-                idempotency key's meaning or re-append an acknowledged record.
+            ValueError: The record is not this topic's outstanding append --
+                wrong topic, wrong bytes, wrong session, or nothing outstanding
+                at all. Raised before any backend call.
         """
-        if record.producer_session_id != self._producer.session_id:
-            raise ValueError(
-                f"record {record.idempotency_key} was written by producer "
-                f"session {record.producer_session_id!r}, not by this one "
-                f"({self._producer.session_id!r}). Only the session that drew "
-                "the sequence number can re-append under that key; from any "
-                "other session the same bytes are a different record."
-            )
-        if record.offset is not None:
-            raise ValueError(
-                f"record {record.idempotency_key} already carries offset "
-                f"{record.offset}, which means the backend acknowledged it. "
-                "There is nothing unresolved about it; if a wake is still owed, "
-                "that is what wake() and retry_wake() are for."
-            )
+        pending = self._outstanding(record)
+        wake = pending.wake if wake is None else wake
+        lease = pending.lease if lease is None else lease
         placed = await self._append(record, wake=wake, lease=lease)
         return await self._wake_for(placed, wake=wake, lease=lease)
 
@@ -663,7 +812,7 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
         # unused, which costs nothing: a gap in the sequence is not observable --
         # offsets come from the provider -- and the retry reuses the same number
         # for the same call.
-        self._refuse_while_unresolved(wake=wake, lease=lease)
+        self._refuse_while_unresolved()
         sequence = self._producer._next_sequence()
         record = StreamRecord(
             kind=RecordKind.DATA,
@@ -918,7 +1067,7 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
         # fence encodes nothing and so cannot be reordered by a codec: what the
         # two share is that the number belongs to the *call*, so a retry that
         # makes the same calls in the same order derives the same keys.
-        self._refuse_while_unresolved(wake=wake, lease=lease)
+        self._refuse_while_unresolved()
         sequence = self._producer._next_sequence()
         fence = StreamRecord(
             kind=RecordKind.WRITE_FENCE,

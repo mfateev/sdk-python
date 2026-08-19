@@ -201,6 +201,15 @@ M1_COVERAGE: dict[int, str | tuple[str, ...]] = {
         "test_wake.py::test_settling_an_append_that_never_landed_appends_it_once",
         "test_wake.py::test_a_conflicting_append_is_a_refusal_not_an_unknown_outcome",
     ),
+    # 78 is case 77's own review. The outcome was right and its recovery was
+    # under-bound: it carried the record but not the operation, and validated
+    # neither the stream the record belongs to nor the producer instance that
+    # still holds the session's counters.
+    78: (
+        "test_wake.py::test_a_refused_append_preserves_the_unresolved_operations_recovery",
+        "test_wake.py::test_an_unknown_append_can_only_be_resolved_on_its_originating_topic",
+        "test_wake.py::test_recovery_is_bound_to_the_producer_instance_that_made_the_append",
+    ),
 }
 
 #: Case number -> what is still missing, for cases the suite does not fully

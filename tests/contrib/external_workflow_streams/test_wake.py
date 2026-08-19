@@ -1044,9 +1044,13 @@ async def test_settling_an_unacknowledged_append_wakes_exactly_once() -> None:
     assert caught.value.wake, "the recovery has to know the call owed a wake"
     assert not client.sent, "nothing can have been signalled before the append landed"
 
-    await topic.resolve_append(caught.value.record, wake=caught.value.wake)
+    await topic.resolve_append(caught.value.record)
 
-    assert len(client.sent) == 1, "the settled record was announced once, or not at all"
+    assert len(client.sent) == 1, (
+        "the settled record was announced once, or not at all -- the recovery "
+        "defaults to what the interrupted call was doing rather than to a wake "
+        "policy of its own"
+    )
     records = await backend.read_after(topic.stream_key, BEGINNING, max_records=10)
     assert [(r.sequence, r.kind) for r in records] == [(0, RecordKind.DATA)]
 
@@ -1063,11 +1067,174 @@ async def test_an_unacknowledged_fence_settles_to_exactly_one_fence() -> None:
         await task
 
     assert caught.value.record.kind == RecordKind.WRITE_FENCE
-    await topic.resolve_append(caught.value.record, wake=False)
+    await topic.resolve_append(caught.value.record)
 
     records = await backend.read_after(topic.stream_key, BEGINNING, max_records=10)
     assert len([r for r in records if r.kind == RecordKind.WRITE_FENCE]) == 1, (
         "the stream holds more than the one fence that was written"
+    )
+    assert not client.sent, (
+        "the fence was appended with wake=False and the recovery invented a "
+        "Signal for it; the recovery finishes the interrupted call, it does not "
+        "choose a different one"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_refused_append_preserves_the_unresolved_operations_recovery() -> None:
+    """The refusal reports the *unsettled* operation, not the call it refused.
+
+    An append outcome is more than its record: whether a wake was owed, under
+    which lease, and whether cancellation is still to be honoured once the state
+    is settled. Filling those from whichever later call happened to be refused
+    makes the error's own instructions wrong -- a caller following them settles a
+    record that owed a Signal with ``wake=False``, and the parked Workflow stays
+    parked on a durable record nobody announced.
+    """
+    backend = CommittingThenBlockingBackend()
+    client = RecordingClient()
+    topic = make_producer(backend, client).topic("tokens", type=str)
+    await park(backend, topic.stream_key, wait_id=1, gen=4)
+    lease = timedelta(seconds=97)
+
+    task = await _cancel_after_commit(
+        backend, lambda: topic.publish("a", wake=True, lease=lease)
+    )
+    with pytest.raises(AppendNotAcknowledgedError) as caught:
+        await task
+    assert (caught.value.wake, caught.value.lease, caught.value.cancelled) == (
+        True,
+        lease,
+        True,
+    )
+
+    with pytest.raises(AppendNotAcknowledgedError) as refused:
+        await topic.publish("b", wake=False, lease=timedelta(seconds=5))
+
+    assert refused.value.record == caught.value.record, (
+        "the refusal must name the append that is actually unsettled"
+    )
+    assert refused.value.wake is True, (
+        "the refusal reported the refused call's wake policy beside the older "
+        "call's record, so recovering by its own fields drops a Signal"
+    )
+    assert refused.value.lease == lease
+    assert refused.value.cancelled is True, (
+        "the caller still has to know it was asked to stop; the refusal is not "
+        "a fresh, uncancelled attempt"
+    )
+    assert refused.value.stream_key == topic.stream_key
+
+    # Recovering by the refusal's own fields, which is what its message says.
+    await topic.resolve_append(
+        refused.value.record, wake=refused.value.wake, lease=refused.value.lease
+    )
+
+    assert len(client.sent) == 1, "the record is durable and nobody was told"
+    records = await backend.read_after(topic.stream_key, BEGINNING, max_records=10)
+    assert [(r.sequence, r.kind) for r in records] == [(0, RecordKind.DATA)]
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_append_can_only_be_resolved_on_its_originating_topic() -> (
+    None
+):
+    """Idempotency is scoped to the stream, so the recovery has to be too.
+
+    A ``StreamRecord`` names its producer session and sequence but not its
+    stream. On any *other* topic that key has never been used, so settling there
+    does not deduplicate against the copy that may already exist -- it appends
+    the value a second time, onto a stream no consumer of it is watching, and
+    leaves the real stream still blocked.
+    """
+    backend = CommittingThenBlockingBackend()
+    client = RecordingClient()
+    producer = make_producer(backend, client)
+    tokens = producer.topic("tokens", type=str)
+    events = producer.topic("events", type=str)
+
+    task = await _cancel_after_commit(backend, lambda: tokens.publish("a", wake=False))
+    with pytest.raises(AppendNotAcknowledgedError) as caught:
+        await task
+    assert caught.value.stream_key == tokens.stream_key, (
+        "the error has to name where it must be settled, since the record cannot"
+    )
+
+    with pytest.raises(ValueError, match="not on"):
+        await events.resolve_append(caught.value.record)
+    assert not await backend.read_after(events.stream_key, BEGINNING, max_records=10), (
+        "the wrong topic took the record, so one logical input is now on two streams"
+    )
+
+    # Nor do different bytes under the outstanding key count as that record.
+    tampered = dataclasses.replace(caught.value.record, payload=b'"z"')
+    with pytest.raises(ValueError, match="does not hold these bytes"):
+        await tokens.resolve_append(tampered)
+    assert producer._unresolved, (
+        "a rejected recovery must not clear the state that is still unsettled"
+    )
+
+    offset = await tokens.resolve_append(caught.value.record)
+    records = await backend.read_after(tokens.stream_key, BEGINNING, max_records=10)
+    assert [(r.sequence, r.offset) for r in records] == [(0, offset)]
+    assert await tokens.publish("b", wake=False), "the settled stream stays usable"
+
+
+@pytest.mark.asyncio
+async def test_recovery_is_bound_to_the_producer_instance_that_made_the_append() -> (
+    None
+):
+    """A same-session replacement producer is not the one that owes the append.
+
+    Its sequence and wake counters start at zero, so settling there leaves both
+    invalid: the next publish reuses a sequence number the recovered record
+    already holds, and the next unparked wake re-derives a request ID an earlier,
+    *different* wake already used -- which the server deduplicates away, leaving
+    a durable record unannounced.
+
+    The recovery for a producer that is gone is the one the Activity retry
+    already performs: rebuild with the same session id and re-run the same calls
+    in the same order. That re-derives the same sequences, so the backend
+    deduplicates the appends, and it leaves the new session's counters correct.
+    """
+    backend = CommittingThenBlockingBackend()
+    backend.blocking = False  # the first publish has to land normally
+    client = RecordingClient()
+    first = make_producer(backend, client)
+    topic = first.topic("tokens", type=str)
+
+    first_offset = await topic.publish("a")
+    assert len(client.sent) == 1
+    first_request_id = client.sent[0].request_id
+
+    backend.blocking = True
+    task = await _cancel_after_commit(backend, lambda: topic.publish("b"))
+    with pytest.raises(AppendNotAcknowledgedError) as caught:
+        await task
+
+    replacement = make_producer(backend, client)
+    assert replacement.session_id == first.session_id
+    with pytest.raises(ValueError, match="no unsettled append"):
+        await replacement.topic("tokens", type=str).resolve_append(caught.value.record)
+
+    # The recovery that refusal names, and what makes it the right one.
+    replacement_topic = replacement.topic("tokens", type=str)
+    assert await replacement_topic.publish("a") == first_offset, (
+        "re-running the same call has to deduplicate onto the original record"
+    )
+    assert client.sent[1].request_id == first_request_id, (
+        "re-running one attempt is a retry of its wake, which the server "
+        "collapses rather than turning into a second Workflow Task"
+    )
+
+    await replacement_topic.publish("b")
+    assert client.sent[2].request_id != first_request_id, (
+        "the second value's wake collided with the first value's, so the server "
+        "deduplicates it away and the record stays unannounced"
+    )
+    records = await backend.read_after(topic.stream_key, BEGINNING, max_records=10)
+    assert [r.sequence for r in records] == [0, 1], (
+        "each value must appear exactly once, under the sequence its call drew"
     )
 
 
