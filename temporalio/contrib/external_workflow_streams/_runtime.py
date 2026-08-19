@@ -41,6 +41,12 @@ from temporalio.contrib.external_workflow_streams._annotation import (
     Segment,
     SegmentEndReason,
     StreamBinding,
+    encode_bindings,
+    encode_header,
+    encode_segment,
+    encode_terminal,
+    encoded_run_size,
+    encoded_segment_size,
 )
 from temporalio.contrib.external_workflow_streams._api import (
     MAX_RECORDS_PER_ACTIVATION,
@@ -51,6 +57,9 @@ from temporalio.contrib.external_workflow_streams._backend import (
 )
 from temporalio.contrib.external_workflow_streams._codec import StreamPayloadCodec
 from temporalio.contrib.external_workflow_streams._continuation import Continuation
+from temporalio.contrib.external_workflow_streams._errors import (
+    ExternalStreamCapacityError,
+)
 from temporalio.contrib.external_workflow_streams._manager import (
     StreamSubscriptionManager,
 )
@@ -63,6 +72,35 @@ from temporalio.contrib.external_workflow_streams._record import (
 from temporalio.contrib.external_workflow_streams._replay import ReplayPlan
 
 __all__ = ["QuiescentWait", "WorkflowStreamRuntime"]
+
+_RUN_COST_FLOOR = 64
+"""The per-record annotation cost assumed until a real run has been measured.
+
+Pessimistic on purpose, and only ever a *starting* price: the largest run the
+current annotation has actually encoded replaces it as soon as there is one, and
+that measurement survives the segment it was taken in. A floor alone is not a
+bound -- a provider chooses how long its offsets are, and a run costs two of
+them -- which is why :data:`_SEGMENT_SPILL_CAP` exists behind it.
+
+Well above what a typical provider's two offsets cost (a Redis stream ID is
+fifteen bytes), so in the ordinary case this bounds nothing: the per-activation
+record cap is reached long first.
+"""
+
+_SEGMENT_SPILL_CAP = 4096
+"""The largest margin a segment frame may overrun the affordability line into.
+
+The runtime prices a record it has not seen yet, so it can misprice one -- and a
+segment frame cannot be moved to the next annotation, because its deliveries
+happened in this Workflow Task and that task's marker is where replay has to find
+them. The margin is what makes a misprice a *rollover* instead of a refused
+frame: the segment spills into it, the same completion asks Core to end the
+Workflow Task, and the terminal is still reserved behind it.
+
+Capped rather than a plain fraction so that a large budget does not hold back
+kilobytes it will never need; floored by the fraction so that a small budget --
+which only tests use -- still has a margin at all.
+"""
 
 _REPLAY_UNBOUNDED = 2**63 - 1
 """The budget reported while a recorded segment is being delivered.
@@ -173,6 +211,9 @@ class WorkflowStreamRuntime:
         self._data_converter = data_converter
         self._default_idle_timeout = default_idle_timeout
         self._max_annotation_bytes = max_annotation_bytes
+        #: The margin a segment frame may overrun the affordability line into.
+        #: See :data:`_SEGMENT_SPILL_CAP`.
+        self._spill_bytes = min(_SEGMENT_SPILL_CAP, max(64, max_annotation_bytes // 8))
         #: What the predecessor Run committed, or None on a first execution.
         #: Restored from History before any subscription is established, never
         #: read from the backend -- a cursor derived from mutable backend state
@@ -196,6 +237,27 @@ class WorkflowStreamRuntime:
         self._pending_deltas: list[bytes] = []
         #: Runs recorded since the current segment opened, in delivery order.
         self._runs: list[Run] = []
+        #: What each of those runs costs encoded, parallel to `_runs`. Kept
+        #: because the open segment's frame size is what decides whether another
+        #: record can be *delivered* at all: a segment frame that no longer fits
+        #: the annotation cannot be deferred to the next one -- its deliveries
+        #: happened in this Workflow Task and that task's marker is where replay
+        #: has to find them -- so the only place left to act is before the record
+        #: that would grow it is handed over. Measured, never estimated: a run's
+        #: cost is two provider-supplied offset strings whose length this side
+        #: does not choose.
+        self._run_sizes: list[int] = []
+        #: The largest run *this annotation* has encoded, in bytes. Unlike
+        #: `_run_sizes` this survives `close_segment`, which is the whole point:
+        #: a record is priced before it is delivered, and pricing the first record
+        #: of each activation at the bare floor -- as a per-segment maximum
+        #: does -- hands over a record the closing segment then cannot record.
+        self._max_run_bytes = 0
+        #: How many segments this annotation already holds. Zero means the next
+        #: record would be its first, which is the one case delivery is never
+        #: refused for: a fresh annotation is the most room there will ever be, so
+        #: refusing there rolls over to an annotation that refuses identically.
+        self._segments_in_annotation = 0
         #: Set when a subscription is registered or a record delivered, so an
         #: activation that changed nothing at all emits nothing.
         self._observed_this_activation = False
@@ -231,28 +293,254 @@ class WorkflowStreamRuntime:
     def delivery_budget_remaining(self) -> int:
         """How many more records this activation may hand to Workflow code.
 
+        Two budgets, and the smaller wins. The record cap bounds how long one
+        ``activate()`` call can run; the **annotation budget** bounds what the
+        marker for this Workflow Task can record. The second belongs here for the
+        same reason as the first: a record handed to Workflow code has to be
+        recorded, a segment frame that no longer fits cannot be moved to the next
+        annotation -- its deliveries happened in *this* Workflow Task and that
+        task's marker is where replay must find them -- and there is no third
+        option. So the budget is spent before the record is delivered rather than
+        checked after the segment is built.
+
         Unbounded during replay. Delivery then comes from the recorded segments
-        rather than a live producer, so it is already finite, and the recorded
+        rather than a live producer, so it is already finite, the recorded
         boundaries already say how many records each activation received --
         re-cutting them here would deliver a different schedule than the one in
-        History.
+        History -- and nothing is being written to a new annotation at all.
         """
         if self._replay_ready is not None:
             return _REPLAY_UNBOUNDED
-        return max(0, MAX_RECORDS_PER_ACTIVATION - self._delivered_this_activation)
+        return min(
+            max(0, MAX_RECORDS_PER_ACTIVATION - self._delivered_this_activation),
+            self._annotation_records_affordable(),
+        )
 
     def delivery_budget_exhausted(self) -> bool:
-        """Whether this activation stopped delivering because of the budget.
+        """Whether this activation stopped delivering because of a budget.
 
-        The completion path asks, because records left buffered by the budget
-        have no readiness notification coming: the watcher moved its prefetch
-        cursor past them when it buffered them. Their readiness has to be
-        re-reported or the Workflow waits forever on records already in front of
-        it.
+        The completion path asks, because records left buffered by a budget have
+        no readiness notification coming: the watcher moved its prefetch cursor
+        past them when it buffered them. Their readiness has to be re-reported or
+        the Workflow waits forever on records already in front of it.
+
+        Either budget counts. The annotation one leaves records buffered in
+        exactly the same way, and its rollover ends the Workflow Task rather than
+        the activation -- so the successor task has to be told the buffer is not
+        empty just as the next activation would have been.
         """
-        return (
-            self._replay_ready is None
-            and self._delivered_this_activation >= MAX_RECORDS_PER_ACTIVATION
+        return self._replay_ready is None and (
+            self._delivered_this_activation >= MAX_RECORDS_PER_ACTIVATION
+            or self.annotation_budget_exhausted
+        )
+
+    # --- the annotation byte budget (ADR-007) --------------------------------
+
+    @property
+    def annotation_budget_exhausted(self) -> bool:
+        """Whether the annotation can no longer afford another record.
+
+        Read by the completion path, which turns it into a rollover request, and
+        by :meth:`_segment_end_reason`, which records it as the reason this
+        segment ended. Not a failure: approaching the budget is a runtime event
+        and rollover is the mechanism for it (ADR-007).
+
+        Deliberately **not** conditioned on this activation having observed
+        anything. That is a property of the activation and this is a property of
+        the annotation, and conflating the two wedges the Workflow: the completion
+        path reads this *after* ``take_observation_delta`` -- which it must, since
+        that call is what closes the crossing segment -- and that call clears the
+        observed flag. The rollover would then go unrequested, the next activation
+        would begin against the same full annotation, and
+        :meth:`delivery_budget_remaining` would hand it a budget of zero. Nothing
+        delivered means nothing observed, which means no rollover, forever.
+        """
+        return self._replay_ready is None and self._annotation_records_affordable() <= 0
+
+    def _annotation_records_affordable(self) -> int:
+        """How many more records this activation's segment can afford to record.
+
+        Bytes converted into records by the most expensive run **this annotation**
+        has encoded, floored at :data:`_RUN_COST_FLOOR`. Annotation-wide and not
+        per-segment, which is the difference between a price and a guess: the open
+        segment is emptied at the end of every activation, so a per-segment
+        maximum prices the first record of *every* activation at the bare floor,
+        and a real run costs two provider-chosen offset strings. Delivering on
+        that price hands over a record the closing segment then cannot record.
+
+        Still only a price, never a proof: nothing here has seen the offsets of
+        the record it is pricing. What makes the arithmetic safe is that a
+        misprice spills into :data:`_SEGMENT_SPILL_CAP` and becomes a rollover,
+        and that the reserve behind the margin keeps the terminal affordable
+        regardless.
+
+        **One record is always affordable while the annotation holds no segment.**
+        A fresh annotation is the most room there will ever be, so refusing there
+        would roll over to an annotation that refuses identically -- a Workflow
+        that delivers nothing, observes nothing, and therefore never even asks for
+        the rollover that was supposed to save it.
+        """
+        headroom = self._annotation_headroom() - self._segment_bytes()
+        price = max(_RUN_COST_FLOOR, self._max_run_bytes)
+        if headroom >= price:
+            return headroom // price
+        if self._segments_in_annotation == 0 and not self._runs:
+            return 1
+        return 0
+
+    def _annotation_headroom(self) -> int:
+        """Bytes this annotation still has for frames that are not its closers.
+
+        The reserve is re-priced here rather than read off the accumulator, which
+        holds whatever it was told last. A terminal entry costs one byte while a
+        wait sits at ``BEGINNING`` and more once it has a cursor, so the figure
+        the accumulator is carrying goes stale on the first delivery -- and a
+        stale reserve on this path is an *under*-reserve, which is the direction
+        that matters.
+
+        When there is no accumulator yet, the first observation is about to create
+        one and its header comes out of the same budget, so the header is priced
+        here rather than discovered to be unaffordable after the fact.
+        """
+        size = (
+            self._accumulator.size
+            if self._accumulator is not None
+            else len(encode_header(self._header_preview()))
+        )
+        return max(
+            0,
+            self._max_annotation_bytes
+            - size
+            - self._reserve_bytes()
+            - self._spill_bytes,
+        )
+
+    def _segment_bytes(self) -> int:
+        """What the open segment would cost as a frame, right now."""
+        if not self._run_sizes:
+            return 0
+        return encoded_segment_size(self._run_sizes)
+
+    def _reserve_bytes(self) -> int:
+        """What closing this annotation will cost: the terminal, plus bindings.
+
+        Held back rather than checked, because neither frame may ever be refused:
+        both record something that already happened, and an annotation Core
+        writes without a terminal is durable and cannot be decoded past the frame
+        after it. See :attr:`AnnotationAccumulator.reserved`.
+        """
+        reserve = len(
+            encode_terminal(
+                {
+                    wait_id: state.delivery_cursor
+                    for wait_id, state in sorted(self._subscriptions.items())
+                }
+            )
+        )
+        late = {
+            wait_id: self._binding(state)
+            for wait_id, state in sorted(self._subscriptions.items())
+            if not state.announced
+        }
+        if late and self._accumulator is not None:
+            # Only with an accumulator: without one the header is about to carry
+            # every one of these, and `_annotation_headroom` prices it there.
+            reserve += len(encode_bindings(late))
+        return reserve
+
+    def _update_reserve(self) -> None:
+        """Re-prices the closing frames on the accumulator that holds them."""
+        if self._accumulator is not None:
+            self._accumulator.reserve(self._reserve_bytes(), spill=self._spill_bytes)
+
+    def _check_segment_recordable(self) -> None:
+        """Refuses a segment that has grown past even the spill margin.
+
+        The last line, and the one thing the arithmetic above cannot rule out: a
+        record is priced before its offsets are seen, so a provider whose offsets
+        are far longer than anything measured can make one run cost more than the
+        whole budget has left. Rollover does not help -- a fresh annotation still
+        has to carry this run -- so the boundary is genuinely unrecordable.
+
+        Raised **here**, where the record has been drained but not yet handed to
+        Workflow code, and as the same non-retryable capacity error
+        ``subscribe()`` raises. Two things follow, and both are the point:
+        ``AnnotationBudgetExceeded`` is not what surfaces, so the message names
+        the provider's offsets rather than an internal byte budget; and the
+        Workflow fails rather than its Workflow Task, so the encoding that cannot
+        fit is not retried forever (ADR-007).
+        """
+        # Headroom plus the margin: what a segment may still spend, counting the
+        # header and every earlier frame this annotation already holds. Measured
+        # against the reserve alone it would miss the header entirely, and the
+        # header is the largest frame most annotations carry.
+        emittable = self._annotation_headroom() + self._spill_bytes
+        segment = self._segment_bytes()
+        if segment <= emittable:
+            return
+        largest = max(self._run_sizes) if self._run_sizes else 0
+        raise ExternalStreamCapacityError(
+            f"this Workflow Task's external stream deliveries no longer fit the "
+            f"replay annotation: the segment recording them needs {segment} bytes "
+            f"against {emittable} available, and its largest single run costs "
+            f"{largest}. A run is two provider-supplied offsets, so this means the "
+            "backend's offsets are far longer than the marker format is sized for. "
+            "Rolling the Workflow Task over cannot help -- the next annotation has "
+            "to carry the same run. Use a backend with shorter offsets, or "
+            "subscribe to fewer streams from one Workflow."
+        )
+
+    def _check_annotation_capacity(self, wait_id: int) -> None:
+        """Refuses a subscription set no annotation could ever record.
+
+        A header is one indivisible frame, and a binding carries four
+        caller-chosen strings -- namespace, Workflow ID, first-execution Run ID,
+        stream name -- plus the backend name and provider id. Enough
+        subscriptions, or long enough valid names, and the header alone is larger
+        than the whole budget. Nothing downstream can recover from that: rollover
+        writes a *fresh* header, so the next annotation is the same size and the
+        one after that too, and the Workflow Task fails identically on every
+        retry with no marker ever written. ADR-007 exists to keep the budget from
+        producing exactly that.
+
+        So the capacity question is asked where the answer is still actionable:
+        inside the Workflow's ``subscribe()`` call. It is deterministic -- the
+        same subscriptions in the same order give the same answer -- so replay
+        reproduces the refusal rather than diverging on it.
+
+        Priced against an **empty** annotation, and against everything such an
+        annotation is nonetheless obliged to carry: its header, its terminal, one
+        segment frame -- an activation that drained and observed nothing still
+        encodes one, and it is meaningful (ADR-018) -- and the spill margin a
+        mispriced record overruns into. Leaving any of those out accepts a
+        subscription set that clears the check and then cannot encode its very
+        first completion, which is the failure this exists to prevent rather than
+        to relocate.
+        """
+        floor = (
+            len(encode_header(self._header_preview()))
+            + len(
+                encode_terminal(
+                    {
+                        other: state.delivery_cursor
+                        for other, state in sorted(self._subscriptions.items())
+                    }
+                )
+            )
+            + len(encode_segment(Segment((), SegmentEndReason.NO_DATA_AVAILABLE)))
+            + self._spill_bytes
+        )
+        if floor <= self._max_annotation_bytes:
+            return
+        raise ExternalStreamCapacityError(
+            f"subscribing external stream wait {wait_id} would make this "
+            f"Workflow's replay annotation need {floor} bytes before recording a "
+            f"single record -- its header, its terminal, one segment frame, and "
+            f"the {self._spill_bytes}-byte margin -- past the "
+            f"{self._max_annotation_bytes}-byte budget. "
+            "Rolling the Workflow Task over cannot help: every annotation begins "
+            "with a header of this size. Subscribe to fewer streams from one "
+            "Workflow, or shorten the stream and backend names."
         )
 
     def rearm_readiness(self) -> None:
@@ -288,6 +576,15 @@ class WorkflowStreamRuntime:
         ``wait_id``, so a chain resumes where it left off without the Workflow
         code saying anything about it -- and a first execution gets ``BEGINNING``
         from the same path.
+
+        Raises:
+            ExternalStreamCapacityError: This subscription set cannot be recorded
+                in an annotation at all -- see
+                :meth:`_check_annotation_capacity`. Raised *here*, out of the
+                Workflow's own ``subscribe()`` call, because that is the only
+                point at which the answer is still "do not make this
+                subscription" rather than "this Workflow Task cannot be
+                completed".
         """
         if start_cursor is None:
             start_cursor = self.restored_start(wait_id, stream_key.stream_name)
@@ -306,7 +603,7 @@ class WorkflowStreamRuntime:
             binding = self._replay_bindings.get(wait_id)
             if binding is not None:
                 self._verify_binding(wait_id, stream_key, backend_name, binding)
-        self._subscriptions[wait_id] = _SubscriptionState(
+        state = _SubscriptionState(
             wait_id=wait_id,
             stream_key=stream_key,
             backend_name=backend_name,
@@ -315,9 +612,20 @@ class WorkflowStreamRuntime:
             consumption_cursor=start_cursor,
             idle_timeout=idle_timeout or self._default_idle_timeout,
         )
+        self._subscriptions[wait_id] = state
         # A subscription created part-way through an annotation begins at its
         # own start cursor, not at wherever the others happen to be.
         self._annotation_start[wait_id] = start_cursor
+        try:
+            self._check_annotation_capacity(wait_id)
+        except Exception:
+            # Rolled back so the refusal leaves no half-registered wait behind:
+            # a state entry with no manager registration would reach the next
+            # annotation's header as a binding for a wait nothing is watching.
+            del self._subscriptions[wait_id]
+            del self._annotation_start[wait_id]
+            raise
+        self._update_reserve()
         self._manager.register(
             run_id=self._run_id,
             wait_id=wait_id,
@@ -544,8 +852,11 @@ class WorkflowStreamRuntime:
         statement of what was committed -- and only the waits it recorded
         something for are named.
 
-        Hopped onto the manager's loop inside the manager, for the same reason
-        :meth:`rearm_readiness` hops: this runs on the Workflow thread.
+        Performed **synchronously**, before this returns: the drain that
+        follows replay runs on this same thread, so a reposition merely posted
+        to the manager's loop would still have the marker-covered records in the
+        buffer when that drain reaches it. Only the watcher's wakeup is hopped;
+        see :meth:`StreamSubscriptionManager.reposition_to_committed`.
         """
         self._manager.reposition_to_committed(self._run_id, boundaries)
 
@@ -636,6 +947,11 @@ class WorkflowStreamRuntime:
                 count=previous.count + 1,
                 control_positions=positions,
             )
+            # Only the run that changed is re-measured. Extending one is cheap;
+            # re-encoding the whole segment once per record would not be.
+            self._run_sizes[-1] = encoded_run_size(self._runs[-1])
+            self._max_run_bytes = max(self._max_run_bytes, self._run_sizes[-1])
+            self._check_segment_recordable()
             return
 
         self._runs.append(
@@ -647,6 +963,9 @@ class WorkflowStreamRuntime:
                 control_positions=(0,) if record.is_control else (),
             )
         )
+        self._run_sizes.append(encoded_run_size(self._runs[-1]))
+        self._max_run_bytes = max(self._max_run_bytes, self._run_sizes[-1])
+        self._check_segment_recordable()
 
     def unsubscribe(self, wait_id: int) -> None:
         """Ends a wait, and tells the Worker to stop serving it.
@@ -709,6 +1028,8 @@ class WorkflowStreamRuntime:
             accumulator.add_segment(Segment(tuple(self._runs), reason))
         )
         self._runs = []
+        self._run_sizes = []
+        self._segments_in_annotation += 1
 
     def _segment_end_reason(self) -> SegmentEndReason:
         """Why this activation stopped delivering.
@@ -717,13 +1038,24 @@ class WorkflowStreamRuntime:
         whether the caller remembered it or not: it is durable, and a reader of
         the annotation has nothing else to tell it why the activation ended.
 
-        ``BATCH_LIMIT`` outranks the other two. Both of them assert that nothing
-        more was available -- ``FENCE_REACHED`` additionally that the set is
-        immediately parkable -- and both are simply false when the runtime
-        stopped with records still sitting in the buffer. Recording
+        ``BATCH_LIMIT`` outranks the two availability reasons. Both of them
+        assert that nothing more was available -- ``FENCE_REACHED`` additionally
+        that the set is immediately parkable -- and both are simply false when the
+        runtime stopped with records still sitting in the buffer. Recording
         ``NO_DATA_AVAILABLE`` for a budget cut-off would put a claim in History
         that the stream ran dry when it did not.
+
+        ``BUDGET_ROLLOVER`` outranks even that, because it says something the
+        others do not: the batch continues in the *following marker*. A rollover
+        recorded as ``BATCH_LIMIT`` would leave replay treating this segment as
+        the end of the consumption.
         """
+        if self.annotation_budget_exhausted:
+            # Ranked first: it is the only one of the four that says the batch
+            # continues in the *next marker*, which is what tells replay to
+            # reassemble across the rollover boundary rather than treat this
+            # segment as the end of the consumption.
+            return SegmentEndReason.BUDGET_ROLLOVER
         if self.delivery_budget_exhausted():
             return SegmentEndReason.BATCH_LIMIT
         if self._subscriptions and all(
@@ -805,7 +1137,20 @@ class WorkflowStreamRuntime:
 
     @property
     def request_rollover(self) -> bool:
-        """Whether the annotation has passed its byte-budget high-water mark."""
+        """Whether Core should be asked to end this Workflow Task's annotation.
+
+        Two conditions, and the second is not redundant. The high-water mark is a
+        *fraction* of the budget, and it only becomes true once a frame that
+        crossed it has been emitted -- but an indivisible frame can be larger than
+        the fraction that was left, so waiting for the mark alone is not a bound.
+        The second condition is the runtime having stopped delivering because the
+        annotation could no longer afford to record another record: that one is
+        true in the same activation, before anything has overflowed, and it is
+        what makes "an annotation can never exceed the budget" (ADR-007) hold for
+        a frame of any size.
+        """
+        if self.annotation_budget_exhausted:
+            return True
         return self._accumulator is not None and self._accumulator.request_rollover
 
     def start_new_annotation(self) -> None:
@@ -819,6 +1164,9 @@ class WorkflowStreamRuntime:
         self._annotation_closed = False
         self._pending_deltas = []
         self._runs = []
+        self._run_sizes = []
+        self._max_run_bytes = 0
+        self._segments_in_annotation = 0
         self._observed_this_activation = False
         self._annotation_start = {
             wait_id: state.delivery_cursor
@@ -917,6 +1265,9 @@ class WorkflowStreamRuntime:
             self._pending_deltas.append(self._accumulator.accumulated())
         else:
             self._announce_late_subscriptions()
+        # Re-priced after any late binding went out, so what is held back is what
+        # is still owed rather than what was owed when the accumulator was made.
+        self._update_reserve()
         return self._accumulator
 
     def _announce_late_subscriptions(self) -> None:
@@ -968,6 +1319,20 @@ class WorkflowStreamRuntime:
         """
         for state in self._subscriptions.values():
             state.announced = True
+        return AnnotationHeader(
+            streams={
+                wait_id: self._binding(state)
+                for wait_id, state in sorted(self._subscriptions.items())
+            },
+        )
+
+    def _header_preview(self) -> AnnotationHeader:
+        """The header a fresh annotation would carry, without claiming it.
+
+        :meth:`_header` marks every subscription announced, which is right when
+        the header is actually being emitted and wrong when the question is only
+        what it would cost.
+        """
         return AnnotationHeader(
             streams={
                 wait_id: self._binding(state)

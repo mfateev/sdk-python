@@ -38,8 +38,10 @@ from dataclasses import dataclass
 from typing import Final
 
 import temporalio.common
+import temporalio.exceptions
 
 __all__ = [
+    "ExternalStreamCapacityError",
     "StreamDecodeError",
     "StreamError",
     "StreamIntegrityError",
@@ -85,6 +87,31 @@ class StreamDecodeError(StreamError):
     producer's -- and reporting it as integrity loss sends an operator to
     restore a backend that was never damaged (ADR-015).
     """
+
+
+class ExternalStreamCapacityError(temporalio.exceptions.ApplicationError):
+    """This Workflow's subscription set cannot be recorded in an annotation.
+
+    Deliberately **not** one of the four taxonomy rows above. Those describe a
+    stream or a converter behaving unexpectedly at read time; this describes
+    Workflow code asking for more than the marker format can carry, and it is
+    known at ``subscribe()`` rather than at read time. The remedy is in the
+    Workflow: fewer streams, or shorter names.
+
+    Non-retryable, and raised from ``subscribe()`` rather than from the
+    completion path, because both halves of that matter. A capacity limit
+    discovered while encoding a completion fails the *Workflow Task*, the server
+    retries Workflow Task failures regardless of cause, and the same subscription
+    set encodes to the same oversized header every time -- a Workflow stuck
+    forever with nothing durable to show why. Raised where the subscription is
+    made, it is an error in the Workflow's own code path, deterministic under
+    replay, and reported once.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            message, type="ExternalStreamCapacityError", non_retryable=True
+        )
 
 
 #: Metric names. Operators are expected to alert on the integrity metric

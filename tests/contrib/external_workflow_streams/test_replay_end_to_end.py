@@ -523,15 +523,22 @@ async def test_an_empty_stream_parked_and_evicted_replays_from_the_recorded_curs
         send_wake_signal,
     )
 
-    #: Which Runs the Worker tore down. `RemoveFromCache` is the only thing that
-    #: reaches this while a Worker is running, so it is the eviction itself
-    #: rather than a symptom of one.
+    #: Which Runs the Worker **finished** tearing down. `RemoveFromCache` is the
+    #: only thing that reaches this while a Worker is running, so it is the
+    #: eviction itself rather than a symptom of one.
+    #:
+    #: Recorded *after* the teardown is awaited, not before. Before, this said only
+    #: that teardown had **started**: the Run's watcher was still alive, and the
+    #: records this test publishes next could be read into a buffer that was about
+    #: to be discarded -- their readiness reported by a watcher with nothing left to
+    #: deliver it to. What the test needs to know is that nothing is watching any
+    #: more, which is the *post*-condition of this call.
     evicted: list[str] = []
     evict_run = StreamSubscriptionManager.evict_run
 
     async def spy_on_eviction(self, run_id: str) -> None:  # type: ignore[no-untyped-def]
-        evicted.append(run_id)
         await evict_run(self, run_id)
+        evicted.append(run_id)
 
     monkeypatch.setattr(StreamSubscriptionManager, "evict_run", spy_on_eviction)
 

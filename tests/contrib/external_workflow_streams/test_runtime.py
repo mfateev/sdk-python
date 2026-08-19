@@ -16,10 +16,18 @@ import pytest_asyncio
 
 import temporalio.converter
 from temporalio.contrib.external_workflow_streams._annotation import (
+    ROLLOVER_HIGH_WATER,
+    AnnotationHeader,
     SegmentEndReason,
+    StreamBinding,
     decode_annotation,
+    encode_header,
+    encode_terminal,
 )
 from temporalio.contrib.external_workflow_streams._backend import StreamKey
+from temporalio.contrib.external_workflow_streams._errors import (
+    ExternalStreamCapacityError,
+)
 from temporalio.contrib.external_workflow_streams._manager import (
     ReadinessResult,
     StreamSubscriptionManager,
@@ -31,7 +39,10 @@ from temporalio.contrib.external_workflow_streams._record import (
     RecordKind,
     StreamRecord,
 )
-from temporalio.contrib.external_workflow_streams._runtime import WorkflowStreamRuntime
+from temporalio.contrib.external_workflow_streams._runtime import (
+    _RUN_COST_FLOOR,
+    WorkflowStreamRuntime,
+)
 from tests.contrib.external_workflow_streams.memory_backend import MemoryStreamBackend
 
 RUN_ID = "run-1"
@@ -745,6 +756,461 @@ async def test_rollover_is_requested_before_the_budget_is_reached(
             runtime.take_observation_delta()
 
         assert delivered > 0
+    finally:
+        await manager.shutdown()
+
+
+def _budget_runtime(
+    backend: MemoryStreamBackend,
+    manager: StreamSubscriptionManager,
+    *,
+    max_annotation_bytes: int,
+) -> WorkflowStreamRuntime:
+    return WorkflowStreamRuntime(
+        manager=manager,
+        backends={"tokens": backend},
+        run_id=RUN_ID,
+        namespace="ns",
+        workflow_id="wf",
+        first_execution_run_id="first",
+        data_converter=temporalio.converter.DataConverter.default,
+        default_idle_timeout=timedelta(seconds=1),
+        max_annotation_bytes=max_annotation_bytes,
+    )
+
+
+async def test_the_segment_that_crosses_the_mark_asks_for_rollover_itself(
+    backend: MemoryStreamBackend,
+) -> None:
+    """The crossing segment's own completion carries the request, not the next one.
+
+    ``take_observation_delta`` is what *closes* the activation's segment, so a
+    rollover flag sampled before it describes the annotation as it stood one
+    activation ago. The segment that crossed the high-water mark then went out
+    with ``request_rollover = false``, and the activation after it was free to add
+    another frame -- and to overflow -- before Core had ever been asked to roll
+    over. One activation of delay is the whole margin the high-water mark exists
+    to provide.
+    """
+    from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
+    from tests.contrib.external_workflow_streams.test_delivery_budget import (
+        _CompletionStub,
+    )
+
+    manager = StreamSubscriptionManager(
+        backends={"tokens": backend},
+        notify_ready=_notify,
+        watch_block=timedelta(milliseconds=10),
+    )
+    runtime = _budget_runtime(backend, manager, max_annotation_bytes=2048)
+    try:
+        subscribe(runtime, 1)
+        subscribe(runtime, 2, name="tool-events")
+
+        # Fill to just short of the mark, one flushed activation at a time, so
+        # that the *next* activation is the one that crosses it.
+        accumulated: list[bytes] = []
+        delivered = 0
+        high_water = int(2048 * ROLLOVER_HIGH_WATER)
+        while True:
+            for wait_id in (1, 2):
+                delivered += 1
+                runtime.record_delivery(wait_id, data(f"{delivered}-0"))
+            delta = runtime.take_observation_delta()
+            if delta is not None:
+                accumulated.append(delta)
+            assert runtime._accumulator is not None
+            # Stops with a gap the next activation's segment is bigger than, so
+            # that segment is unambiguously the frame that crosses the mark.
+            if runtime._accumulator.size >= high_water - 400:
+                break
+            assert not runtime.request_rollover, (
+                "the mark was crossed by a flushed activation, so nothing here "
+                "is testing the activation that crosses it"
+            )
+
+        # One more activation, whose closing segment is what crosses the mark --
+        # and which is therefore the completion that has to carry the request.
+        for _ in range(15):
+            for wait_id in (1, 2):
+                delivered += 1
+                runtime.record_delivery(wait_id, data(f"{delivered}-0"))
+        assert not runtime.request_rollover, (
+            "the crossing segment is still open, so the accumulator cannot know "
+            "about it yet -- which is the entire reason the flag must be read "
+            "after the delta is taken and not before"
+        )
+
+        stub = _CompletionStub(runtime)
+        _WorkflowInstanceImpl._emit_external_stream_commands(stub)  # type: ignore[arg-type]
+
+        commands = stub._current_completion.successful.commands
+        progress = commands[0].workflow_stream_progress
+        assert progress.request_rollover, (
+            "the completion that carried the crossing segment did not ask for the "
+            "rollover, so an entire further activation may append to an "
+            "annotation Core has not been told to close"
+        )
+        accumulated.append(progress.observation_delta)
+        annotation = decode_annotation(b"".join(accumulated))
+        assert annotation.terminal is not None, (
+            "Core issues no finalization job for a rollover it was asked for, so "
+            "the terminal has to ride this same delta"
+        )
+        assert annotation.segments[-1].end_reason in (
+            SegmentEndReason.BUDGET_ROLLOVER,
+            SegmentEndReason.NO_DATA_AVAILABLE,
+        )
+    finally:
+        await manager.shutdown()
+
+
+async def test_a_frame_larger_than_the_slack_rolls_over_instead_of_raising(
+    backend: MemoryStreamBackend,
+) -> None:
+    """An indivisible frame bigger than the remaining budget is not a failure.
+
+    The high-water mark is a *fraction* of the budget, and a segment frame can be
+    larger than the fraction that is left: a run costs two provider-supplied
+    offset strings, and nothing bounds their length from this side. Checking at
+    encode time and raising is what ADR-007 rejects -- the encoding that
+    overflowed overflows again on the retry, so the Workflow Task fails forever
+    with no marker, no terminal, and no rollover ever asked for.
+
+    The runtime instead stops handing records over while the annotation can still
+    record them, and asks for the rollover on that boundary. Long offsets are what
+    make one activation's segment expensive here; that is exactly the shape the
+    old check-and-fail path could not survive.
+    """
+    manager = StreamSubscriptionManager(
+        backends={"tokens": backend},
+        notify_ready=_notify,
+        watch_block=timedelta(milliseconds=10),
+    )
+    runtime = _budget_runtime(backend, manager, max_annotation_bytes=1024)
+    long = "o" * 300
+    try:
+        subscribe(runtime, 1)
+        subscribe(runtime, 2, name="tool-events")
+
+        # Each record is its own run, and each run costs two 300-byte offsets --
+        # far more than the 25% of 1024 bytes that the high-water margin leaves.
+        delivered = 0
+        while runtime.delivery_budget_remaining() > 0 and delivered < 50:
+            wait_id = 1 + (delivered % 2)
+            delivered += 1
+            runtime.record_delivery(wait_id, data(f"{long}{delivered}-0"))
+
+        assert delivered < 50, (
+            "the annotation budget never stopped delivery, so this test is not "
+            "exercising the boundary it exists for"
+        )
+        assert runtime.request_rollover, (
+            "the runtime stopped delivering because the annotation could record "
+            "no more, and said nothing about it -- Core is never asked to roll "
+            "the task over and the next activation overflows"
+        )
+        assert runtime.annotation_budget_exhausted
+        assert runtime.delivery_budget_exhausted(), (
+            "records left buffered by the annotation budget need their readiness "
+            "re-reported exactly as the record cap's do"
+        )
+
+        # And the annotation still closes, which is what raising would have
+        # prevented: a marker with no terminal is durable and undecodable past
+        # the frame after it.
+        delta = runtime.take_observation_delta()
+        assert delta is not None
+        terminal = runtime.add_terminal()
+        annotation = decode_annotation(delta + terminal)
+        assert annotation.terminal is not None
+        assert annotation.segments[-1].end_reason == SegmentEndReason.BUDGET_ROLLOVER, (
+            "a segment cut by the byte budget has to say so: the batch continues "
+            "in the following marker, which no other end reason implies"
+        )
+    finally:
+        await manager.shutdown()
+
+
+async def test_an_activation_the_annotation_budget_stopped_is_not_wedged_by_it(
+    backend: MemoryStreamBackend,
+) -> None:
+    """Stopping delivery obliges the same completion to ask for the rollover.
+
+    These two are one mechanism and each is useless alone. The annotation budget
+    stops delivery so a segment can never overflow; the rollover is what gives the
+    next Workflow Task a fresh annotation to deliver into. Stop without asking and
+    the Workflow is **wedged**: the next activation begins against the same full
+    annotation, is handed a delivery budget of zero, delivers nothing, and so
+    observes nothing -- and a rollover condition that depended on having observed
+    something would then never become true again.
+
+    That is not hypothetical. The flag is read after `take_observation_delta`,
+    which it must be, since that call is what closes the crossing segment -- and
+    that call also clears the observed flag. The frame here is deliberately larger
+    than the slack the *fractional* high-water mark leaves but small enough that
+    the mark itself is not crossed, so the mark cannot cover for it.
+    """
+    from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
+    from tests.contrib.external_workflow_streams.test_delivery_budget import (
+        _CompletionStub,
+    )
+
+    manager = StreamSubscriptionManager(
+        backends={"tokens": backend},
+        notify_ready=_notify,
+        watch_block=timedelta(milliseconds=10),
+    )
+    runtime = _budget_runtime(backend, manager, max_annotation_bytes=1024)
+    long = "o" * 300
+    try:
+        subscribe(runtime, 1)
+        subscribe(runtime, 2, name="tool-events")
+
+        delivered = 0
+        while runtime.delivery_budget_remaining() > 0 and delivered < 50:
+            wait_id = 1 + (delivered % 2)
+            delivered += 1
+            runtime.record_delivery(wait_id, data(f"{long}{delivered}-0"))
+
+        assert delivered < 50, "the annotation budget never stopped delivery"
+        assert runtime._accumulator is None or not (
+            runtime._accumulator.request_rollover
+        ), (
+            "the accumulator's own high-water mark is asking for this rollover, "
+            "so it would mask the condition under test -- the frame has to be "
+            "larger than the slack the fractional mark leaves without reaching "
+            "the mark itself"
+        )
+
+        stub = _CompletionStub(runtime)
+        _WorkflowInstanceImpl._emit_external_stream_commands(stub)  # type: ignore[arg-type]
+
+        commands = stub._current_completion.successful.commands
+        assert commands[0].workflow_stream_progress.request_rollover, (
+            "delivery stopped for the annotation budget and the completion asked "
+            "for no rollover, so the next Workflow Task inherits a full "
+            "annotation and can never deliver again"
+        )
+        assert (
+            decode_annotation(
+                commands[0].workflow_stream_progress.observation_delta
+            ).terminal
+            is not None
+        )
+
+        # And the next Workflow Task can in fact deliver: the annotation was
+        # closed and a fresh one begins from its own header.
+        assert runtime.delivery_budget_remaining() > 0, (
+            "the Workflow Task after the rollover is still unable to take a "
+            "single record"
+        )
+        assert not runtime.annotation_budget_exhausted
+    finally:
+        await manager.shutdown()
+
+
+async def test_the_first_record_of_an_activation_is_priced_from_a_measurement(
+    backend: MemoryStreamBackend,
+) -> None:
+    """A per-segment maximum prices every activation's first record at the floor.
+
+    ``close_segment`` empties the open segment at the end of each activation, so a
+    price taken from *that* segment's runs is back to the bare floor every time --
+    and a real run costs two provider-chosen offset strings, which can be many
+    times the floor. Delivery then goes ahead on a price that is wrong by a factor,
+    the closing segment no longer fits, and what surfaces is a byte-budget error
+    that fails the Workflow.
+
+    The measurement therefore belongs to the *annotation*, not the segment: the
+    largest run encoded since the header went out is what the next record costs
+    until a larger one appears.
+    """
+    manager = StreamSubscriptionManager(
+        backends={"tokens": backend},
+        notify_ready=_notify,
+        watch_block=timedelta(milliseconds=10),
+    )
+    runtime = _budget_runtime(backend, manager, max_annotation_bytes=8192)
+    long = "9" * 300
+    try:
+        subscribe(runtime, 1)
+        subscribe(runtime, 2, name="tool-events")
+
+        # One activation's worth of long-offset runs, then the flush that closes
+        # its segment. The price has to survive that flush: `close_segment` empties
+        # the open segment, and a price read from it is back to the floor.
+        for i in range(4):
+            runtime.record_delivery(1 + (i % 2), data(f"{long}{i}-0"))
+        measured = runtime._max_run_bytes
+        assert measured > _RUN_COST_FLOOR, (
+            "the long offsets did not even cost more than the floor, so this test "
+            "cannot tell a measurement from a guess"
+        )
+
+        runtime.take_observation_delta()
+
+        assert runtime._run_sizes == [], "the open segment must have been emptied"
+        assert runtime._max_run_bytes == measured, (
+            "the price fell back to the floor when the segment was closed, so the "
+            "first record of the next activation is priced at "
+            f"{_RUN_COST_FLOOR} instead of {measured} -- and delivering on that "
+            "price hands over a record the closing segment cannot record"
+        )
+
+        # And a fresh annotation *does* start from the floor again, which is right:
+        # it has measured nothing, and the measurement is a property of the
+        # annotation rather than of the Run.
+        runtime.add_terminal()
+        assert runtime._max_run_bytes == 0
+
+        # Driven to the end, nothing escapes and every annotation closes: the
+        # arithmetic never hands over a record it cannot then record.
+        total = 0
+        for _ in range(40):
+            while runtime.delivery_budget_remaining() > 0 and total < 400:
+                total += 1
+                runtime.record_delivery(1 + (total % 2), data(f"{long}{total}-0"))
+            delta = runtime.take_observation_delta()
+            if delta is not None and runtime.request_rollover:
+                assert decode_annotation(delta + runtime.add_terminal()).terminal
+        assert total > 0, "nothing was ever delivered, so this asserts nothing"
+    finally:
+        await manager.shutdown()
+
+
+async def test_a_run_too_large_for_any_annotation_says_so_and_fails_the_workflow(
+    backend: MemoryStreamBackend,
+) -> None:
+    """The one boundary no rollover can move, reported as itself.
+
+    A record is priced before its offsets are seen, so a provider whose offsets are
+    far longer than anything measured can make one run cost more than the whole
+    budget has left -- and a fresh annotation has to carry that same run, so
+    rolling over changes nothing. That is a genuine capacity limit, and the two
+    things that matter are how it is *reported*: not as an internal byte-budget
+    error, which names nothing an operator can act on, and not as a Workflow Task
+    failure, which the server retries on an encoding that cannot succeed (ADR-007).
+    """
+    manager = StreamSubscriptionManager(
+        backends={"tokens": backend},
+        notify_ready=_notify,
+        watch_block=timedelta(milliseconds=10),
+    )
+    runtime = _budget_runtime(backend, manager, max_annotation_bytes=2048)
+    try:
+        subscribe(runtime, 1)
+        with pytest.raises(ExternalStreamCapacityError) as caught:
+            for i in range(10):
+                runtime.record_delivery(1, data(f"{'9' * 5000}{i}-0"))
+
+        assert "offsets" in str(caught.value), (
+            f"the error must name what an operator can change: {caught.value}"
+        )
+        assert caught.value.non_retryable, (
+            "a retryable capacity limit is a Workflow Task the server retries "
+            "against an encoding that can never fit"
+        )
+    finally:
+        await manager.shutdown()
+
+
+async def test_a_subscription_set_too_large_to_record_is_refused_at_subscribe(
+    backend: MemoryStreamBackend,
+) -> None:
+    """A header that cannot fit is rejected where the Workflow can still act on it.
+
+    A header is one indivisible frame and a rollover writes a fresh one, so an
+    oversized header is not a rollover problem -- every annotation would be the
+    same size. Discovered while encoding a completion it fails the Workflow Task,
+    the server retries Workflow Task failures regardless of cause, and the retry
+    encodes the identical bytes: a Workflow stuck permanently with nothing durable
+    to say why.
+
+    Raised from the ``subscribe()`` call instead, it is deterministic, reproduces
+    under replay, and names what to change.
+    """
+    manager = StreamSubscriptionManager(
+        backends={"tokens": backend},
+        notify_ready=_notify,
+        watch_block=timedelta(milliseconds=10),
+    )
+    runtime = _budget_runtime(backend, manager, max_annotation_bytes=512)
+    try:
+        subscribe(runtime, 1)
+        with pytest.raises(ExternalStreamCapacityError) as caught:
+            subscribe(runtime, 2, name="s" * 600)
+
+        assert "512" in str(caught.value)
+        assert "2" in str(caught.value), "the error must name the refused wait"
+        # Refused *before* it became replay-visible: a wait left half-registered
+        # would reach the next header as a binding nothing is watching.
+        assert set(runtime.subscriptions()) == {1}
+        assert manager.subscription(RUN_ID, 2) is None
+
+        # And the Workflow Task that survives the refusal still completes: the
+        # annotation for the subscription it does hold encodes and closes.
+        runtime.record_delivery(1, data("1-0"))
+        annotation = annotation_of(runtime)
+        assert set(annotation.header.streams) == {1}  # type: ignore[attr-defined]
+        assert annotation.terminal is not None  # type: ignore[attr-defined]
+    finally:
+        await manager.shutdown()
+
+
+async def test_the_capacity_floor_covers_everything_an_empty_annotation_carries(
+    backend: MemoryStreamBackend,
+) -> None:
+    """Clearing header-plus-terminal is not clearing the floor.
+
+    Every annotation also carries at least one **segment frame** -- an activation
+    that drained and observed nothing still encodes one, and the empty segment is
+    meaningful (ADR-018) -- and the **spill margin** a mispriced record overruns
+    into. A check that priced only the header and the terminal accepted a
+    subscription set that cleared it by a byte or two and then could not encode its
+    very first completion, which relocates the failure rather than preventing it.
+    """
+    manager = StreamSubscriptionManager(
+        backends={"tokens": backend},
+        notify_ready=_notify,
+        watch_block=timedelta(milliseconds=10),
+    )
+    try:
+        # One wait whose stream name makes its header 230 bytes and its terminal 4.
+        # The budget below fits both with room to spare -- and does not fit the
+        # 3-byte segment frame and the 64-byte margin behind them.
+        name = "s" * 200
+        runtime = _budget_runtime(backend, manager, max_annotation_bytes=300)
+        header_and_terminal = len(
+            encode_header(
+                AnnotationHeader(
+                    {
+                        1: StreamBinding(
+                            stream_key=runtime.stream_key(name),
+                            start_cursor=BEGINNING,
+                            backend_name="tokens",
+                            provider_id=MemoryStreamBackend.provider_id,
+                            provider_format_version=(
+                                MemoryStreamBackend.provider_format_version
+                            ),
+                        )
+                    }
+                )
+            )
+        ) + len(encode_terminal({1: BEGINNING}))
+        assert header_and_terminal <= 300, (
+            "this set clears header-plus-terminal, which is the whole point: a "
+            "floor priced on those two alone accepts it"
+        )
+
+        with pytest.raises(ExternalStreamCapacityError) as caught:
+            runtime.register(
+                wait_id=1, stream_key=runtime.stream_key(name), backend_name="tokens"
+            )
+        assert "margin" in str(caught.value), (
+            f"the error must say what the floor covers: {caught.value}"
+        )
+        assert set(runtime.subscriptions()) == set()
     finally:
         await manager.shutdown()
 

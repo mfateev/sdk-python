@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+import temporalio.exceptions
 from temporalio.contrib.external_workflow_streams._annotation import (
     MAX_ANNOTATION_BYTES,
     ROLLOVER_HIGH_WATER,
@@ -20,6 +21,8 @@ from temporalio.contrib.external_workflow_streams._annotation import (
     decode_annotation,
     encode_annotation,
     encode_bindings,
+    encode_segment,
+    encode_terminal,
 )
 from temporalio.contrib.external_workflow_streams._backend import StreamKey
 from temporalio.contrib.external_workflow_streams._record import (
@@ -503,20 +506,91 @@ def test_an_alternating_two_stream_batch_asks_for_rollover_rather_than_overflowi
 
 
 def test_exceeding_the_hard_budget_raises_rather_than_growing() -> None:
-    """Unreachable in practice; raised so a future encoding change is caught here.
+    """The last resort, reached only if every prevention above it failed.
 
     The alternative is the server rejecting an oversized event, which surfaces
     as an unexplained Workflow Task failure a long way from the cause.
     """
     tiny = AnnotationAccumulator(header(), max_bytes=120, high_water=0.9)
 
-    with pytest.raises(AnnotationBudgetExceeded, match="past the 120-byte budget"):
+    with pytest.raises(AnnotationBudgetExceeded, match="past the"):
         for i in range(100):
             tiny.add_segment(
                 Segment(
                     (Run(1, offset(i), offset(i + 1), 2),), SegmentEndReason.BATCH_LIMIT
                 )
             )
+
+
+def test_the_budget_error_fails_the_workflow_rather_than_the_task() -> None:
+    """A budget overflow may not become a Workflow Task that retries forever.
+
+    ADR-007 rejects check-and-fail precisely because the encoding that overflowed
+    overflows again on the retry, and the server retries Workflow Task failures
+    regardless of cause: no marker, no terminal, no rollover, forever. A
+    non-retryable application failure is bounded and reported once instead.
+    """
+    tiny = AnnotationAccumulator(header(), max_bytes=120, high_water=0.9)
+
+    with pytest.raises(AnnotationBudgetExceeded) as caught:
+        for i in range(100):
+            tiny.add_segment(
+                Segment(
+                    (Run(1, offset(i), offset(i + 1), 2),), SegmentEndReason.BATCH_LIMIT
+                )
+            )
+
+    assert isinstance(caught.value, temporalio.exceptions.ApplicationError)
+    assert caught.value.non_retryable, (
+        "a retryable budget overflow is the permanent Workflow Task retry loop "
+        "ADR-007 exists to rule out"
+    )
+
+
+def test_a_reserved_terminal_always_fits() -> None:
+    """The frame that closes the annotation may never be the one refused.
+
+    An annotation Core writes with no terminal is durable and cannot be decoded
+    past the frame after it, so "the terminal did not fit" has to be arithmetically
+    impossible rather than merely unlikely. Reserving what it costs is what makes
+    it so -- segments are then refused *before* the space the terminal needs is
+    gone.
+    """
+    blocked = {1: AFTER(offset(9)), 2: AFTER(offset(9))}
+    terminal_bytes = len(encode_terminal(blocked))
+
+    accumulator = AnnotationAccumulator(header(), max_bytes=4096, high_water=0.9)
+    accumulator.reserve(terminal_bytes)
+
+    refused = False
+    for i in range(4096):
+        segment = Segment(
+            (Run(1, offset(i), offset(i + 1), 2),), SegmentEndReason.BATCH_LIMIT
+        )
+        if not accumulator.fits(len(encode_segment(segment))):
+            refused = True
+            break
+        accumulator.add_segment(segment)
+
+    assert refused, "the loop must have run into the reserve, or it proves nothing"
+    assert accumulator.headroom == 0 or accumulator.headroom < terminal_bytes + 32
+    # The whole point: with the segments stopped, the terminal still goes in.
+    accumulator.add_terminal(blocked)
+    assert accumulator.size <= 4096
+    decoded = decode_annotation(accumulator.accumulated())
+    assert decoded.terminal == blocked
+
+
+def test_the_reserve_is_only_spendable_by_the_frames_it_was_set_aside_for() -> None:
+    """A segment may not eat the terminal's space, however much room *looks* left."""
+    accumulator = AnnotationAccumulator(header(), max_bytes=4096, high_water=0.9)
+    accumulator.reserve(4096 - accumulator.size)
+
+    assert accumulator.headroom == 0
+    with pytest.raises(AnnotationBudgetExceeded):
+        accumulator.add_segment(
+            Segment((Run(1, offset(0), offset(1), 2),), SegmentEndReason.BATCH_LIMIT)
+        )
 
 
 # --- golden file ------------------------------------------------------------

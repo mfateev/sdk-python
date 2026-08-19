@@ -29,6 +29,7 @@ can disagree about the name.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Generic
@@ -82,10 +83,28 @@ class WakeNotAcknowledgedError(Exception):
     it -- so this is a resumable state, not a lost record.
     """
 
-    def __init__(self, message: str, *, pending: list[WakeRequest]) -> None:
+    def __init__(
+        self, message: str, *, pending: list[WakeRequest], restart: bool = False
+    ) -> None:
         super().__init__(message)
         self.pending = pending
         """The wakes still owed, ready to be retried verbatim."""
+        self.restart = restart
+        """Whether the caller must call :meth:`.wake` again instead of retrying.
+
+        The wake is three steps -- observe the parked set, claim the generation,
+        Signal -- and only the third produces the requests
+        :meth:`ProducerTopicHandle.retry_wake` re-sends. A failure in the first
+        two leaves nothing to re-send, so ``pending`` is empty and retrying it
+        would silently do nothing at all: the record would stay durable and
+        unannounced while the caller believed it had recovered.
+
+        ``True`` therefore says "no wake was composed; compose one". Calling
+        :meth:`ProducerTopicHandle.wake` again is safe and is the whole recovery
+        -- it re-observes the parked set, and a parked wake's request ID is
+        derived from the generation rather than from the sender, so a wake some
+        other producer already sent deduplicates against it.
+        """
         self.offset: Offset | None = None
         """Where the record landed, when raised from :meth:`publish`.
 
@@ -337,7 +356,14 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
             WakeNotAcknowledgedError: The record is durable; the wake is not.
                 ``.offset`` says where the record landed and ``.pending`` carries
                 the wakes still owed, so the caller retries the half that failed
-                rather than re-appending the half that did not.
+                rather than re-appending the half that did not. **Every** failure
+                after the append arrives this way, including one from the
+                coordination steps that precede the Signal -- those set
+                ``.restart`` and leave ``.pending`` empty, meaning the recovery is
+                another :meth:`wake` rather than a :meth:`retry_wake`. This
+                matters because it is the only thing that tells the caller not to
+                retry ``publish()``: a second call draws a new sequence number and
+                therefore a new idempotency key, so it appends the record twice.
         """
         record = StreamRecord(
             kind=RecordKind.DATA,
@@ -405,8 +431,12 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
             or a single unparked wake when nothing on this stream is parked.
 
         Raises:
-            WakeNotAcknowledgedError: A Signal failed. The record is durable;
-                the wake is not. ``.pending`` carries the wakes still owed.
+            WakeNotAcknowledgedError: The wake did not complete. The record is
+                durable; the wake is not. A failed Signal fills ``.pending`` with
+                the wakes still owed, for :meth:`retry_wake`. A failure in the
+                observe or claim steps that precede it leaves ``.pending`` empty
+                and sets ``.restart``, because nothing was composed and calling
+                this method again is the recovery.
         """
         producer = self._producer
         if producer._client is None:
@@ -417,44 +447,74 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
             )
 
         backend = producer._backend
-        parked = await backend.parked_wait_ids(self._stream_key)
-        # An unparked wake still needs a wait id for the envelope; 0 is the
-        # "no particular subscription" value, and Python rechecks every active
-        # subscription on wakeup regardless of which one the Signal named.
-        targets: list[tuple[int, int | None]] = [
-            (wait_id, await backend.current_park_generation(self._stream_key, wait_id))
-            for wait_id in parked
-        ]
-        if not targets:
-            targets = [(0, None)]
-
-        requests: list[WakeRequest] = []
-        for wait_id, generation in targets:
-            if generation is not None:
-                # Claimed, and then signalled whichever way the claim went. The
-                # claim is how a provider learns a wake is in flight and how an
-                # abandoned one becomes takeable after its lease, so it is still
-                # taken -- but its answer is not an acknowledgement, and the
-                # result is deliberately unused. See this method's docstring.
-                await backend.claim_park_generation(
-                    self._stream_key,
+        # The coordination steps are inside the same guarantee as the Signal, and
+        # every caller reaches here *after* a durable append. A provider outage in
+        # any of them used to escape as whatever the provider raised -- a bare
+        # `ConnectionError` -- which told the caller nothing about the record that
+        # had already landed. `publish()` catches only the durable-but-
+        # unacknowledged error, so the raw exception passed straight through it
+        # and lost the offset with it; retrying `publish()` then appended a
+        # *second* record, because the sequence had already advanced and the
+        # idempotency key with it.
+        try:
+            parked = await backend.parked_wait_ids(self._stream_key)
+            # An unparked wake still needs a wait id for the envelope; 0 is the
+            # "no particular subscription" value, and Python rechecks every active
+            # subscription on wakeup regardless of which one the Signal named.
+            targets: list[tuple[int, int | None]] = [
+                (
                     wait_id,
-                    generation,
-                    claimant=producer.session_id,
-                    lease=lease,
+                    await backend.current_park_generation(self._stream_key, wait_id),
                 )
-            requests.append(
-                wake_request_for(
-                    producer.workflow,
-                    stream_name=self._stream_key.stream_name,
-                    wait_id=wait_id,
-                    park_generation=generation,
-                    sender_identity=producer.session_id,
-                    wake_counter=(
-                        producer._next_wake_counter() if generation is None else 0
-                    ),
+                for wait_id in parked
+            ]
+            if not targets:
+                targets = [(0, None)]
+
+            requests: list[WakeRequest] = []
+            for wait_id, generation in targets:
+                if generation is not None:
+                    # Claimed, and then signalled whichever way the claim went. The
+                    # claim is how a provider learns a wake is in flight and how an
+                    # abandoned one becomes takeable after its lease, so it is still
+                    # taken -- but its answer is not an acknowledgement, and the
+                    # result is deliberately unused. See this method's docstring.
+                    await backend.claim_park_generation(
+                        self._stream_key,
+                        wait_id,
+                        generation,
+                        claimant=producer.session_id,
+                        lease=lease,
+                    )
+                requests.append(
+                    wake_request_for(
+                        producer.workflow,
+                        stream_name=self._stream_key.stream_name,
+                        wait_id=wait_id,
+                        park_generation=generation,
+                        sender_identity=producer.session_id,
+                        wake_counter=(
+                            producer._next_wake_counter() if generation is None else 0
+                        ),
+                    )
                 )
-            )
+        except asyncio.CancelledError:
+            raise
+        except WakeNotAcknowledgedError:
+            raise
+        except Exception as err:
+            # `pending` is empty and `restart` is set: nothing was composed, so
+            # there is nothing to re-send and `retry_wake` would be a no-op that
+            # looked like recovery. Calling `wake()` again is the recovery.
+            raise WakeNotAcknowledgedError(
+                "the record was appended but its wake could not be composed: "
+                f"{err}. No Signal was sent. Call wake() again -- it re-observes "
+                "the parked set, and a parked wake's request ID is derived from "
+                "the generation, so a wake another producer already sent "
+                "deduplicates against it.",
+                pending=[],
+                restart=True,
+            ) from err
 
         sent: list[str] = []
         for index, request in enumerate(requests):
@@ -481,7 +541,21 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
         Takes the requests verbatim rather than recomputing them: recomputing
         would draw a fresh wake counter for an unparked wake, derive a different
         request ID, and defeat the deduplication that makes the retry safe.
+
+        Refuses an empty list rather than returning quietly. A
+        :class:`WakeNotAcknowledgedError` raised before any request was composed
+        carries no pending wakes and sets ``restart``; a caller that fed that
+        empty list to this method would get a successful-looking no-op while the
+        record stayed durable and unannounced. There is exactly one recovery from
+        that state and it is :meth:`wake`.
         """
+        if not pending:
+            raise ValueError(
+                "retry_wake() was given no wakes to re-send. A "
+                "WakeNotAcknowledgedError with an empty `pending` sets `restart`, "
+                "which means no Signal was composed and there is nothing to "
+                "re-send: call wake() again instead."
+            )
         producer = self._producer
         assert producer._client is not None
         sent: list[str] = []
@@ -517,6 +591,12 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
         A fence on one stream alone does not park the Workflow Task either; the
         task parks early only when every active subscription is immediately
         parkable.
+
+        Raises:
+            WakeNotAcknowledgedError: The fence is durable; the wake is not, on
+                exactly the terms :meth:`publish` describes. Retrying
+                ``finish_writing()`` appends a *second* fence, for the same
+                reason retrying ``publish()`` appends a second record.
         """
         fence = StreamRecord(
             kind=RecordKind.WRITE_FENCE,

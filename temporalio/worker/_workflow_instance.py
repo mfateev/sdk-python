@@ -297,6 +297,14 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
 
         self._extern_functions = det.extern_functions
         self._external_stream_runtime = det.external_stream_runtime
+        self._pending_replay_finish: Any = None
+        """A marker replay whose last segment the activation's own drain serves.
+
+        Set by ``_apply_replay_external_streams`` and consumed by
+        ``_finish_replay_external_streams``, which the activation calls once that
+        drain has run. Held here rather than on the runtime because what it
+        defers is a step of the *activation*, not of the stream runtime.
+        """
         self._disable_eager_activity_execution = det.disable_eager_activity_execution
         self._worker_level_failure_exception_types = (
             det.worker_level_failure_exception_types
@@ -514,30 +522,57 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
             if start_job:
                 self._workflow_input = self._make_workflow_input(start_job)
 
-            if self._single_batch_activation:
-                # Applying every job before giving workflow tasks a chance to
-                # run prevents their order in the activation from hiding state
-                # that arrived in the same workflow task.
-                for job_set in job_sets:
-                    for job in job_set:
-                        # Let errors bubble out of these to the caller to fail the task
-                        self._apply(job)
-                if any(job_sets):
-                    self._run_once(check_conditions=bool(job_sets[1] or job_sets[2]))
-            else:
-                # Preserve the legacy scheduling order for histories which do
-                # not contain the single-batch workflow logic flag.
-                for index, job_set in enumerate(job_sets):
-                    if not job_set:
-                        continue
-                    for job in job_set:
-                        # Let errors bubble out of these to the caller to fail the task
-                        self._apply(job)
+            try:
+                if self._single_batch_activation:
+                    # Applying every job before giving workflow tasks a chance to
+                    # run prevents their order in the activation from hiding state
+                    # that arrived in the same workflow task.
+                    for job_set in job_sets:
+                        for job in job_set:
+                            # Let errors bubble out of these to the caller to fail the task
+                            self._apply(job)
+                    if any(job_sets):
+                        self._run_once(
+                            check_conditions=bool(job_sets[1] or job_sets[2])
+                        )
+                else:
+                    # Preserve the legacy scheduling order for histories which do
+                    # not contain the single-batch workflow logic flag.
+                    for index, job_set in enumerate(job_sets):
+                        if not job_set:
+                            continue
+                        for job in job_set:
+                            # Let errors bubble out of these to the caller to fail the task
+                            self._apply(job)
 
-                    # Run one iteration of the loop. We do not allow conditions to
-                    # be checked in patch jobs (first index) or query jobs (last
-                    # index).
-                    self._run_once(check_conditions=index == 1 or index == 2)
+                        # Run one iteration of the loop. We do not allow conditions to
+                        # be checked in patch jobs (first index) or query jobs (last
+                        # index).
+                        self._run_once(check_conditions=index == 1 or index == 2)
+            except BaseException:
+                # An error is already on its way out, so the replay is *abandoned*
+                # rather than closed. Closing runs `verify_replay_consumed`, which
+                # raises whenever a recorded delivery is still armed -- which it is,
+                # since the drain that would have taken it is the one that just
+                # failed -- and an exception raised while another is propagating
+                # **replaces** it. A user's failure, or an unrelated nondeterminism
+                # error, would reach the completion path as a nondeterminism error
+                # blaming a `subscribe()` call nobody touched: the wrong diagnosis,
+                # and the wrong classification with it, since a workflow-failing
+                # error would be retried as a task failure instead.
+                #
+                # Replay mode is still left, because a Run stuck in it has every
+                # later drain return nothing at all. Only the checks and the
+                # cursor move are skipped -- and the reposition must be skipped
+                # here in any case: an activation that failed committed nothing.
+                self._abandon_replay_external_streams()
+                raise
+            else:
+                # A replay marker's last recorded segment is drained by the
+                # activation's *own* drain above, not by the replay driver, so
+                # what closes the replay -- the consumed check, the cursor
+                # reposition, and leaving replay mode -- can only happen here.
+                self._finish_replay_external_streams()
 
             # Detected *after* the drain, not during it: `_run_once` already
             # drains `self._ready` until empty, so "no coroutine is runnable" is
@@ -851,6 +886,11 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         predicates fire a different number of times than they did live
         (ADR-018).
 
+        *k*, not *k + 1*: the activation runs a drain of its own for the job set
+        this job arrived in, so only the first *k - 1* segments are drained here
+        and the last is left to that one. Closing the replay therefore also
+        moves to after it, in :meth:`_finish_replay_external_streams`.
+
         This is safe with respect to Workflow time: every segment of a marker
         belongs to one Workflow Task, so ``workflow.now()`` is constant across
         them in both directions.
@@ -868,6 +908,8 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
             runtime.resolve_all_pending()
             return
 
+        deferred = False
+        closed = False
         try:
             # The bindings first, and before any delivery. A recorded run is
             # joined to a subscription by `wait_id`, which is an integer and
@@ -876,27 +918,102 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
             # another delivers the first stream's recorded bytes through the
             # second's subscription rather than failing as nondeterminism.
             runtime.begin_replay(plan.annotation.header.streams)
-            for segment in plan.segments:
+            # Every segment but the **last** is drained here. The last one is
+            # armed and left to the drain the activation runs for the job set
+            # this job arrived in, because that drain happens whatever this
+            # method does: a driver that drained all *k* segments itself
+            # produced *k + 1* drains for the *k* the marker records, and
+            # ADR-018 requires exactly *k*. Leaving the last one to the
+            # activation is also what the live run did -- there each
+            # activation's single trailing drain served the records that
+            # activation had just been handed.
+            for segment in plan.segments[:-1]:
                 runtime.begin_replay_segment(list(segment.deliveries))
                 runtime.resolve_all_pending()
                 self._run_once(check_conditions=True)
-            # Nothing recorded may be left over. Each of these records was
-            # handed to Workflow code in the activation its run was recorded in,
-            # so a replay that ends holding one has run code that consumes less
-            # than History says was consumed -- what a removed `subscribe()`
-            # call looks like from here.
+            # Reached only once every segment but the last has been drained.
+            if plan.segments:
+                runtime.begin_replay_segment(list(plan.segments[-1].deliveries))
+                runtime.resolve_all_pending()
+                # Closing the replay here would end replay mode before the drain
+                # that delivers this final segment, so it is handed to
+                # `_finish_replay_external_streams` -- which the activation calls
+                # once that drain has run, and which is what leaves replay mode
+                # from then on.
+                self._pending_replay_finish = plan
+                deferred = True
+            else:
+                # A marker that recorded no activation of its own -- a Workflow
+                # Task that bound a wait and blocked with the stream never
+                # delivering. **Nothing is deferred, and that is not asymmetry
+                # for its own sake.** With no recorded segment for the
+                # activation's drain to serve, that drain is a *live* one:
+                # records that arrived while this Run was evicted are already in
+                # the buffer and it would hand them over. Repositioning after it
+                # would then retract exactly what it had just delivered -- cursor
+                # back to the marker's boundary, buffer cleared -- and the
+                # watcher would re-read and re-deliver records Workflow code
+                # already had. Closing first retracts the buffer *before* the
+                # drain, so the drain finds nothing and the watcher re-reads from
+                # the boundary the marker committed. The records are not lost;
+                # they arrive on the activation the re-read announces.
+                self._pending_replay_finish = plan
+                closed = True
+                self._finish_replay_external_streams()
+        finally:
+            if not deferred and not closed:
+                # The walk raised part-way. Leaving replay mode set would make
+                # every later drain on this Run return nothing at all, turning
+                # one marker's failure into a Workflow that silently never
+                # receives again -- and the checks the close performs must not
+                # run here, where they would replace the error that got us here
+                # with one of their own.
+                self._pending_replay_finish = None
+                runtime.end_replay()
+
+    def _abandon_replay_external_streams(self) -> None:
+        """Leaves replay mode without running any of the checks a close runs.
+
+        For the path where an activation is already failing. See the caller.
+        """
+        self._pending_replay_finish = None
+        runtime = self._external_stream_runtime
+        if runtime is not None:
+            runtime.end_replay()
+
+    def _finish_replay_external_streams(self) -> None:
+        """Closes the replay whose last segment the activation's drain served.
+
+        Called from the activation's ``finally`` so that a drain which raised
+        still leaves replay mode, for the reason
+        :meth:`_apply_replay_external_streams` gives.
+        """
+        plan = self._pending_replay_finish
+        if plan is None:
+            return
+        self._pending_replay_finish = None
+        runtime = self._external_stream_runtime
+        if runtime is None:
+            return
+        try:
+            # Nothing recorded may be left over. Each of these records was handed
+            # to Workflow code in the activation its run was recorded in, so a
+            # replay that ends holding one has run code that consumes less than
+            # History says was consumed -- what a removed `subscribe()` call
+            # looks like from here.
             runtime.verify_replay_consumed()
             # The manager knew nothing about this marker while replay was
             # running: its watcher has been reading the very same records from
-            # the subscription's start cursor into the live buffer. The next
-            # live drain would hand them over again -- observed end-to-end as
-            # one marker's record delivered twice. Moving the cursors to what
-            # the marker committed is what makes live delivery resume *after*
-            # those records rather than in front of them.
+            # the subscription's start cursor into the live buffer. The next live
+            # drain would hand them over again -- observed end-to-end as one
+            # marker's record delivered twice. Moving the cursors to what the
+            # marker committed is what makes live delivery resume *after* those
+            # records rather than in front of them.
             #
-            # After the loop, not inside it: a replay that raised part-way
-            # committed nothing, and advancing a committed cursor for records
-            # this Workflow may never have received would lose them outright.
+            # After every segment's drain, not inside the walk: a replay that
+            # raised part-way committed nothing, and advancing a committed cursor
+            # for records this Workflow may never have received would lose them
+            # outright.
             runtime.reposition_after_replay(plan.committed_boundaries)
         finally:
             runtime.end_replay()
@@ -2410,13 +2527,22 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
             # it already reads.
             runtime.start_new_annotation()
         else:
-            # Read before the terminal is added: closing the annotation starts a
-            # fresh one, whose accumulator is nowhere near the high-water mark.
-            request_rollover = runtime.request_rollover
             parts: list[bytes] = []
+            # The delta first. `take_observation_delta` is what *closes* this
+            # activation's segment, so a rollover decision read before it is a
+            # decision about the annotation as it stood one activation ago: the
+            # segment that crossed the high-water mark went out with
+            # `request_rollover = false`, and the following activation was then
+            # free to add another frame and overflow before Core had ever been
+            # asked to roll over. Reading it after also picks up the runtime
+            # having stopped delivering because the annotation could afford no
+            # more, which is decided while this same segment is being closed.
             delta = runtime.take_observation_delta()
             if delta is not None:
                 parts.append(delta)
+            # And before the terminal is added: closing the annotation starts a
+            # fresh one, whose accumulator is nowhere near the high-water mark.
+            request_rollover = runtime.request_rollover
             # Both of these end the Workflow Task. Retention is refused outright
             # for the first; for the second Core takes the rollover as
             # authoritative *over* a retention request, because the annotation

@@ -29,7 +29,10 @@ from temporalio.contrib.external_workflow_streams._producer import (
     WakeNotAcknowledgedError,
     WorkflowChainKey,
 )
-from temporalio.contrib.external_workflow_streams._record import BEGINNING
+from temporalio.contrib.external_workflow_streams._record import (
+    BEGINNING,
+    RecordKind,
+)
 from temporalio.contrib.external_workflow_streams._wake import (
     UNPARKED_WAKE_GENERATION,
     send_wake_signal,
@@ -542,6 +545,112 @@ async def test_a_retried_wake_reuses_the_original_request_id() -> None:
 
     client.fail = False
     assert await topic.retry_wake(caught.value.pending) == [expected]
+
+
+class FlakyCoordinationBackend(MemoryStreamBackend):
+    """A backend whose append works and whose coordination calls do not.
+
+    One named method fails once. Appending keeps working throughout, which is the
+    whole point: the record is durable before the failure happens, so what the
+    caller has to be told is which half of ``publish()`` failed.
+    """
+
+    def __init__(self, failing: str) -> None:
+        super().__init__()
+        self.failing = failing
+        self.failures = 0
+
+    def _maybe_fail(self, name: str) -> None:
+        if name == self.failing:
+            self.failing = ""
+            self.failures += 1
+            raise ConnectionError(f"{name} is unavailable")
+
+    async def parked_wait_ids(self, key):  # type: ignore[no-untyped-def]
+        self._maybe_fail("parked_wait_ids")
+        return await super().parked_wait_ids(key)
+
+    async def current_park_generation(self, key, wait_id):  # type: ignore[no-untyped-def]
+        self._maybe_fail("current_park_generation")
+        return await super().current_park_generation(key, wait_id)
+
+    async def claim_park_generation(self, key, wait_id, generation, **kwargs):  # type: ignore[no-untyped-def]
+        self._maybe_fail("claim_park_generation")
+        return await super().claim_park_generation(key, wait_id, generation, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "failing",
+    ["parked_wait_ids", "current_park_generation", "claim_park_generation"],
+)
+@pytest.mark.asyncio
+async def test_a_coordination_failure_after_the_append_is_still_unacknowledged(
+    failing: str,
+) -> None:
+    """The wake is three steps, and all three are after a durable append.
+
+    Only the Signal used to be inside the guarantee. The observe and claim steps
+    raised whatever the provider raised -- a bare ``ConnectionError`` -- which
+    passed straight through ``publish()``, because ``publish()`` catches only the
+    durable-but-unacknowledged error. The caller then had neither the offset nor
+    any statement about what had already landed, and its only obvious move --
+    retry ``publish()`` -- appends the record a *second* time, under a new
+    sequence number and therefore a new idempotency key.
+    """
+    backend = FlakyCoordinationBackend(failing)
+    client = RecordingClient()
+    topic = make_producer(backend, client).topic("tokens", type=str)
+    await park(backend, topic.stream_key, wait_id=1, gen=4)
+
+    with pytest.raises(WakeNotAcknowledgedError) as caught:
+        await topic.publish("a")
+
+    assert backend.failures == 1, "the test did not exercise the failure it names"
+    assert caught.value.offset is not None, (
+        "the caller has no other way to learn that the append it must not retry "
+        "did succeed"
+    )
+    assert caught.value.restart, (
+        "no Signal was composed, so `pending` is empty and only a fresh wake() "
+        "recovers -- a caller told to retry_wake([]) would get a no-op that "
+        "looks like success"
+    )
+    assert not caught.value.pending
+    with pytest.raises(ValueError, match="call wake\(\) again"):
+        await topic.retry_wake(caught.value.pending)
+
+    # Recovering the wake alone leaves exactly one record in the stream.
+    assert await topic.wake()
+    records = await backend.read_after(topic.stream_key, BEGINNING, max_records=10)
+    assert [r.sequence for r in records if r.kind == RecordKind.DATA] == [0], (
+        "the stream holds more than the one record that was published"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_coordination_failure_after_a_fence_is_still_unacknowledged() -> None:
+    """A fence is the record most likely to find the Workflow parked.
+
+    Same guarantee as ``publish()``, and the duplicate it prevents is worse:
+    retrying ``finish_writing()`` appends a second fence, which reads back as a
+    producer session that ended twice.
+    """
+    backend = FlakyCoordinationBackend("parked_wait_ids")
+    client = RecordingClient()
+    topic = make_producer(backend, client).topic("tokens", type=str)
+    await park(backend, topic.stream_key, wait_id=1, gen=4)
+
+    with pytest.raises(WakeNotAcknowledgedError) as caught:
+        await topic.finish_writing()
+
+    assert caught.value.offset is not None
+    assert caught.value.restart
+
+    assert await topic.wake()
+    records = await backend.read_after(topic.stream_key, BEGINNING, max_records=10)
+    assert len([r for r in records if r.kind == RecordKind.WRITE_FENCE]) == 1, (
+        "the stream holds more than the one fence that was written"
+    )
 
 
 @pytest.mark.asyncio

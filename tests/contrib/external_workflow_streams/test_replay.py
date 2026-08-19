@@ -16,6 +16,7 @@ from datetime import timedelta
 import pytest
 import pytest_asyncio
 
+import temporalio.api.common.v1
 import temporalio.converter
 import temporalio.workflow
 from temporalio.contrib.external_workflow_streams._annotation import (
@@ -441,6 +442,133 @@ async def test_an_intact_but_undecodable_record_is_a_decode_error(
     assert not isinstance(classified, StreamIntegrityError)
 
 
+class _FailingRetrieveDriver(temporalio.converter.StorageDriver):
+    """Stores payloads in memory and refuses to give them back once armed.
+
+    Stands in for an external payload store that is briefly unreachable. It
+    raises the exception such a driver's client would raise -- a bare
+    ``ConnectionError`` -- rather than anything this module defines, which is the
+    whole point: the converter does not wrap it, so if no layer labels it the
+    record arrives at the consumer as an unclassified failure.
+    """
+
+    def __init__(self) -> None:
+        self._stored: dict[str, bytes] = {}
+        self.fail = False
+        self.retrieves = 0
+
+    def name(self) -> str:
+        return "failing-retrieve"
+
+    async def store(self, context, payloads):  # type: ignore[no-untyped-def]
+        claims = []
+        for index, payload in enumerate(payloads):
+            key = f"k{len(self._stored) + index}"
+            self._stored[key] = payload.SerializeToString()
+            claims.append(
+                temporalio.converter.StorageDriverClaim(claim_data={"k": key})
+            )
+        return claims
+
+    async def retrieve(self, context, claims):  # type: ignore[no-untyped-def]
+        self.retrieves += 1
+        if self.fail:
+            raise ConnectionError("the external payload store is unreachable")
+        out = []
+        for claim in claims:
+            payload = temporalio.api.common.v1.Payload()
+            payload.ParseFromString(self._stored[claim.claim_data["k"]])
+            out.append(payload)
+        return out
+
+
+def _extstore_converter(
+    driver: _FailingRetrieveDriver,
+) -> temporalio.converter.DataConverter:
+    return temporalio.converter.DataConverter(
+        external_storage=temporalio.converter.ExternalStorage(
+            drivers=[driver], payload_size_threshold=1
+        )
+    )
+
+
+@pytest.mark.parametrize("path", ["live", "replay"])
+@pytest.mark.asyncio
+async def test_an_unreachable_payload_store_is_a_storage_failure_not_a_decode_one(
+    backend: MemoryStreamBackend, key: StreamKey, path: str
+) -> None:
+    """Row one, on both delivery paths, whichever way the payload is fetched.
+
+    A record's bytes can be a *reference*: with external storage configured, what
+    the stream holds is a claim and the value does not exist until the payload
+    store hands it over. A store that cannot be reached is therefore the same
+    condition as a stream backend that cannot be reached -- transient, clearing on
+    its own, with nothing for an operator to change.
+
+    Left unlabelled it is not reported that way. The driver raises whatever its
+    client raises, the converter does not wrap it, and the consumer's
+    classification rule is "the range validated, so the bytes are the bytes that
+    were written" -- which turns it into a decode failure and tells an operator to
+    align a converter that was never wrong. Both paths are checked because they
+    prepare in different places: the watcher's loop for live delivery, the replay
+    read for a recorded range.
+    """
+    driver = _FailingRetrieveDriver()
+    converter = _extstore_converter(driver)
+    manager = StreamSubscriptionManager(
+        backends={"tokens": backend},
+        notify_ready=_notify,
+        data_converter=converter,
+        watch_block=timedelta(milliseconds=10),
+    )
+    try:
+        codec = StreamPayloadCodec(converter, str)
+        placed = await backend.append(
+            key, StreamRecord(RecordKind.DATA, await codec.encode("alpha"), "p", 0)
+        )
+        assert driver._stored, (
+            "the payload was not externalized, so nothing here depends on the "
+            "payload store at all"
+        )
+
+        # The manager is what prepares, so the converter under test is the one it
+        # holds; the runtime here only needs to make the subscription.
+        runtime = make_runtime(manager, backend)
+        runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+
+        driver.fail = True
+        if path == "live":
+            subscription = manager.subscription(RUN_ID, 1)
+            assert subscription is not None
+            await _until(
+                lambda: subscription.buffered == 1,
+                5,
+                "the watcher never buffered the record",
+            )
+            prepared = manager.drain(RUN_ID, 1)[0]
+        else:
+            plan = await manager.prepare_replay(RUN_ID, annotation_for(key, [placed]))
+            _, prepared = plan.segments[0].deliveries[0]
+
+        carried = getattr(prepared, "prepare_error", None)
+        assert carried is not None, (
+            f"the {path} path prepared the record without noticing that its "
+            "payload could not be fetched"
+        )
+        assert isinstance(carried, StreamStorageError), (
+            f"the {path} path carried {type(carried).__name__}, so the delivery "
+            "that raises it will classify a storage outage as a decode failure"
+        )
+        assert not isinstance(carried, StreamDecodeError)
+
+        # And the classification rule leaves it alone rather than relabelling it:
+        # a storage failure is about reaching the store at all, so "the range
+        # validated" says nothing about it.
+        assert classify_read_failure(range_validated=True, cause=carried) is carried
+    finally:
+        await manager.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_a_replay_plan_is_consumed_once(
     manager: StreamSubscriptionManager, backend: MemoryStreamBackend, key: StreamKey
@@ -479,7 +607,18 @@ class DriverStub:
 
     def __init__(self, runtime) -> None:  # type: ignore[no-untyped-def]
         self._external_stream_runtime = runtime
+        self._pending_replay_finish = None
         self.drains: list[int] = []
+
+    def _finish_replay_external_streams(self) -> None:
+        """The real one. A plan with no segments closes from inside the job.
+
+        Present because a stub stands in for the instance, and the job calls this
+        on itself when there is no segment for the activation's drain to serve.
+        """
+        from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
+
+        _WorkflowInstanceImpl._finish_replay_external_streams(self)  # type: ignore[arg-type]
 
     def _run_once(self, *, check_conditions: bool) -> None:
         assert check_conditions, (
@@ -540,12 +679,29 @@ class ConsumingStub(DriverStub):
                 self._runtime.drain(wait_id)
 
 
-def drive(runtime) -> DriverStub:  # type: ignore[no-untyped-def]
+def drive_with(stub):  # type: ignore[no-untyped-def]
+    """Runs the whole activation shape around one replay job, not just `_apply`.
+
+    The trailing drain is neither optional nor this helper's invention: the replay
+    job lands in the non-query job set, so the activation runs exactly one
+    `_run_once` for that set whatever `_apply` did with the job. Driving `_apply`
+    alone is what let the driver perform one drain more than the marker records
+    without any test noticing -- ADR-018 requires *k* drains for *k* segments and
+    it was performing *k + 1* -- so every test here drives the activation's drain
+    too, and the close that the driver now defers until after it.
+    """
     from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
 
-    stub = ConsumingStub(runtime)
-    _WorkflowInstanceImpl._apply_replay_external_streams(stub, object())  # type: ignore[arg-type]
+    try:
+        _WorkflowInstanceImpl._apply_replay_external_streams(stub, object())  # type: ignore[arg-type]
+        stub._run_once(check_conditions=True)
+    finally:
+        _WorkflowInstanceImpl._finish_replay_external_streams(stub)  # type: ignore[arg-type]
     return stub
+
+
+def drive(runtime) -> DriverStub:  # type: ignore[no-untyped-def]
+    return drive_with(ConsumingStub(runtime))
 
 
 @pytest.mark.asyncio
@@ -633,9 +789,7 @@ async def test_a_drain_sees_only_its_own_segments_records(
 
     from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
 
-    _WorkflowInstanceImpl._apply_replay_external_streams(  # type: ignore[arg-type]
-        DrainingStub(runtime), object()
-    )
+    drive_with(DrainingStub(runtime))
 
     assert seen_per_drain == [
         [placed[0].offset, placed[1].offset],
@@ -684,7 +838,7 @@ async def test_a_replayed_drain_never_reaches_the_live_buffer(
     runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
     subscription = manager.subscription(RUN_ID, 1)
     assert subscription is not None
-    subscription._append(placed[2:])
+    subscription._append(placed[2:], subscription._prefetch_epoch)
 
     seen: list[list[Offset]] = []
 
@@ -695,14 +849,24 @@ async def test_a_replayed_drain_never_reaches_the_live_buffer(
 
     from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
 
-    _WorkflowInstanceImpl._apply_replay_external_streams(  # type: ignore[arg-type]
-        DrainingStub(runtime), object()
-    )
+    drive_with(DrainingStub(runtime))
 
     assert seen == [[placed[0].offset, placed[1].offset]]
-    # And the buffered-past records are still there for the live drain that
-    # follows -- withheld, not discarded.
-    assert [r.offset for r in runtime.drain(1)] == [r.offset for r in placed[2:]]
+    # And the buffered-past records were never handed to that drain. Closing the
+    # replay retracts them rather than leaving them in front of the next one:
+    # reading is not consuming, so the speculative buffer is discarded and the
+    # watcher re-reads from the boundary the marker committed. Withheld either
+    # way -- what changed is that the retraction is now certain by the time the
+    # replay returns rather than posted onto the manager's loop and raced.
+    assert subscription.committed_cursor == AFTER(placed[1].offset)
+    assert subscription.prefetch_cursor == AFTER(placed[1].offset), (
+        "the watcher must resume reading at the marker's boundary, which is "
+        "what re-reads the records this retraction dropped"
+    )
+    assert runtime.drain(1) == [], (
+        "records read past the marker must not survive the replay in the "
+        "buffer, or the first live drain hands over what it never saw recorded"
+    )
 
 
 @pytest.mark.asyncio
@@ -784,9 +948,7 @@ async def test_two_markers_reassemble_in_workflow_task_order(
 
         from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
 
-        _WorkflowInstanceImpl._apply_replay_external_streams(  # type: ignore[arg-type]
-            DrainingStub(runtime), object()
-        )
+        drive_with(DrainingStub(runtime))
         per_marker.append(drains)
 
     assert per_marker == [
@@ -853,9 +1015,7 @@ async def test_one_segment_delivers_each_waits_own_records(
 
     from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
 
-    _WorkflowInstanceImpl._apply_replay_external_streams(  # type: ignore[arg-type]
-        DrainingStub(runtime), object()
-    )
+    drive_with(DrainingStub(runtime))
 
     assert drained[1] == [r.offset for r in placed]
     assert drained[2] == [r.offset for r in other_placed]
@@ -925,6 +1085,424 @@ async def test_live_delivery_after_a_replay_resumes_past_the_marker(
     assert subscription.committed_cursor == AFTER(placed[1].offset), (
         "the marker's boundary was never committed, so a later reset would "
         "send the subscription back to the start cursor"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_first_live_drain_after_a_replay_needs_no_loop_turn(
+    manager: StreamSubscriptionManager, backend: MemoryStreamBackend, key: StreamKey
+) -> None:
+    """Repositioning has to have *happened*, not merely been scheduled.
+
+    The drain that follows replay is on the Workflow thread, and so is the replay
+    itself. A reposition posted to the manager's loop with `call_soon_threadsafe`
+    and then left to arrive whenever the loop next runs is ordered by nothing at
+    all: if Workflow code drains first -- which one ordinary scheduler pass is
+    enough to do -- the live buffer still holds every record the marker just
+    delivered and hands them over a second time.
+
+    So this test deliberately gives the manager's loop **no** opportunity to run
+    between the replay and the drain: no `await`, no `sleep(0)`, nothing. That is
+    the whole point. A version of this test with a yield in the middle passes
+    against a posted reposition too, and proves only that the loop happened to
+    win.
+    """
+    placed = await append_five(backend, key)
+    runtime = make_runtime(manager, backend)
+    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+
+    subscription = manager.subscription(RUN_ID, 1)
+    assert subscription is not None
+    await _until(
+        lambda: subscription.buffered == 5,
+        5,
+        "the watcher never buffered the records, so nothing would be "
+        "re-delivered either way and this proves nothing",
+    )
+
+    # A marker covering the first two of the five only.
+    await manager.prepare_replay(RUN_ID, annotation_for(key, placed[:2]))
+    drive(runtime)
+
+    # No yield here on purpose. Everything below runs in the same synchronous
+    # stretch of Workflow-thread work that the replay just finished in.
+    assert subscription.committed_cursor == AFTER(placed[1].offset), (
+        "the marker's boundary must be committed by the time the replay returns, "
+        "not once some later loop turn gets round to it"
+    )
+    assert manager.drain(RUN_ID, 1) == [], (
+        "the drain immediately after a replay still saw the marker-covered "
+        "records in the live buffer, so the Workflow receives them twice"
+    )
+    assert subscription.prefetch_cursor == AFTER(placed[1].offset), (
+        "the watcher must have been moved to re-read from the marker's boundary"
+    )
+
+    # And the records past the marker are not lost: the watcher re-reads them
+    # from the boundary that was committed.
+    await _until(
+        lambda: subscription.buffered == 3,
+        5,
+        "the buffer never refilled from the marker's boundary",
+    )
+    assert [r.offset for r in manager.drain(RUN_ID, 1)] == [
+        r.offset for r in placed[2:]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_activation_reports_its_own_error_not_the_replays(
+    manager: StreamSubscriptionManager, backend: MemoryStreamBackend, key: StreamKey
+) -> None:
+    """Closing a replay may not overwrite the error that stopped it.
+
+    The close runs ``verify_replay_consumed``, which raises whenever a recorded
+    delivery is still armed -- and after a drain fails, one always is: the drain
+    that would have taken it is the one that failed. An exception raised while
+    another is propagating **replaces** it, so running the close from a bare
+    ``finally`` turned every failing replay activation into a nondeterminism error
+    blaming a ``subscribe()`` call nobody had touched.
+
+    Two things are lost that way, not one. The diagnosis, and the *classification*:
+    a ``FailureError`` out of Workflow code fails the Workflow, while a
+    nondeterminism error fails the Workflow Task and is retried forever.
+
+    Replay mode is still left -- a Run stuck in it has every later drain return
+    nothing -- so what the abandon path skips is only the checks and the cursor
+    move, and the cursor move has to be skipped anyway: an activation that failed
+    committed nothing.
+    """
+    placed = await append_five(backend, key)
+    await manager.prepare_replay(RUN_ID, annotation_for(key, placed))
+    runtime = make_runtime(manager, backend)
+    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+
+    from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
+
+    # A replay left mid-flight, exactly as a drain that raised leaves it: the
+    # segment armed, its deliveries untaken, the close still owed.
+    stub = DriverStub(runtime)
+    runtime.begin_replay(decode_annotation(annotation_for(key, placed)).header.streams)
+    plan = runtime.take_replay_plan()
+    assert plan is not None
+    runtime.begin_replay_segment(list(plan.segments[0].deliveries))
+    stub._pending_replay_finish = plan
+
+    # Closing from here is what a bare `finally` did, and it raises: the recorded
+    # deliveries are still armed, because the drain that would have taken them is
+    # the one that failed. Asserted so that what follows is a contrast and not a
+    # coincidence.
+    with pytest.raises(temporalio.workflow.NondeterminismError):
+        _WorkflowInstanceImpl._finish_replay_external_streams(stub)  # type: ignore[arg-type]
+
+    # Abandoning does not. Re-arm and take the other path.
+    runtime.begin_replay_segment(list(plan.segments[0].deliveries))
+    stub._pending_replay_finish = plan
+    _WorkflowInstanceImpl._abandon_replay_external_streams(stub)  # type: ignore[arg-type]
+
+    assert runtime._replay_ready is None and runtime._replay_bindings is None, (
+        "replay mode was left set, so every later drain on this Run returns nothing"
+    )
+    assert stub._pending_replay_finish is None
+    subscription = manager.subscription(RUN_ID, 1)
+    assert subscription is not None
+    assert subscription.committed_cursor == BEGINNING, (
+        "an activation that failed committed nothing, so the cursor may not have "
+        "moved to the marker's boundary"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_marker_with_no_segments_closes_before_the_activations_own_drain(
+    manager: StreamSubscriptionManager, backend: MemoryStreamBackend, key: StreamKey
+) -> None:
+    """A marker that recorded no activation of its own defers nothing.
+
+    A Workflow Task that subscribed to a quiet stream and blocked writes a marker
+    with a header and a terminal and **no segments** -- and its terminal names the
+    cursor nothing was ever delivered past. There is no recorded segment for the
+    activation's own drain to serve, so that drain is a *live* one: records that
+    arrived while the Run was evicted are in the buffer and it hands them over.
+
+    Repositioning after that drain retracts what it just delivered. The cursor goes
+    back to the marker's boundary, the buffer is cleared, and the watcher re-reads
+    and re-delivers records Workflow code already has. So a plan with no segments
+    closes inside the job, before the drain, and only a plan with segments defers.
+
+    This is not reachable by inspection alone: the drain only has something to
+    deliver if the watcher buffered first, so the defect it guards against
+    presents as an occasional end-to-end failure and passes in isolation.
+    """
+    placed = await append_five(backend, key)
+    # The marker of a Workflow Task that saw nothing: header and terminal only,
+    # with the terminal at the start cursor.
+    annotation = encode_annotation(
+        Annotation(
+            header=AnnotationHeader({1: binding(key)}),
+            segments=(),
+            terminal={1: BEGINNING},
+        )
+    )
+    await manager.prepare_replay(RUN_ID, annotation)
+    runtime = make_runtime(manager, backend)
+    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+
+    subscription = manager.subscription(RUN_ID, 1)
+    assert subscription is not None
+    await _until(
+        lambda: subscription.buffered == 5,
+        5,
+        "the watcher never buffered anything, so the activation's drain has "
+        "nothing to deliver and this proves nothing",
+    )
+
+    taken: list[Offset] = []
+
+    class LiveDrainingStub(DriverStub):
+        def _run_once(self, *, check_conditions: bool) -> None:
+            super()._run_once(check_conditions=check_conditions)
+            taken.extend(r.offset for r in runtime.drain(1))  # type: ignore[misc]
+
+    drive_with(LiveDrainingStub(runtime))
+
+    assert taken == [], (
+        "the activation's drain handed over buffered records and the replay's "
+        "close then retracted the cursor past them, so the watcher re-reads and "
+        f"the Workflow receives every one of them twice: {taken}"
+    )
+    assert subscription.committed_cursor == BEGINNING, (
+        "the marker committed nothing, so its boundary is the start cursor"
+    )
+    assert subscription.prefetch_cursor == BEGINNING, (
+        "the watcher must be re-reading from the boundary the marker committed"
+    )
+
+    # And the records are not lost -- they arrive on the activation the re-read
+    # announces, which is the ordinary live path.
+    await _until(
+        lambda: subscription.buffered == 5,
+        5,
+        "the buffer never refilled, so the records the retraction dropped are "
+        "gone rather than merely deferred",
+    )
+    assert [r.offset for r in manager.drain(RUN_ID, 1)] == [r.offset for r in placed]
+
+
+@pytest.mark.asyncio
+async def test_a_read_in_flight_across_a_reposition_cannot_be_appended(
+    manager: StreamSubscriptionManager, backend: MemoryStreamBackend, key: StreamKey
+) -> None:
+    """Reposition and append must be atomic against the prefetch epoch.
+
+    Making the reposition synchronous on the Workflow thread is only half a fix.
+    The watcher captures the epoch, reads, *awaits* a user codec, and appends -- so
+    a check made before the append can pass and then have the reposition land in
+    between, putting the retracted records straight back into the buffer and
+    re-advancing ``prefetch_cursor`` past them. Under the reposition's own lock,
+    the append is either cleared by it or rejected by it, with no third
+    interleaving.
+
+    The watcher is held **between its read and its append**, which is the window
+    that matters and the one an epoch check placed outside the lock cannot cover.
+    """
+    placed = await append_five(backend, key)
+    reached_prepare = asyncio.Event()
+    release_prepare = asyncio.Event()
+    real_prepare = manager._prepare
+
+    async def paused_prepare(records):  # type: ignore[no-untyped-def]
+        reached_prepare.set()
+        await release_prepare.wait()
+        return await real_prepare(records)
+
+    manager._prepare = paused_prepare  # type: ignore[assignment]
+
+    runtime = make_runtime(manager, backend)
+    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+    subscription = manager.subscription(RUN_ID, 1)
+    assert subscription is not None
+
+    await asyncio.wait_for(reached_prepare.wait(), 5)
+    assert subscription.buffered == 0, "the watcher got past its append already"
+
+    # The Workflow thread's half, while that read is still in flight.
+    manager.reposition_to_committed(RUN_ID, {1: AFTER(placed[1].offset)})
+    assert subscription.committed_cursor == AFTER(placed[1].offset)
+
+    release_prepare.set()
+    # Give the watcher every chance to append what it read from the old position.
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if subscription.buffered:
+            break
+
+    assert all(r.offset != placed[0].offset for r in list(subscription._buffer)), (
+        "a read that started before the reposition was appended after it, so the "
+        "records the marker already accounts for are back in front of the Workflow"
+    )
+    assert subscription.prefetch_cursor != BEGINNING, (
+        "the watcher never resumed from the new boundary"
+    )
+
+    # And the contract that makes the above hold whatever the interleaving, which a
+    # single-threaded loop cannot demonstrate on its own: the epoch is compared
+    # under the same lock the reposition takes, so an append carrying a retracted
+    # epoch is *refused* rather than merely unlikely. In production the two run on
+    # different threads, where "there is no await between the check and the append"
+    # is not an argument.
+    with subscription._lock:
+        stale_epoch = subscription._prefetch_epoch - 1
+    assert subscription._append(list(placed), stale_epoch) is False, (
+        "an append from a retracted epoch was accepted, so a watcher that read "
+        "before the reposition can undo it"
+    )
+    assert all(r.offset != placed[0].offset for r in list(subscription._buffer))
+
+
+@pytest.mark.asyncio
+async def test_a_replay_activation_never_delivers_a_record_the_marker_omits(
+    manager: StreamSubscriptionManager, backend: MemoryStreamBackend, key: StreamKey
+) -> None:
+    """A record the annotation does not name may not reach Workflow code.
+
+    The dangerous shape is a *coalesced* readiness job: a replayed Run registers a
+    live watcher while it replays, the stream already holds records, and Core can
+    resolve a stream wait in the same activation that carries the replay job. If
+    the activation's own drain reaches the live buffer, Workflow code receives a
+    record no marker records -- observed downstream as a replay that either
+    diverges or fails as nondeterminism.
+
+    The record here is *poison*: it is in the buffer and in no run of the
+    annotation. Whatever the drains do, it must not come out. This drives the
+    activation shape rather than a real ``activate()``, so what it covers is the
+    Python-side invariant; the end-to-end case is
+    ``test_replay_end_to_end.py``'s parked-and-evicted test.
+    """
+    placed = await append_five(backend, key)
+    # The marker records the first two records, across two segments.
+    annotation = encode_annotation(
+        Annotation(
+            header=AnnotationHeader({1: binding(key)}),
+            segments=(
+                Segment(
+                    (Run(1, placed[0].offset, placed[0].offset, 1),),  # type: ignore[arg-type]
+                    SegmentEndReason.BATCH_LIMIT,
+                ),
+                Segment(
+                    (Run(1, placed[1].offset, placed[1].offset, 1),),  # type: ignore[arg-type]
+                    SegmentEndReason.NO_DATA_AVAILABLE,
+                ),
+            ),
+            terminal={1: AFTER(placed[1].offset)},  # type: ignore[arg-type]
+        )
+    )
+    await manager.prepare_replay(RUN_ID, annotation)
+    runtime = make_runtime(manager, backend)
+    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+
+    subscription = manager.subscription(RUN_ID, 1)
+    assert subscription is not None
+    await _until(
+        lambda: subscription.buffered > 0,
+        5,
+        "the watcher never filled the live buffer, so there is no poison record "
+        "for a stray drain to find",
+    )
+
+    taken: list[Offset] = []
+
+    class ResolvingStub(DriverStub):
+        """Resolves pending waits on every drain, as a coalesced readiness job does."""
+
+        def _run_once(self, *, check_conditions: bool) -> None:
+            super()._run_once(check_conditions=check_conditions)
+            runtime.resolve_all_pending()
+            taken.extend(r.offset for r in runtime.drain(1))  # type: ignore[misc]
+
+    stub = drive_with(ResolvingStub(runtime))
+
+    assert len(stub.drains) == 2, (
+        f"two recorded segments must produce two drains, got {len(stub.drains)}"
+    )
+    assert taken == [placed[0].offset, placed[1].offset], (
+        f"the replay activation delivered something the marker does not name: {taken}"
+    )
+    # A delta is expected -- the `subscribe()` this Run replayed is itself
+    # replay-visible and puts the stream in the next annotation's header. What must
+    # not be in it is a *run*: every record this activation handed over came from
+    # the marker, and re-recording those would ask Core to write a second marker
+    # for observations already in History.
+    delta = runtime.take_observation_delta()
+    assert delta is not None
+    recorded = decode_annotation(delta)
+    assert all(not segment.runs for segment in recorded.segments), (
+        "the replay activation recorded runs of its own, so a record it delivered "
+        "came from the live buffer rather than from the marker"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_marker_drains_once_per_segment_including_the_activations_own(
+    manager: StreamSubscriptionManager, backend: MemoryStreamBackend, key: StreamKey
+) -> None:
+    """*k* segments produce *k* drains for the whole activation, not *k + 1*.
+
+    The driver is not the only thing that drains. The replay job lands in the
+    non-query job set, so the activation runs one `_run_once` for that set after
+    every job in it has been applied -- meaning a driver that drained all *k*
+    segments itself produced one drain more than the marker records. ADR-018
+    requires exactly *k*: under `_single_batch_activation` each live stream
+    activation drove exactly one condition-checking drain, so an extra one
+    evaluates `wait_condition` predicates at a point that did not exist live.
+
+    Counted across the activation rather than inside `_apply`, because inside
+    `_apply` the count was always right and the defect was never visible there.
+    An empty segment is included: it records an activation that drained and found
+    nothing, and it must cost a drain like any other.
+    """
+    placed = await append_five(backend, key)
+    annotation = encode_annotation(
+        Annotation(
+            header=AnnotationHeader({1: binding(key)}),
+            segments=(
+                Segment(
+                    (Run(1, placed[0].offset, placed[1].offset, 2),),  # type: ignore[arg-type]
+                    SegmentEndReason.BATCH_LIMIT,
+                ),
+                # The empty one: an activation that ran a drain and found nothing.
+                Segment((), SegmentEndReason.NO_DATA_AVAILABLE),
+                Segment(
+                    (Run(1, placed[2].offset, placed[4].offset, 3),),  # type: ignore[arg-type]
+                    SegmentEndReason.NO_DATA_AVAILABLE,
+                ),
+            ),
+            terminal={1: AFTER(placed[4].offset)},  # type: ignore[arg-type]
+        )
+    )
+    await manager.prepare_replay(RUN_ID, annotation)
+    runtime = make_runtime(manager, backend)
+    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+
+    predicate_evaluations = 0
+
+    class ConditionCountingStub(ConsumingStub):
+        def _run_once(self, *, check_conditions: bool) -> None:
+            nonlocal predicate_evaluations
+            super()._run_once(check_conditions=check_conditions)
+            if check_conditions:
+                # Stands in for a `wait_condition` predicate that stays false:
+                # what it counts is how many times the loop asked.
+                predicate_evaluations += 1
+
+    stub = drive_with(ConditionCountingStub(runtime))
+
+    assert len(stub.drains) == 3, (
+        f"three recorded segments must produce three drains across the whole "
+        f"activation, got {len(stub.drains)}"
+    )
+    assert predicate_evaluations == 3, (
+        f"a still-false wait_condition predicate must be evaluated once per "
+        f"recorded segment, got {predicate_evaluations}"
     )
 
 
@@ -1033,9 +1611,7 @@ async def test_a_rebinding_made_during_the_replay_activation_is_caught_too(
     from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
 
     with pytest.raises(temporalio.workflow.NondeterminismError, match="workflow"):
-        _WorkflowInstanceImpl._apply_replay_external_streams(  # type: ignore[arg-type]
-            LateRegisteringStub(runtime), object()
-        )
+        drive_with(LateRegisteringStub(runtime))
 
 
 @pytest.mark.asyncio
@@ -1106,9 +1682,7 @@ async def test_a_removed_subscription_leaves_recorded_deliveries_unconsumed(
     from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
 
     with pytest.raises(temporalio.workflow.NondeterminismError) as caught:
-        _WorkflowInstanceImpl._apply_replay_external_streams(  # type: ignore[arg-type]
-            OnlyWaitOneStub(runtime), object()
-        )
+        drive_with(OnlyWaitOneStub(runtime))
 
     assert "[2]" in str(caught.value), (
         f"the error must name the wait whose records went undelivered: {caught.value}"
@@ -1313,9 +1887,7 @@ async def test_a_subscription_made_during_the_replay_drive_is_not_missing(
 
     from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
 
-    _WorkflowInstanceImpl._apply_replay_external_streams(  # type: ignore[arg-type]
-        LateSubscribingStub(runtime), object()
-    )
+    drive_with(LateSubscribingStub(runtime))
 
     assert taken == [recorded.offset], (
         f"the subscription made inside the drive must satisfy the marker's "
@@ -1592,9 +2164,7 @@ async def test_a_wait_registered_mid_annotation_replays(
 
     from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
 
-    _WorkflowInstanceImpl._apply_replay_external_streams(  # type: ignore[arg-type]
-        DrainingStub(runtime), object()
-    )
+    drive_with(DrainingStub(runtime))
 
     assert drained == {1: [first_record.offset], 2: [late_record.offset]}
     assert plan.committed_boundaries == {
@@ -1729,9 +2299,7 @@ async def test_a_replayed_drain_stops_at_another_waits_record(
 
     from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
 
-    _WorkflowInstanceImpl._apply_replay_external_streams(  # type: ignore[arg-type]
-        InterleavingStub(runtime), object()
-    )
+    drive_with(InterleavingStub(runtime))
 
     assert taken == [
         (1, left_records[0].offset),

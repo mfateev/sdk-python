@@ -335,10 +335,14 @@ class Subscription:
             popped = [
                 self._buffer.popleft() for _ in range(min(limit, len(self._buffer)))
             ]
-        if popped:
-            last = popped[-1].offset
-            assert last is not None
-            self.delivery_cursor = AFTER(last)
+            if popped:
+                last = popped[-1].offset
+                assert last is not None
+                # Inside the lock with the pop, not after it: `reposition_to`
+                # runs on this same thread but between two activations, and a
+                # cursor advanced outside the lock could be written on top of
+                # the boundary a reposition had just committed.
+                self.delivery_cursor = AFTER(last)
         return popped
 
     def note_wait_generation(self, generation: int) -> None:
@@ -371,15 +375,32 @@ class Subscription:
 
     # --- the manager loop's half --------------------------------------------
 
-    def _append(self, records: list[StreamRecord]) -> None:
+    def _append(self, records: list[StreamRecord], epoch: int) -> bool:
+        """Buffers a read's result unless a reposition has retracted it.
+
+        The epoch is compared **here, under the lock that the reposition also
+        takes**, rather than by the watcher before it calls: repositioning is
+        synchronous on the Workflow thread (see
+        :meth:`StreamSubscriptionManager.reposition_to_committed`), so a check
+        made outside this lock could pass and then have the reposition land
+        before the append -- putting the retracted records straight back into
+        the buffer and re-advancing ``prefetch_cursor`` past them.
+
+        Returns whether the records were buffered. ``False`` means they were
+        read from a position the marker already accounts for and the next pass
+        reads from the new cursor.
+        """
         with self._lock:
+            if self._prefetch_epoch != epoch:
+                return False
             self._buffer.extend(records)
             full = len(self._buffer) >= self.buffer_size
-        last = records[-1].offset
-        assert last is not None
-        self.prefetch_cursor = AFTER(last)
+            last = records[-1].offset
+            assert last is not None
+            self.prefetch_cursor = AFTER(last)
         if full:
             self._has_room.clear()
+        return True
 
     def _room(self) -> int:
         with self._lock:
@@ -400,16 +421,31 @@ class Subscription:
         here was ever a claim. This is exactly why "no cursor advances unless
         the marker commits" is safe to state.
         """
+        self._retract_to_committed()
+        self._has_room.set()
+
+    def _retract_to_committed(self) -> None:
+        """The state half of :meth:`reset_to_committed`, safe on either thread.
+
+        Every write is under ``_lock`` and nothing here touches an
+        ``asyncio`` primitive, which is what lets the Workflow thread call it
+        directly through :meth:`reposition_to`. Waking the watcher is the part
+        that must run on the manager's loop, so it stays with the callers.
+        """
         with self._lock:
-            self._buffer.clear()
-            self._prefetch_epoch += 1
+            self._retract_locked()
+
+    def _retract_locked(self) -> None:
+        """Discards the speculative state. The caller holds ``_lock``."""
+        self._buffer.clear()
+        self._prefetch_epoch += 1
         self.delivery_cursor = self.committed_cursor
         self.prefetch_cursor = self.committed_cursor
-        self._has_room.set()
 
     def commit(self, cursor: Cursor) -> None:
         """Advances the committed cursor when a marker commits."""
-        self.committed_cursor = cursor
+        with self._lock:
+            self.committed_cursor = cursor
 
     def reposition_to(self, cursor: Cursor) -> None:
         """Commits a marker's boundary and restarts every read from it.
@@ -424,9 +460,23 @@ class Subscription:
         The boundary comes from the marker rather than from what the buffer
         happens to hold, because the marker is the only durable statement of
         where consumption reached.
+
+        **Called synchronously from the Workflow thread**, and deliberately not
+        hopped onto the manager's loop. The drain that immediately follows
+        replay is on the Workflow thread too, so a reposition merely *posted*
+        to the loop leaves the retracted records in the buffer for it to hand
+        over a second time -- the reposition has to have happened by the time
+        this returns, not merely be scheduled. Nothing here touches an
+        ``asyncio`` primitive, and the epoch bump is what fences a read already
+        in flight; see :meth:`_append`.
         """
-        self.commit(cursor)
-        self.reset_to_committed()
+        # One lock hold for both halves: a watcher append landing between them
+        # would be dropped by the epoch bump anyway, but a reader that saw the
+        # new committed cursor next to the old delivery cursor would see a state
+        # that never existed.
+        with self._lock:
+            self.committed_cursor = cursor
+            self._retract_locked()
 
 
 class PreparedRecord(StreamRecord):
@@ -584,6 +634,13 @@ class StreamSubscriptionManager:
         #: Whether the sweep has already run, so `shutdown` can tell "nobody
         #: swept" -- which it must then do itself -- from "already swept".
         self._swept = False
+        #: Subscriptions the sweep has not yet decided anything about. Filled
+        #: when the sweep starts and drained as each Run's status is read; what
+        #: is left when the sweep stops -- cancelled by the grace period, or
+        #: stopped by a probe it could not complete -- is counted as a lost wake
+        #: rather than passed over, because a wake this Worker abandoned is
+        #: silent by nature and the counter is the only thing that says otherwise.
+        self._unaccounted: list[Subscription] = []
         #: What the probe phase heard, per Run. Recorded rather than acted on,
         #: because the two halves of the sweep belong at different points of the
         #: Worker's shutdown -- see `probe_runs`.
@@ -970,19 +1027,22 @@ class StreamSubscriptionManager:
         """Moves each named wait to the boundary a replayed marker committed.
 
         Called from the Workflow thread once replay has delivered a marker's
-        recorded ranges, so the work is hopped onto the manager's loop for the
-        same reason :meth:`rearm_ready` hops: an ``asyncio.Event`` may not be
-        set from another thread, and a watcher task created from the Workflow
-        executor thread is silently never scheduled.
-        """
-        self._loop.call_soon_threadsafe(
-            self._reposition_to_committed, run_id, dict(cursors)
-        )
+        recorded ranges, and **completed before it returns** -- unlike
+        :meth:`rearm_ready`, which only has to happen eventually. The very next
+        thing the Workflow thread does is drain, and a reposition merely posted
+        to the manager's loop leaves the marker-covered records sitting in the
+        buffer for that drain to hand over a second time. Posting it and
+        returning made the fix depend on the manager loop winning a race that
+        nothing ordered; the observed symptom was a Workflow receiving
+        ``['alpha', 'alpha', 'beta']``.
 
-    def _reposition_to_committed(
-        self, run_id: str, cursors: Mapping[int, Cursor]
-    ) -> None:
-        """The manager-loop half of :meth:`reposition_to_committed`."""
+        Only the watcher's wakeup is hopped, because that is the one part that
+        touches an ``asyncio`` primitive. The retraction itself is under the
+        subscription's lock and the epoch bump fences a read already in flight,
+        so a watcher appending concurrently is either cleared by this or
+        rejected by :meth:`Subscription._append`.
+        """
+        repositioned: list[Subscription] = []
         for wait_id, cursor in cursors.items():
             subscription = self.subscription(run_id, wait_id)
             if subscription is None or subscription._cancelled:
@@ -991,6 +1051,12 @@ class StreamSubscriptionManager:
                 # reposition here and nothing to say about it.
                 continue
             subscription.reposition_to(cursor)
+            repositioned.append(subscription)
+        for subscription in repositioned:
+            # An `asyncio.Event` may not be set from another thread, so the one
+            # asynchronous consequence of the retraction -- a watcher parked on
+            # backpressure now having room -- is what gets hopped.
+            self._loop.call_soon_threadsafe(subscription.note_drained)
 
     def blocked_snapshot(self, run_id: str) -> dict[int, Cursor]:
         """Where every active subscription's deliveries stopped.
@@ -1027,7 +1093,8 @@ class StreamSubscriptionManager:
                 # a cursor that no longer describes this subscription, and
                 # appending its result would undo the reposition rather than
                 # merely race it.
-                epoch = subscription._prefetch_epoch
+                with subscription._lock:
+                    epoch = subscription._prefetch_epoch
                 try:
                     records = await subscription.backend.read_after(
                         subscription.stream_key,
@@ -1067,14 +1134,15 @@ class StreamSubscriptionManager:
                     [(subscription.stream_key, record) for record in records]
                 )
 
-                if subscription._prefetch_epoch != epoch:
-                    # Discarded rather than buffered: these were read from a
-                    # position a reposition has since retracted, so they are
-                    # records the marker already accounts for. The next pass
-                    # reads from the new cursor.
+                # The epoch is compared inside `_append`, under the lock the
+                # reposition also takes, because repositioning is synchronous on
+                # the Workflow thread: a check made out here could pass and then
+                # have the reposition land before the append. `False` means the
+                # records were read from a position a reposition has since
+                # retracted, so they are records the marker already accounts
+                # for; the next pass reads from the new cursor.
+                if not subscription._append(prepared, epoch):
                     continue
-
-                subscription._append(prepared)
                 await self._report_ready(subscription)
         except asyncio.CancelledError:
             pass
@@ -1807,6 +1875,16 @@ class StreamSubscriptionManager:
             return
         self._swept = True
         self._shutting_down = True
+        # Every subscription starts out unaccounted for, and each one leaves this
+        # set exactly once: when its Run's status says nothing is owed, or when
+        # its wake is acknowledged. Whatever is still in it when the sweep stops
+        # is a handoff this Worker did not make, and the whole point of the
+        # counter is that such a handoff cannot be silent.
+        self._unaccounted = [
+            subscription
+            for run_id in list(self._runs)
+            for subscription in self._runs.get(run_id, {}).values()
+        ]
         try:
             await asyncio.wait_for(self._sweep(), grace.total_seconds())
         except asyncio.TimeoutError:
@@ -1815,6 +1893,16 @@ class StreamSubscriptionManager:
                 "tearing down anyway",
                 grace,
             )
+        finally:
+            # In a `finally`, and reached on the timeout path especially.
+            # `wait_for` cancels `_sweep()`, and cancellation lands wherever the
+            # sweep happened to be: inside a hanging Signal send, whose
+            # `CancelledError` `_send_owed_wake` deliberately re-raises, and
+            # before every subscription the serial loop had not reached yet.
+            # Accounting done only where the sweep managed to reach therefore
+            # reported a clean shutdown -- `shutdown_wake_failures == 0` -- for a
+            # Worker that had just abandoned every one of its handoffs.
+            self._account_unswept()
 
     async def shutdown(self, *, grace: timedelta = DEFAULT_SHUTDOWN_GRACE) -> None:
         """Sweeps every Run that still holds subscriptions, then tears down.
@@ -1836,8 +1924,20 @@ class StreamSubscriptionManager:
         record is buffered", so probing with it would assert something false and
         manufacture a spurious Workflow Task on the way out of a Worker that is
         shutting down.
+
+        Nothing is counted as a failure in here beyond the wakes this actually
+        attempted. What was never reached is accounted for by
+        :meth:`_account_unswept`, which runs whether this returns or is cancelled
+        by the grace period.
         """
         if self._run_status is None:
+            # No probe wired means there is no sweep on this manager at all --
+            # the whole mechanism is defined in terms of what Core answers -- so
+            # there is no obligation to have failed to discharge. Resolved rather
+            # than counted: a metric that fires for a mechanism that was never
+            # configured tells an operator nothing about the deployment that has
+            # it.
+            self._resolve_unaccounted(self._unaccounted)
             return
         for run_id in list(self._runs):
             subscriptions = list(self._runs.get(run_id, {}).values())
@@ -1852,7 +1952,16 @@ class StreamSubscriptionManager:
                 # give owe a wake.
                 try:
                     status = _status_value(await self._run_status(run_id))
+                except asyncio.CancelledError:
+                    raise
                 except Exception:
+                    # Left unaccounted for on purpose. A Run whose status cannot
+                    # be read is a Run this Worker cannot say anything about, and
+                    # "we could not tell" is not "nothing was owed": these
+                    # subscriptions may each be holding a buffered record with
+                    # nowhere to announce it. Sending a wake anyway would race a
+                    # Workflow Task that may be open, so the honest outcome is to
+                    # send nothing and let the counter say a handoff was lost.
                     logger.exception(
                         "External stream shutdown probe failed for run %s", run_id
                     )
@@ -1862,10 +1971,12 @@ class StreamSubscriptionManager:
                 # A Workflow Task is open and Core owns what happens to it
                 # (C15b). A wake here would race that transition and produce a
                 # second task for a Run already being attended to.
+                self._resolve_unaccounted(subscriptions)
                 continue
             if status == RunStatus.PARKED:
                 # Already parked, so a producer's append will wake it through the
                 # ordinary path. Nothing is owed.
+                self._resolve_unaccounted(subscriptions)
                 continue
 
             # NoOpenWorkflowTask and RunNotFound both mean local readiness has
@@ -1885,9 +1996,67 @@ class StreamSubscriptionManager:
         The grace period bounds the whole sweep, so the retries cannot extend
         shutdown past it, and a wake that never lands is reported rather than
         dropped -- which is the only thing that makes giving up acceptable.
+
+        Counting the failure is deliberately **not** done here for the
+        cancellation case. The grace period expiring cancels this coroutine
+        wherever it is, `_send_owed_wake` re-raises `CancelledError` by design,
+        and no `except` here could both record the failure and leave the
+        cancellation intact for the subscriptions after this one -- which are not
+        reached either. The subscription stays in the unaccounted set instead and
+        :meth:`_account_unswept` counts it, which covers being cancelled and
+        being never visited with the same rule.
         """
         subscription.wakes_owed += 1
-        if not await self._send_owed_wake(subscription):
+        if await self._send_owed_wake(subscription):
+            self._resolve_unaccounted([subscription])
+        else:
+            self._record_shutdown_wake_failure(subscription)
+            self._resolve_unaccounted([subscription])
+
+    def _resolve_unaccounted(self, subscriptions: Sequence[Subscription]) -> None:
+        """Marks these subscriptions as decided, however they were decided.
+
+        Both outcomes are decisions: nothing was owed, or a wake was attempted
+        and its result recorded. What stays in the set is only what the sweep
+        never got to say anything about.
+        """
+        decided = set(map(id, subscriptions))
+        self._unaccounted = [
+            subscription
+            for subscription in self._unaccounted
+            if id(subscription) not in decided
+        ]
+
+    def _account_unswept(self) -> None:
+        """Counts every subscription the sweep never resolved as a lost handoff.
+
+        The grace period is a bound on how long shutdown may be held open, not a
+        licence to stop counting: a Worker that abandons a wake and reports zero
+        failures makes the failure invisible in exactly the way this counter
+        exists to prevent. Both silent cases end up here -- the wake the
+        cancellation landed inside, and every subscription the serial loop never
+        reached.
+        """
+        unaccounted, self._unaccounted = self._unaccounted, []
+        for subscription in unaccounted:
+            if (
+                self._runs.get(subscription.run_id, {}).get(subscription.wait_id)
+                is not subscription
+            ):
+                # Gone from the Run while the sweep ran, which the *live* readiness
+                # path does -- it drops a subscription on `RunNotFound`, and only
+                # after its own owed wake was acknowledged. `RunNotFound` is a
+                # likely answer during shutdown and the watchers keep running
+                # through the whole grace window, so this is an ordinary
+                # interleaving, not a corner. Counting it would report a lost
+                # handoff for one that was made, on the counter operators are told
+                # to alert on.
+                continue
+            logger.warning(
+                "External stream shutdown left a wake unresolved for %s wait %s",
+                subscription.stream_key,
+                subscription.wait_id,
+            )
             self._record_shutdown_wake_failure(subscription)
 
     async def _send_owed_wake(self, subscription: Subscription) -> bool:

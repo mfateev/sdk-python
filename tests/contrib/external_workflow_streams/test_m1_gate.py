@@ -118,6 +118,52 @@ M1_COVERAGE: dict[int, str | tuple[str, ...]] = {
         "test_redis_backend.py::test_a_trimmed_range_is_integrity_loss_not_a_storage_failure",
         "test_redis_backend.py::test_a_deleted_write_fence_is_integrity_loss",
     ),
+    # Cases 56-62 -- "Boundaries an implementation review found unprotected".
+    # These are mapped here before the vendored copy of the list carries them:
+    # the gate parses the plan out of `temporalio/bridge/sdk-core`, so it counts
+    # 55 cases until the submodule pointer moves to the commit that adds them.
+    # Mapping ahead of that is deliberate -- an unmapped case is what the gate is
+    # designed to fail on, so the map has to arrive no later than the list does.
+    56: "test_replay.py::test_the_first_live_drain_after_a_replay_needs_no_loop_turn",
+    57: "test_replay.py::test_a_marker_drains_once_per_segment_including_the_activations_own",
+    58: "test_runtime.py::test_the_segment_that_crosses_the_mark_asks_for_rollover_itself",
+    59: (
+        "test_runtime.py::test_a_frame_larger_than_the_slack_rolls_over_instead_of_raising",
+        "test_runtime.py::test_a_subscription_set_too_large_to_record_is_refused_at_subscribe",
+    ),
+    60: (
+        "test_wake.py::test_a_coordination_failure_after_the_append_is_still_unacknowledged",
+        "test_wake.py::test_a_coordination_failure_after_a_fence_is_still_unacknowledged",
+    ),
+    61: (
+        "test_shutdown_sweep.py::test_a_grace_period_expiry_counts_every_wake_it_abandons",
+        "test_shutdown_sweep.py::test_a_probe_that_cannot_answer_is_not_reported_as_nothing_owed",
+        "test_shutdown_sweep.py::test_a_hanging_probe_counts_the_runs_it_never_answered_for",
+        "test_shutdown_sweep.py::test_a_run_with_nothing_owed_is_not_counted_as_a_failure",
+    ),
+    62: "test_replay.py::test_an_unreachable_payload_store_is_a_storage_failure_not_a_decode_one",
+    # 63 and 64 came out of reviewing the fixes for 56-62 rather than out of the
+    # review itself: the first fix for the byte budget stopped delivery without
+    # obliging the same completion to ask for the rollover, and the first fix for
+    # the sweep counted subscriptions on a manager that had no sweep to perform.
+    63: "test_runtime.py::test_an_activation_the_annotation_budget_stopped_is_not_wedged_by_it",
+    64: "test_shutdown_sweep.py::test_a_manager_with_no_probe_owes_nothing_and_reports_nothing",
+    65: "test_replay.py::test_a_marker_with_no_segments_closes_before_the_activations_own_drain",
+    # 66-69 came out of an independent review of the fixes for 56-62, which found
+    # four more defects in this round's own code. The shape is the one worth
+    # remembering: each was correct for the case it was aimed at.
+    66: "test_runtime.py::test_the_first_record_of_an_activation_is_priced_from_a_measurement",
+    67: "test_runtime.py::test_a_run_too_large_for_any_annotation_says_so_and_fails_the_workflow",
+    68: "test_runtime.py::test_the_capacity_floor_covers_everything_an_empty_annotation_carries",
+    69: (
+        "test_replay.py::test_a_failing_activation_reports_its_own_error_not_the_replays",
+        "test_shutdown_sweep.py::test_a_wake_the_live_path_delivered_is_not_counted_as_abandoned",
+    ),
+    # 70-71 are the two deterministic tests `empty-stream-replay-flake-handoff.md`
+    # asks for, written as far as the available harness allows; that document says
+    # which part of each is covered here and which stays end-to-end.
+    70: "test_replay.py::test_a_read_in_flight_across_a_reposition_cannot_be_appended",
+    71: "test_replay.py::test_a_replay_activation_never_delivers_a_record_the_marker_omits",
 }
 
 #: Case number -> what is still missing, for cases the suite does not fully

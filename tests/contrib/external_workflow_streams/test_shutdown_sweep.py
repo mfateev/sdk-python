@@ -368,6 +368,225 @@ async def test_shutdown_is_never_blocked_past_the_grace_period(
     assert manager._runs == {}
 
 
+@pytest.mark.asyncio
+async def test_a_grace_period_expiry_counts_every_wake_it_abandons(
+    backend: MemoryStreamBackend,
+) -> None:
+    """A Worker may give up on a wake; it may not do so quietly.
+
+    The grace period cancels the sweep wherever it happens to be, and
+    ``_send_owed_wake`` re-raises ``CancelledError`` by design -- so the failure
+    accounting that sits after it was never reached, and neither was any
+    subscription later in the serial loop. Shutdown then reported
+    ``shutdown_wake_failures == 0`` for a Worker that had just abandoned every
+    one of its handoffs, which is precisely the silence this counter exists to
+    break: a dropped wake looks exactly like a producer with nothing to say.
+    """
+    hanging = asyncio.Event()
+
+    class HangingWakeHarness(Harness):
+        async def _wake(self, subscription) -> None:  # type: ignore[no-untyped-def]
+            hanging.set()
+            await asyncio.sleep(60)
+
+    harness = HangingWakeHarness(backend, RunStatus.NO_OPEN_WORKFLOW_TASK)
+    for wait_id in (1, 2):
+        harness.manager.register(
+            run_id=RUN_ID,
+            wait_id=wait_id,
+            stream_key=StreamKey("ns", "wf", "first-run", f"tokens-{wait_id}"),
+            backend_name="tokens",
+            start_cursor=BEGINNING,
+        )
+
+    started = asyncio.get_running_loop().time()
+    await harness.manager.shutdown(grace=timedelta(milliseconds=200))
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 5, f"shutdown waited {elapsed:.1f}s past its grace period"
+    assert hanging.is_set(), "the wake never got as far as hanging"
+    assert harness.wakes == [], "no wake was acknowledged, so none may be reported"
+    assert harness.manager.shutdown_wake_failures == 2, (
+        "both handoffs were abandoned -- the one the cancellation landed inside "
+        f"and the one never reached -- and {harness.manager.shutdown_wake_failures} "
+        "were counted"
+    )
+    assert sorted(harness.metric) == ["tokens-1", "tokens-2"], (
+        f"the metric must fire once per abandoned subscription: {harness.metric}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_probe_that_cannot_answer_is_not_reported_as_nothing_owed(
+    backend: MemoryStreamBackend,
+) -> None:
+    """ "We could not tell" is not "nothing was owed".
+
+    A Run whose status cannot be read may be holding a buffered record with
+    nowhere to announce it. Sending a wake anyway would race a Workflow Task that
+    might be open, so the sweep sends nothing -- but passing over the Run without
+    counting it tears the Run down and reports a clean shutdown, which is the same
+    silent loss by a different route.
+    """
+
+    class FailingProbeHarness(Harness):
+        async def _probe(self, run_id: str) -> str:
+            self.probes.append(run_id)
+            raise ConnectionError("service unavailable")
+
+    harness = FailingProbeHarness(backend, RunStatus.NO_OPEN_WORKFLOW_TASK)
+    for wait_id in (1, 2):
+        harness.manager.register(
+            run_id=RUN_ID,
+            wait_id=wait_id,
+            stream_key=StreamKey("ns", "wf", "first-run", f"tokens-{wait_id}"),
+            backend_name="tokens",
+            start_cursor=BEGINNING,
+        )
+
+    await asyncio.wait_for(harness.manager.shutdown(grace=timedelta(seconds=2)), 5)
+
+    assert harness.wakes == []
+    assert harness.manager.shutdown_wake_failures == 2, (
+        "a Run this Worker could say nothing about was torn down reporting a "
+        "clean shutdown"
+    )
+    assert sorted(harness.metric) == ["tokens-1", "tokens-2"]
+    assert harness.manager._runs == {}, "shutdown must still complete"
+
+
+@pytest.mark.asyncio
+async def test_a_hanging_probe_counts_the_runs_it_never_answered_for(
+    backend: MemoryStreamBackend,
+) -> None:
+    """The grace period expiring inside the probe is the same loss as inside the wake."""
+
+    class HangingProbeHarness(Harness):
+        async def _probe(self, run_id: str) -> str:
+            self.probes.append(run_id)
+            await asyncio.sleep(60)
+            return RunStatus.NO_OPEN_WORKFLOW_TASK
+
+    harness = HangingProbeHarness(backend, RunStatus.NO_OPEN_WORKFLOW_TASK)
+    harness.manager.register(
+        run_id=RUN_ID,
+        wait_id=1,
+        stream_key=StreamKey("ns", "wf", "first-run", "tokens-1"),
+        backend_name="tokens",
+        start_cursor=BEGINNING,
+    )
+
+    await harness.manager.shutdown(grace=timedelta(milliseconds=200))
+
+    assert harness.wakes == []
+    assert harness.manager.shutdown_wake_failures == 1
+    assert harness.metric == ["tokens-1"]
+
+
+@pytest.mark.asyncio
+async def test_a_run_with_nothing_owed_is_not_counted_as_a_failure(
+    backend: MemoryStreamBackend,
+) -> None:
+    """The counter has to stay quiet where it should, or it says nothing at all.
+
+    A parked Run is woken by a producer's append through the ordinary path, and a
+    Run with an open Workflow Task is Core's to finish. Counting either as an
+    abandoned handoff would make the metric fire on every clean shutdown and
+    become unalertable.
+    """
+    for status in (RunStatus.PARKED, RunStatus.WFT_OPEN):
+        harness = Harness(backend, status)
+        harness.manager.register(
+            run_id=RUN_ID,
+            wait_id=1,
+            stream_key=StreamKey("ns", "wf", "first-run", "tokens"),
+            backend_name="tokens",
+            start_cursor=BEGINNING,
+        )
+
+        await asyncio.wait_for(harness.manager.shutdown(grace=timedelta(seconds=2)), 5)
+
+        assert harness.manager.shutdown_wake_failures == 0, (
+            f"a Run reported as {status} owes no wake, so nothing was abandoned"
+        )
+        assert harness.metric == []
+
+
+@pytest.mark.asyncio
+async def test_a_wake_the_live_path_delivered_is_not_counted_as_abandoned(
+    backend: MemoryStreamBackend,
+) -> None:
+    """The sweep's set is a snapshot, and the live path empties it underneath.
+
+    Readiness that comes back `RunNotFound` owes a wake, sends it, and *then* drops
+    the subscription -- and `RunNotFound` is a likely answer during shutdown, while
+    watchers keep running for the whole grace window and the sweep awaits inside
+    itself for them to interleave with. A subscription that leaves the Run that way
+    has had its handoff made, so counting it reports a loss that did not happen on
+    the counter operators are told to alert on.
+    """
+    other_run = "run-2"
+    harness = Harness(backend, RunStatus.PARKED)
+    for run_id in (RUN_ID, other_run):
+        harness.manager.register(
+            run_id=run_id,
+            wait_id=1,
+            stream_key=StreamKey("ns", "wf", run_id, "tokens"),
+            backend_name="tokens",
+            start_cursor=BEGINNING,
+        )
+
+    # While the sweep is busy with the first Run, the live path takes the second
+    # Run's subscription away -- which is what it does on `RunNotFound`, and only
+    # once its own owed wake has been acknowledged. The sweep then reaches that Run,
+    # finds no subscriptions, and moves on without saying anything about it.
+    async def drop_the_other(run_id: str) -> str:
+        if run_id == RUN_ID:
+            harness.manager._runs.get(other_run, {}).pop(1, None)
+        return RunStatus.PARKED
+
+    harness.manager._run_status = drop_the_other  # type: ignore[assignment]
+
+    await asyncio.wait_for(harness.manager.shutdown(grace=timedelta(seconds=2)), 5)
+
+    assert harness.manager.shutdown_wake_failures == 0, (
+        "a subscription whose wake the live path had already delivered was counted "
+        "as an abandoned handoff, on the counter operators are told to alert on"
+    )
+    assert harness.metric == []
+
+
+@pytest.mark.asyncio
+async def test_a_manager_with_no_probe_owes_nothing_and_reports_nothing(
+    backend: MemoryStreamBackend,
+) -> None:
+    """No probe wired means no sweep, which means nothing to have failed at.
+
+    The sweep is defined entirely in terms of what Core answers, so a manager with
+    no run-status probe has no handoff obligation at all. Counting its
+    subscriptions as abandoned wakes would make the metric fire wherever the
+    mechanism simply is not configured -- which is noise in exactly the series an
+    operator is expected to alert on.
+    """
+    manager = StreamSubscriptionManager(
+        backends={"tokens": backend},
+        notify_ready=lambda *_: _accepted(),
+        watch_block=timedelta(milliseconds=10),
+    )
+    manager.register(
+        run_id=RUN_ID,
+        wait_id=1,
+        stream_key=StreamKey("ns", "wf", "first-run", "tokens"),
+        backend_name="tokens",
+        start_cursor=BEGINNING,
+    )
+
+    await asyncio.wait_for(manager.shutdown(grace=timedelta(seconds=2)), 5)
+
+    assert manager.shutdown_wake_failures == 0
+    assert manager._runs == {}
+
+
 # --- teardown ordering --------------------------------------------------------
 
 

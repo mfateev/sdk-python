@@ -11,6 +11,16 @@ codec. A mismatch is detected on the consumer, and is classified as a decode
 failure rather than as stream integrity loss -- the stream is fine; the
 configuration is not.
 
+The one thing this module classifies itself is an **external payload store that
+cannot be reached**. That is row one of the taxonomy, not row three: the bytes
+in the stream are a reference, the value does not exist until the reference is
+fetched, and a driver that cannot fetch it raises whatever its client raises.
+Left unlabelled it reaches the consumer as an unclassified failure on a record
+whose range validated, which the classification rule turns into a decode
+failure -- sending an operator to change a converter during a storage outage.
+Nothing further down can tell the two apart, so the label is applied at the call
+that knows.
+
 Decoding on the consumer is **two halves, run in two different places**:
 
 - :py:meth:`StreamPayloadCodec.prepare`, on the **Worker's loop**:
@@ -35,6 +45,10 @@ from typing import Any, Generic
 
 import temporalio.api.common.v1
 import temporalio.converter
+from temporalio.contrib.external_workflow_streams._errors import (
+    StreamError,
+    StreamStorageError,
+)
 from temporalio.types import AnyType
 
 __all__ = ["StreamPayloadCodec"]
@@ -100,9 +114,32 @@ class StreamPayloadCodec(Generic[AnyType]):
         # itself is these two calls followed by `from_payloads`, so preparing
         # here and converting in `convert` is byte-for-byte the same work in the
         # same order -- only on two different threads.
-        retrieved = await self.data_converter._external_retrieve_payload_sequence(
-            [parsed]
-        )
+        try:
+            retrieved = await self.data_converter._external_retrieve_payload_sequence(
+                [parsed]
+            )
+        except StreamError:
+            raise
+        except Exception as err:
+            # Row one of the taxonomy, and it has to be labelled *here*. An
+            # external-storage driver raises whatever its client raises -- a
+            # bare `ConnectionError` for an unreachable payload store -- and the
+            # converter does not wrap it. Everything downstream sees an
+            # unclassified exception on a record whose range validated, and the
+            # classification rule for that is row three: the operator is told to
+            # align a converter that is in fact fine while the payload store is
+            # the thing that is down. Nothing below this call can tell the two
+            # apart, because by then the only evidence is the exception type the
+            # driver chose.
+            #
+            # A payload store is as much a stream read as the stream backend is:
+            # the record's bytes are a reference, and the value does not exist
+            # until they are fetched. Transient by the same argument, and clears
+            # the same way.
+            raise StreamStorageError(
+                "an external stream record's payload could not be retrieved from "
+                f"external storage: {err}"
+            ) from err
         decoded = await self.data_converter._decode_payload_sequence(retrieved)
         if len(decoded) != 1:
             raise ValueError(

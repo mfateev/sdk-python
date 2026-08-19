@@ -58,10 +58,11 @@ Two properties the encoding is built around:
 from __future__ import annotations
 
 import enum
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Final
 
+import temporalio.exceptions
 from temporalio.contrib.external_workflow_streams._backend import StreamKey
 from temporalio.contrib.external_workflow_streams._record import (
     AFTER,
@@ -83,6 +84,8 @@ __all__ = [
     "decode_annotation",
     "encode_annotation",
     "encode_bindings",
+    "encoded_run_size",
+    "encoded_segment_size",
 ]
 
 SCHEMA_VERSION: Final = 2
@@ -152,14 +155,33 @@ class AnnotationDecodeError(Exception):
     """The annotation bytes are not a well-formed annotation."""
 
 
-class AnnotationBudgetExceeded(Exception):
+class AnnotationBudgetExceeded(temporalio.exceptions.ApplicationError):
     """Encoding would push the annotation past :data:`MAX_ANNOTATION_BYTES`.
 
-    Should be unreachable in practice: the encoder asks for a rollover at the
-    high-water mark, long before this. It is raised rather than assumed away so
-    a future encoding change that grows a frame is caught here rather than by
-    the server rejecting an oversized event.
+    Unreachable if the three preventions hold, and each closes a way it used to
+    be reachable:
+
+    - the closing frames are **reserved** rather than checked, so the terminal
+      and any late bindings frame always fit (see
+      :attr:`AnnotationAccumulator.reserved`);
+    - the runtime **stops delivering** rather than growing a segment it could not
+      then record, and asks Core to roll the Workflow Task over;
+    - ``subscribe()`` **refuses** a subscription set whose own header and
+      terminal could not fit an empty annotation, at the point the Workflow makes
+      it.
+
+    An :py:class:`~temporalio.exceptions.ApplicationError` marked
+    non-retryable, and that is the substance of this class rather than a detail.
+    A plain exception here fails the *Workflow Task*, and the server retries
+    Workflow Task failures forever: the encoding that overflowed overflows again
+    on every retry, so the Workflow is stuck permanently with no marker, no
+    terminal, and no rollover ever requested. ADR-007 rejects exactly that
+    check-and-fail behaviour. Failing the Workflow instead is still bad news, but
+    it is bounded, visible, and reported once.
     """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, type="AnnotationBudgetExceeded", non_retryable=True)
 
 
 # --- the decoded shape ------------------------------------------------------
@@ -439,24 +461,57 @@ def encode_bindings(streams: Mapping[int, StreamBinding]) -> bytes:
     return bytes(out)
 
 
+def _put_run(out: bytearray, run: Run) -> None:
+    _put_uvarint(out, run.wait_id)
+    _put_str(out, run.first_offset.serialize())
+    _put_str(out, run.last_offset.serialize())
+    _put_uvarint(out, run.count)
+    _put_uvarint(out, len(run.control_positions))
+    previous = 0
+    for position in run.control_positions:
+        # Delta-encoded: control positions ascend, so the gaps are smaller
+        # numbers than the absolute indices and cost fewer varint bytes.
+        _put_uvarint(out, position - previous)
+        previous = position
+
+
 def encode_segment(segment: Segment) -> bytes:
     out = bytearray()
     out.append(_FRAME_SEGMENT)
     _put_uvarint(out, len(segment.runs))
     for run in segment.runs:
-        _put_uvarint(out, run.wait_id)
-        _put_str(out, run.first_offset.serialize())
-        _put_str(out, run.last_offset.serialize())
-        _put_uvarint(out, run.count)
-        _put_uvarint(out, len(run.control_positions))
-        previous = 0
-        for position in run.control_positions:
-            # Delta-encoded: control positions ascend, so the gaps are smaller
-            # numbers than the absolute indices and cost fewer varint bytes.
-            _put_uvarint(out, position - previous)
-            previous = position
+        _put_run(out, run)
     out.append(int(segment.end_reason))
     return bytes(out)
+
+
+def encoded_run_size(run: Run) -> int:
+    """What one run costs inside a segment frame, in bytes.
+
+    Exposed because the runtime has to know what an *open* segment costs before
+    it is closed: a segment frame that no longer fits the annotation's remaining
+    budget cannot be deferred to the next annotation -- its deliveries happened
+    in this Workflow Task and the marker for that task is where replay must find
+    them -- so the only place to act is before the records that would grow it are
+    handed over. Measured rather than estimated per record, because a run's cost
+    is dominated by two provider-supplied offset strings whose length this side
+    does not choose.
+    """
+    out = bytearray()
+    _put_run(out, run)
+    return len(out)
+
+
+def encoded_segment_size(run_sizes: Sequence[int]) -> int:
+    """What a segment frame costs, given what each of its runs costs.
+
+    Takes the per-run sizes rather than the runs so that a caller extending one
+    run at a time re-measures only the run it changed.
+    """
+    out = bytearray()
+    _put_uvarint(out, len(run_sizes))
+    # Frame tag, the run count, the runs themselves, and the end-reason byte.
+    return 1 + len(out) + sum(run_sizes) + 1
 
 
 def encode_terminal(blocked: dict[int, Cursor]) -> bytes:
@@ -575,13 +630,55 @@ class AnnotationAccumulator:
         self._high_water_bytes = int(max_bytes * high_water)
         self._emitted: list[bytes] = []
         self._size = 0
+        self._closing = 0
+        self._spill = 0
         self._terminated = False
-        self._emit(encode_header(header))
+        self._emit(encode_header(header), closing=True)
 
     @property
     def size(self) -> int:
         """Bytes accumulated so far, which is what the marker will carry."""
         return self._size
+
+    @property
+    def reserved(self) -> int:
+        """Bytes held back from the ordinary run of segments.
+
+        Two parts, and they are held back against different things:
+
+        - **closing** -- the terminal, plus a bindings frame for any wait
+          registered since the header went out. Neither may ever be refused: both
+          record something that has already happened, and an annotation whose
+          terminal does not fit is one Core writes *without* a terminal --
+          durable, and undecodable past the frame after it. Only they may spend
+          this.
+        - **spill** -- a margin a segment frame may overrun into. The runtime
+          stops delivering before a segment it could not record, but it prices a
+          record it has not seen yet, and a provider chooses how long its offsets
+          are. The margin is what turns a misprice into a rollover instead of a
+          refusal; an annotation that dips into it has already asked Core to end
+          the Workflow Task.
+        """
+        return self._closing + self._spill
+
+    def reserve(self, closing: int, *, spill: int = 0) -> None:
+        """Sets what closing costs, and how much a segment may overrun."""
+        self._closing = closing
+        self._spill = spill
+
+    @property
+    def headroom(self) -> int:
+        """Bytes available to a segment before it starts spending the margin.
+
+        What the runtime measures affordability against. Zero does not mean the
+        annotation is full; it means the next segment overruns into the spill and
+        the Workflow Task has to end.
+        """
+        return max(0, self._max_bytes - self._closing - self._spill - self._size)
+
+    def fits(self, frame_bytes: int) -> bool:
+        """Whether a segment of this size fits without spending the margin."""
+        return frame_bytes <= self.headroom
 
     @property
     def request_rollover(self) -> bool:
@@ -590,6 +687,11 @@ class AnnotationAccumulator:
         Set once the high-water mark is passed. Core then rolls the task over
         *without* a finalization round trip, because the progress report
         carrying this flag already carried the terminal.
+
+        The high-water mark alone is not the whole condition -- it is a fraction
+        of the budget, and a frame can be larger than the fraction that is left.
+        The runtime adds the other half by refusing to grow a segment it could not
+        then record; see ``WorkflowStreamRuntime.request_rollover``.
         """
         return self._size >= self._high_water_bytes
 
@@ -613,7 +715,12 @@ class AnnotationAccumulator:
             raise ValueError("cannot bind a wait after the terminal")
         if not streams:
             raise ValueError("a bindings frame binds at least one wait")
-        return self._emit(encode_bindings(streams))
+        # A closing frame for budget purposes: the wait it binds was admitted by
+        # `register`, which charged this frame into the reserve at the time, and
+        # refusing it now would leave the wait in the terminal with no stream key,
+        # no backend, and no start cursor -- which replay reports as a wait the
+        # Workflow never created.
+        return self._emit(encode_bindings(streams), closing=True)
 
     def add_segment(self, segment: Segment) -> bytes:
         """Encodes one activation's segment and returns it as a delta."""
@@ -625,17 +732,25 @@ class AnnotationAccumulator:
         """Encodes the blocked snapshot that closes this annotation."""
         if self._terminated:
             raise ValueError("an annotation has one terminal, not two")
-        delta = self._emit(encode_terminal(blocked))
+        delta = self._emit(encode_terminal(blocked), closing=True)
         self._terminated = True
         return delta
 
-    def _emit(self, frame: bytes) -> bytes:
-        if self._size + len(frame) > self._max_bytes:
+    def _emit(self, frame: bytes, *, closing: bool = False) -> bytes:
+        # A closing frame -- the header, a bindings frame, the terminal -- may
+        # spend everything, including the margin, because it is what makes the
+        # annotation readable at all. A segment may spend the margin but not the
+        # closing reserve: overrunning into the margin is a rollover, overrunning
+        # past it is the failure this is the last line against.
+        cap = self._max_bytes if closing else self._max_bytes - self._closing
+        if self._size + len(frame) > cap:
             raise AnnotationBudgetExceeded(
                 f"encoding {len(frame)} more byte(s) would take the annotation to "
-                f"{self._size + len(frame)}, past the {self._max_bytes}-byte budget; "
-                "the runtime should have rolled the Workflow Task over at the "
-                f"{self._high_water_bytes}-byte high-water mark"
+                f"{self._size + len(frame)}, past the {cap}-byte limit "
+                f"({self._max_bytes}-byte budget less {self._closing} reserved for "
+                "the frames that close it); the runtime should have stopped "
+                "delivering and asked Core to roll the Workflow Task over before "
+                "this"
             )
         self._emitted.append(frame)
         self._size += len(frame)
