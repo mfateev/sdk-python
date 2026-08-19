@@ -48,6 +48,8 @@ class FakeRuntime:
         self.deliveries: list[tuple[int, StreamRecord]] = []
         self.consumed: list[tuple[int, StreamRecord]] = []
         self.blocked: list[tuple[int, bool]] = []
+        #: The wait ids `close()` asked the Worker to stop serving.
+        self.unsubscribed: list[int] = []
         self.pending: dict[int, asyncio.Future[None]] = {}
         self.budget = MAX_RECORDS_PER_ACTIVATION
         #: Overrides what `codec_for` hands back, so a test can control when --
@@ -103,6 +105,9 @@ class FakeRuntime:
 
     def note_blocked(self, wait_id: int, blocked: bool) -> None:
         self.blocked.append((wait_id, blocked))
+
+    def unsubscribe(self, wait_id: int) -> None:
+        self.unsubscribed.append(wait_id)
 
     def register_pending(self, wait_id: int, future: asyncio.Future[None]) -> None:
         self.pending[wait_id] = future
@@ -342,6 +347,32 @@ async def test_an_empty_buffer_blocks_on_a_readiness_future(
         await pending
     except asyncio.CancelledError:
         pass
+
+
+def test_closing_a_subscription_unsubscribes_it(runtime: FakeRuntime) -> None:
+    """The Workflow side going quiet is only half of closing.
+
+    Everything the Workflow itself can observe is already right without this
+    call -- iteration ends, the wait leaves the blocked set, undelivered records
+    stay unconsumed -- so nothing on this side of the boundary would notice it
+    missing. What is left behind is on the Worker: a watcher still prefetching
+    into a buffer nobody will drain, and a park intent still in the backend for
+    every producer that asks.
+    """
+    subscription = external_stream.topic(
+        "tokens", backend="tokens-redis", type=str
+    ).subscribe()
+
+    subscription.close()
+
+    assert runtime.unsubscribed == [subscription.wait_id], (
+        "closing left the Worker serving a wait no Workflow code is reading"
+    )
+    # Idempotent, like the rest of `close`: the ordinary shape is a `finally`
+    # that cannot know whether the iterator already ended, and by a second call
+    # the Worker has already dropped this wait.
+    subscription.close()
+    assert runtime.unsubscribed == [subscription.wait_id]
 
 
 # --- names --------------------------------------------------------------------

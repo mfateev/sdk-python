@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 import uuid
 from datetime import timedelta
 
@@ -534,6 +535,117 @@ async def test_cancelling_one_subscription_leaves_the_others(
 
         assert manager.subscription(RUN_ID, 1) is None
         assert manager.subscription(RUN_ID, 2) is not None
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_wait_takes_back_its_park_intent(
+    stream_key: StreamKey,
+) -> None:
+    """The intent has to go here, because nothing later can be asked to retry.
+
+    The resolve path can afford to log a failure and try again, since the
+    subscription it is working on stays registered. This one drops it, so an
+    intent left behind is left behind for good -- and a stale intent is what
+    `current_park_generation` answers to every producer that asks. A producer
+    naming a generation Core has discarded sends a wake Core ignores as stale:
+    the record is appended, the Signal is sent, and the Workflow is never woken.
+    """
+    backend = MemoryStreamBackend()
+    manager = make_manager(backend, RecordingNotifier())
+    manager.register(
+        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+    )
+    try:
+        assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING})
+        assert await backend.parked_wait_ids(stream_key) == [1]
+
+        await manager.cancel(RUN_ID, 1)
+
+        assert await backend.parked_wait_ids(stream_key) == [], (
+            "the closed wait's intent is still in the backend, advertising a "
+            "park generation Core has discarded"
+        )
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_wait_stops_its_watcher(stream_key: StreamKey) -> None:
+    """Dropping the subscription is what makes an orphaned watcher invisible.
+
+    Once it is out of the Run's map nothing can reach it to notice, and it goes
+    on prefetching into a buffer nobody can drain -- holding a backend
+    connection for the rest of the Worker's life.
+    """
+    backend = MemoryStreamBackend()
+    manager = make_manager(backend, RecordingNotifier())
+    subscription = manager.register(
+        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+    )
+    try:
+        await asyncio.sleep(0.05)
+        assert subscription._watcher is not None and not subscription._watcher.done()
+
+        await manager.cancel(RUN_ID, 1)
+
+        assert subscription._cancelled, "the cancelled subscription must be marked dead"
+        assert subscription._watcher.done(), (
+            "its watcher outlived it, so it is still reading a stream nothing "
+            "is reading back"
+        )
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_from_the_workflow_thread_reaches_a_loop_with_nothing_to_do(
+    stream_key: StreamKey,
+) -> None:
+    """Driven from a real second thread, standing in for the executor.
+
+    ``close()`` runs inside the synchronous ``activate()``, and ``create_task``
+    from there does not raise: the task is appended to the loop's ready queue
+    and the loop is never woken, so it runs only if something else happens to
+    wake the loop. Between activations nothing does -- the watchers are sitting
+    in blocking reads -- which is why the watch block below is long and why the
+    other thread, not this coroutine, is what waits. Awaiting anything with a
+    timeout here would arm a timer, and the wake that timer produces would run
+    the cancel whether or not the loop was ever told about it.
+    """
+    backend = MemoryStreamBackend()
+    manager = make_manager(
+        backend, RecordingNotifier(), watch_block=timedelta(seconds=30)
+    )
+    manager.register(
+        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+    )
+    try:
+        # Long enough for the watcher to settle into its blocking read.
+        await asyncio.sleep(0.1)
+
+        def workflow_thread() -> bool:
+            # Waited out here rather than on the loop, and waited out at all:
+            # a task appended while the loop is still on its way into the
+            # select is picked up on the way in, which hides the missing wake.
+            time.sleep(0.2)
+            manager.cancel_from_workflow_thread(RUN_ID, 1)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if manager.subscription(RUN_ID, 1) is None:
+                    return True
+                time.sleep(0.01)
+            return False
+
+        cancelled = await asyncio.get_running_loop().run_in_executor(
+            None, workflow_thread
+        )
+
+        assert cancelled, (
+            "the cancel was queued onto a loop nothing woke, so a watcher that "
+            "was supposed to stop keeps running with nothing to say so"
+        )
     finally:
         await manager.shutdown()
 

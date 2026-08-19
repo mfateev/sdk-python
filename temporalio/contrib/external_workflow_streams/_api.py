@@ -722,8 +722,8 @@ class ExternalStreamSubscription(Generic[AnyType]):
           the iteration ends with ``StopAsyncIteration`` instead of raising
           ``CancelledError`` into Workflow code that merely closed a stream;
         - records already drained but never handed over are **dropped without
-          being consumed**, so the consumption cursor still points in front of
-          them and a Continue-As-New successor receives them.
+          being consumed**, so the consumption cursor stops short of them and a
+          Continue-As-New successor receives them.
 
         The Worker-side half -- stopping this wait's watcher and removing its
         park intent -- is the manager's, and is reached through the runtime

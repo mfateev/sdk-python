@@ -677,6 +677,34 @@ async def test_readiness_after_a_re_block_names_the_current_generation(
         await manager.shutdown()
 
 
+async def test_a_closed_wait_can_never_re_enter_the_blocked_set(
+    runtime: WorkflowStreamRuntime,
+) -> None:
+    """Closing keeps the wait's state, so the state has to refuse to block again.
+
+    The subscription is deliberately not forgotten -- its binding is what a
+    replay of unchanged code reads, and its cursor is what stops a
+    Continue-As-New successor restarting the stream from the beginning -- which
+    leaves it reachable by ``wait_id`` long after the coroutine that was
+    awaiting it is gone. A wait that could re-enter the blocked set from there
+    would be named by the quiescent snapshot, and Core would go back to
+    retaining -- and eventually parking -- the Workflow Task for nobody.
+    """
+    subscribe(runtime, 1)
+    runtime.note_blocked(1, False)
+    runtime.unsubscribe(1)
+
+    runtime.note_blocked(1, True)
+
+    assert runtime.quiescent_snapshot() is None, (
+        "a closed wait re-entered the quiescent set, so Core is asked to hold "
+        "the Workflow Task open for a wait nothing is awaiting"
+    )
+    # And its binding is still there to be read, which is the whole reason
+    # closing does not simply drop the state.
+    assert set(annotation_of(runtime).header.streams) == {1}  # type: ignore[attr-defined]
+
+
 # --- the byte budget --------------------------------------------------------
 
 

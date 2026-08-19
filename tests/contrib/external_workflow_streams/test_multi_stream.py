@@ -57,18 +57,22 @@ def backend() -> MemoryStreamBackend:
 
 
 class StubManager:
-    def cancel_from_workflow_thread(self, run_id, wait_id):  # type: ignore[no-untyped-def]
-        pass
-
-    """Records registrations and starts no watcher.
+    """Records registrations and cancellations, and starts no watcher.
 
     The snapshot and annotation tests are about what the runtime decides, which
     happens before any watching. A real manager would spawn prefetch loops
     against a backend nothing is writing to, and their failures would be noise.
     """
 
+    def __init__(self) -> None:
+        #: `(run_id, wait_id)` for every wait the runtime asked to stop serving.
+        self.cancelled: list[tuple[str, int]] = []
+
     def register(self, *, run_id, wait_id, stream_key, backend_name, start_cursor):  # type: ignore[no-untyped-def]
         pass
+
+    def cancel_from_workflow_thread(self, run_id, wait_id):  # type: ignore[no-untyped-def]
+        self.cancelled.append((run_id, wait_id))
 
     def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]
         pass
@@ -824,3 +828,32 @@ async def test_closing_a_subscription_ends_its_wait_and_its_iteration(
     # Idempotent: closing twice is not an error, because the ordinary shape is a
     # `finally` that cannot know whether the iterator already ended.
     subscription.close()
+
+
+@pytest.mark.asyncio
+async def test_closing_a_subscription_tells_the_worker_to_stop_serving_it(
+    public_api_runtime: WorkflowStreamRuntime,
+    manager: StubManager,
+) -> None:
+    """Ending the wait is what the Workflow sees; the Worker has to be told too.
+
+    Nothing above this line would notice the message never being sent: iteration
+    ends, the wait leaves the quiescent set, and the Workflow runs on. What is
+    left behind is a watcher still prefetching into a buffer nobody can drain
+    and a park intent still in the backend, and only the manager can take either
+    of them back.
+    """
+    subscription = external_stream.topic(
+        "tokens", backend="tokens", type=str
+    ).subscribe()
+
+    subscription.close()
+
+    assert manager.cancelled == [(RUN_ID, subscription.wait_id)], (
+        "closing left the Worker serving a wait no Workflow code is reading"
+    )
+    # Cancelled once, however often it is closed: by the second call the Worker
+    # has already dropped this wait, and its state here is kept only so that
+    # replay and a Continue-As-New successor can still read it.
+    subscription.close()
+    assert manager.cancelled == [(RUN_ID, subscription.wait_id)]

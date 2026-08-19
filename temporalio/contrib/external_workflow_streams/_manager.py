@@ -1359,8 +1359,9 @@ class StreamSubscriptionManager:
             except Exception:
                 logger.exception(
                     "Could not remove the park intent for %s wait %s while "
-                    "cancelling it; it will be reconciled if this Run is "
-                    "registered again",
+                    "cancelling it; nothing will retry, so producers may go on "
+                    "reading a generation Core has discarded and their wakes "
+                    "will be ignored as stale",
                     subscription.stream_key,
                     subscription.wait_id,
                 )
