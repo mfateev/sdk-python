@@ -168,7 +168,24 @@ class ExternalStreamProducer:
     ) -> None:
         self._backend = backend
         self._workflow = workflow
-        self._data_converter = data_converter
+        #: Bound to the Workflow these records are for, which is the same
+        #: context the consuming Worker decodes them under. The two sides share
+        #: one converter and must therefore share one context: a producer that
+        #: encrypts under no context while the consumer decrypts under a
+        #: Workflow-derived key is a mismatch that the append reports as
+        #: success and that only surfaces on the far side, as a decode failure
+        #: against a configuration that is in fact correct.
+        #:
+        #: A producer is bound to exactly one chain, so this is settled once
+        #: here rather than per topic. `workflow_id` and not a Run: the chain
+        #: key spans Continue-As-New, and a record written for one Run is read
+        #: by its successors.
+        self._data_converter = data_converter.with_context(
+            temporalio.converter.WorkflowSerializationContext(
+                namespace=workflow.namespace,
+                workflow_id=workflow.workflow_id,
+            )
+        )
         self._session_id = session_id
         self._client = client
         self._sequence = 0

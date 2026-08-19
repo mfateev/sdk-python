@@ -669,6 +669,57 @@ async def test_merge_never_yields_control_records(fake_runtime: FakeRuntime) -> 
     assert any(r.is_control for _, r in fake_runtime.consumed)
 
 
+@pytest.mark.asyncio
+async def test_a_replayed_segment_is_yielded_in_its_recorded_order(
+    public_api_runtime: WorkflowStreamRuntime,
+) -> None:
+    """Rotation changes which wait is *asked* first, never what is *served*.
+
+    ``merge`` resumes each pass after the wait that last took a record, and
+    under replay the budget is unbounded, so the passes are not cut where they
+    were cut live and the rotation reaches positions the live run never started
+    from. That is safe only because a replay drain serves from the **front** of
+    the recorded segment and only while the front belongs to the asking wait: a
+    wait asked out of turn is told nothing and the record stays for whoever
+    asks next. Every active wait is still asked exactly once per pass, so the
+    front's owner is always reached and the recorded global order comes out
+    whole.
+
+    A recorded order that interleaves three waits and repeats one of them is
+    what would expose an ask order leaking into a yield order -- and a yield
+    order that differed from History is nondeterminism, which is the one thing
+    a fairness fix may not buy its fairness with.
+    """
+    recorded = [2, 1, 3, 1, 2, 3, 3]
+    subscriptions = [
+        external_stream.topic(name, backend="tokens", type=str).subscribe()
+        for name in ("a", "b", "c")
+    ]
+    assert [s.wait_id for s in subscriptions] == [1, 2, 3]
+    records = await encoded(*(f"r{i}" for i in range(len(recorded))))
+    public_api_runtime.begin_activation()
+    public_api_runtime.begin_replay_segment(
+        [
+            (wait_id, record.placed_at(Offset(f"{index:08d}")))
+            for index, (wait_id, record) in enumerate(zip(recorded, records))
+        ]
+    )
+
+    iterator = merge(*subscriptions)
+    seen: list[tuple[int, str]] = []
+    for _ in recorded:
+        subscription, value = await asyncio.wait_for(iterator.__anext__(), 1)
+        seen.append((subscription.wait_id, value))
+    await iterator.aclose()
+
+    assert [wait_id for wait_id, _ in seen] == recorded, (
+        "the replayed segment came out in an order the live run never "
+        "delivered; the merge is asking in a different order than it recorded "
+        "in and the drain is obliging"
+    )
+    assert [value for _, value in seen] == [f"r{i}" for i in range(len(recorded))]
+
+
 # --- through a real Worker ----------------------------------------------------
 
 

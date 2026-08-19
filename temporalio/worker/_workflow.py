@@ -1231,7 +1231,29 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             # Continue-As-New chain, so a new Run continues the same stream
             # rather than starting a fresh one.
             first_execution_run_id=init.first_execution_run_id,
-            data_converter=self._data_converter,
+            # Bound to the consuming Workflow, the same way `decode_activation`
+            # binds every other payload this activation carries. A converter
+            # that derives a key from the Workflow it serves would otherwise get
+            # the right context for the Workflow's own argument and no context
+            # at all for a stream record delivered in the very same activation.
+            #
+            # Bound *here* rather than inside the runtime's `codec_for`: the
+            # runtime crosses into the Workflow sandbox, and `with_context` runs
+            # user code to clone the component converters -- work that belongs
+            # on this side of the boundary, and that a per-Run handle need do
+            # only once.
+            #
+            # `with_context` and not `_with_contexts`: the store context names
+            # the Workflow as the payload's *storer*, and a stream record is
+            # stored by its producer, not by this Run. `with_context` also
+            # returns the converter unchanged unless a component implements
+            # `WithSerializationContext`, so the default converter is untouched.
+            data_converter=self._data_converter.with_context(
+                temporalio.converter.WorkflowSerializationContext(
+                    namespace=self._namespace,
+                    workflow_id=init.workflow_id,
+                )
+            ),
             default_idle_timeout=DEFAULT_IDLE_TIMEOUT,
             # Read here, before the Workflow object exists and therefore before
             # any subscribe() call: a start cursor restored after a subscription

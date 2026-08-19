@@ -164,6 +164,12 @@ class WorkflowStreamRuntime:
         self._namespace = namespace
         self._workflow_id = workflow_id
         self._first_execution_run_id = first_execution_run_id
+        #: Already bound to this Workflow's `WorkflowSerializationContext` by
+        #: the Worker that built this runtime, so `codec_for` hands Workflow
+        #: code a converter carrying the same context every other payload in the
+        #: activation was converted with. Bound out there rather than in here
+        #: because `with_context` runs user code, and this object lives on the
+        #: far side of the sandbox boundary.
         self._data_converter = data_converter
         self._default_idle_timeout = default_idle_timeout
         self._max_annotation_bytes = max_annotation_bytes
@@ -445,7 +451,9 @@ class WorkflowStreamRuntime:
         self._replay_ready = list(deliveries)
 
     def verify_replay_consumed(self) -> None:
-        """Every recorded delivery must have reached Workflow code.
+        """Everything the marker recorded must have happened again.
+
+        Two things, checked once the last segment has been delivered.
 
         A record in a run was handed to Workflow code during the activation the
         run was recorded in, so a replay that leaves one behind is running
@@ -454,8 +462,59 @@ class WorkflowStreamRuntime:
         marker's records for it would otherwise be discarded in silence -- the
         Workflow reaching its next command having consumed less than History
         says it consumed.
+
+        And every wait the marker *bound* must have been recreated, which is a
+        strictly larger claim: a binding is written for a subscription whether
+        or not anything was ever delivered through it. The first observation has
+        to carry provider identity, stream key, and start cursor even for a
+        stream that stayed quiet for the whole Workflow Task, so a binding with
+        no runs behind it is the ordinary shape of a quiet subscription rather
+        than an exotic one -- and it is invisible to every check that reasons
+        from deliveries.
         """
         self._verify_replay_consumed()
+        # The one check that reads in the other direction. Every other one walks
+        # what the code *did*: :meth:`begin_replay` iterates the subscriptions
+        # that exist and verifies only those the marker also names,
+        # :meth:`register` verifies a wait only when it is registered at all,
+        # and :meth:`_verify_replay_consumed` has nothing to report unless
+        # records were left undelivered. A recorded wait that the code no longer
+        # creates and that the marker holds no records for is therefore reached
+        # by none of them.
+        #
+        # Two removals escape without this, and the second is the worse one:
+        #
+        # - the **last** ``subscribe()`` removed, on a stream that was quiet.
+        #   Nothing renumbers, no records go undelivered, and the replay is
+        #   accepted although the Workflow now holds one subscription fewer than
+        #   History says it did -- with its own live reads never made.
+        # - a **middle** ``subscribe()`` removed where the later waits name the
+        #   same stream and backend. Every survivor renumbers down by one, so
+        #   the binding comparison compares equal for all of them, and the
+        #   records the marker recorded for wait *k* are consumed by what was
+        #   subscription *k+1*: a different cursor, a different consumer, and
+        #   nothing left over for the delivery check to notice.
+        #
+        # Deliberately **not** symmetric, and deliberately not in
+        # :meth:`_verify_replay_consumed`, which :meth:`begin_replay_segment`
+        # also calls before each segment. "every bound wait was registered" is
+        # the invariant; the converse is not, because replay runs the Workflow
+        # forward past the Workflow Task the marker covers, and the
+        # subscriptions it makes there belong to the *next* marker's header. An
+        # added ``subscribe()`` at the end is a supported change and must stay
+        # one.
+        missing = sorted(set(self._replay_bindings or {}) - set(self._subscriptions))
+        if missing:
+            # Row four, not integrity loss: the recorded ranges are exactly
+            # where they were written, and it is the Workflow code that moved.
+            raise temporalio.workflow.NondeterminismError(
+                f"the marker records external stream wait(s) {missing} that this "
+                "Workflow never created. A subscribe() call was removed or "
+                "reordered, which renumbers every later wait and can hand one "
+                "wait's recorded records to another wait's subscription; gate "
+                "the change behind workflow.patched() exactly as a removed "
+                "timer would be."
+            )
 
     def _verify_replay_consumed(self) -> None:
         if not self._replay_ready:

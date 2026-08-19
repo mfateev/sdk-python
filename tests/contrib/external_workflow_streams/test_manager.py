@@ -8,18 +8,21 @@ never reaches the thread ``_apply`` runs on, and that readiness means *buffered*
 from __future__ import annotations
 
 import asyncio
+import inspect
 import threading
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 
 import pytest
 
-from temporalio.contrib.external_workflow_streams._backend import StreamKey
+from temporalio.contrib.external_workflow_streams._backend import ParkIntent, StreamKey
 from temporalio.contrib.external_workflow_streams._errors import (
     StreamStorageError,
 )
 from temporalio.contrib.external_workflow_streams._manager import (
+    PARK_REMOVAL_ATTEMPTS,
     ReadinessResult,
     StreamSubscriptionManager,
 )
@@ -80,6 +83,30 @@ async def append(
         await backend.append(
             key, StreamRecord(RecordKind.DATA, payload, f"s{payload.decode()}", i)
         )
+
+
+async def until(
+    condition: Callable[[], object | Awaitable[object]],
+    message: str,
+    timeout: float = 2.0,
+) -> None:
+    """Waits for something a background task is on its way to doing.
+
+    Retries, reconciliations and watchers all run on the manager's own loop, so
+    a single ``sleep`` long enough to be reliable is also long enough to make
+    every one of these tests slow. Accepts an awaitable condition because most
+    of what is being waited for is a question for the backend.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        outcome = condition()
+        if inspect.isawaitable(outcome):
+            outcome = await outcome
+        if outcome:
+            return
+        if time.monotonic() >= deadline:
+            pytest.fail(message)
+        await asyncio.sleep(0.01)
 
 
 # --- readiness means buffered ------------------------------------------------
@@ -1059,5 +1086,449 @@ async def test_a_failed_park_leaves_no_externally_visible_half(failing: str) -> 
             "advertising a park Core never confirmed"
         )
         assert await backend.parked_wait_ids(second) == []
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_park_takes_back_the_intents_it_had_installed() -> None:
+    """Cancellation is the *most* likely way a half-installed park is abandoned.
+
+    Core withdrawing the activation and the Worker shutting down both arrive as
+    ``CancelledError``, which derives from ``BaseException`` -- so a rollback
+    reached only by ``except Exception`` is skipped for exactly the failures
+    most likely to leave a park half-installed. The intents that stay describe a
+    park Core never confirmed, and the eviction that follows takes the local
+    mirror away while they remain.
+    """
+
+    class Blocking(MemoryStreamBackend):
+        """Holds the second install open, so the first one is already visible."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.reached = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def install_park_intent(self, key, intent):  # type: ignore[no-untyped-def]
+            if intent.wait_id == 2:
+                self.reached.set()
+                await self.release.wait()
+            return await super().install_park_intent(key, intent)
+
+    backend = Blocking()
+    manager = make_manager(backend, RecordingNotifier())
+    key = StreamKey("ns", "wf", "first-run", "tokens")
+    try:
+        manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=key, backend_name="tokens"
+        )
+        manager.register(
+            run_id=RUN_ID, wait_id=2, stream_key=key, backend_name="tokens"
+        )
+        parking = asyncio.get_running_loop().create_task(
+            manager.prepare_park(RUN_ID, 4, {1: BEGINNING, 2: BEGINNING})
+        )
+        await asyncio.wait_for(backend.reached.wait(), 2)
+        assert await backend.parked_wait_ids(key) == [1], (
+            "this case is only meaningful once one intent is installed"
+        )
+
+        parking.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await parking
+
+        assert await backend.parked_wait_ids(key) == [], (
+            "the park was abandoned mid-install and wait 1's intent is still in "
+            "the backend, advertising a park Core never confirmed"
+        )
+    finally:
+        backend.release.set()
+        await manager.shutdown()
+
+
+# --- the removal a failure leaves owed ----------------------------------------
+#
+# A park intent is durable backend state; the manager's knowledge of it is not.
+# `installed_park_generation` is a mirror that only the Worker which installed
+# the park holds, and every removal path reaches its intent *through* the
+# Subscription that carries it -- which the close, the eviction and the hand-off
+# all throw away. So a failed removal recorded on the Subscription is a failed
+# removal recorded on the object the next step discards, and the manager keeps a
+# per-Run ledger of owed removals instead.
+
+
+class FailingRemovals(MemoryStreamBackend):
+    """A backend whose park-intent removals fail on demand.
+
+    ``failures`` counts down, so a test can ask for a single blip or -- with a
+    number no retry can reach -- for a window it closes itself by setting it
+    back to zero.
+    """
+
+    def __init__(self, failures: int = 0) -> None:
+        super().__init__()
+        self.failures = failures
+        self.removal_attempts = 0
+
+    async def remove_park_intent(self, key, wait_id):  # type: ignore[no-untyped-def]
+        self.removal_attempts += 1
+        if self.failures > 0:
+            self.failures -= 1
+            raise ConnectionError("backend unavailable")
+        return await super().remove_park_intent(key, wait_id)
+
+
+async def _nothing_parked(backend: MemoryStreamBackend, key: StreamKey) -> bool:
+    return await backend.parked_wait_ids(key) == []
+
+
+async def _inherit(backend: MemoryStreamBackend, key: StreamKey, run_id: str) -> None:
+    """Leaves behind the intent of a park whose Worker is gone.
+
+    Installed straight into the backend rather than through a manager, because
+    that is exactly what makes it inherited: no mirror of it exists anywhere on
+    the Worker that finds it.
+    """
+    await backend.install_park_intent(
+        key,
+        ParkIntent(wait_id=1, cursor=BEGINNING, park_generation=7, run_id=run_id),
+    )
+
+
+@pytest.mark.asyncio
+async def test_one_blip_does_not_end_the_inherited_park_reconciliation(
+    stream_key: StreamKey,
+) -> None:
+    """Registration is the only moment an inherited intent is looked for.
+
+    It runs at most once per Subscription, so a single transient backend error
+    used to leave the intent installed with nothing left to try it again. What
+    that costs is the invariant's whole point: ``current_park_generation`` goes
+    on answering a generation Core has discarded, and because a parked wake's
+    request ID ignores sender identity the wake naming it is byte-identical to
+    the one that already ended that generation -- so the server deduplicates it
+    and the Workflow is never told about a record that is durably present.
+    """
+    backend = FailingRemovals(failures=1)
+    await _inherit(backend, stream_key, RUN_ID)
+    manager = make_manager(backend, RecordingNotifier())
+    try:
+        manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+
+        await until(
+            lambda: _nothing_parked(backend, stream_key),
+            "the inherited intent is still installed after one failed removal, "
+            "and only another registration of this same wait would try again",
+        )
+        assert backend.removal_attempts >= 2, "the failed removal must be retried"
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_an_inherited_intent_no_retry_could_remove_stays_owed(
+    stream_key: StreamKey,
+) -> None:
+    """Retries are the cheap first line; the ledger is what makes them optional.
+
+    Bounding the retries is only survivable because giving up records the
+    removal rather than forgetting it. Waiting instead for "the next time this
+    wait is registered" is a coincidence of eviction, not a mechanism -- and the
+    Run that most needs the removal is the one cached and blocked on something
+    other than this stream, which never registers this wait again at all.
+    """
+    backend = FailingRemovals(failures=99)
+    await _inherit(backend, stream_key, RUN_ID)
+    manager = make_manager(backend, RecordingNotifier())
+    try:
+        manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+        await until(
+            lambda: backend.removal_attempts >= PARK_REMOVAL_ATTEMPTS,
+            "the reconciliation must exhaust its attempts before the ledger is "
+            "the only thing left holding the removal",
+        )
+        backend.failures = 0
+
+        # Anything that takes this Run's park lock drains it; a resolve is the
+        # one that arrives without any prompting from this wait.
+        await manager.resolve_park(RUN_ID)
+
+        assert await backend.parked_wait_ids(stream_key) == [], (
+            "the reconciliation gave up and nothing remembered the removal, so "
+            "the intent outlives every attempt to take it out"
+        )
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_close_whose_removal_fails_leaves_the_removal_owed(
+    stream_key: StreamKey,
+) -> None:
+    """A close drops the subscription, and used to drop the removal with it.
+
+    Nothing could retry afterwards: the resolve path iterates *registered*
+    subscriptions, eviction and the shutdown sweep remove no intents, and
+    another wait's park cannot touch a per-wait key.
+
+    And the damage is not confined to the closed wait. A stale intent keeps
+    ``parked_wait_ids`` non-empty, which suppresses the unparked-wake fallback
+    for the whole stream: with no live wait parked, the producer sends only the
+    dead generation, Core discards it as stale, and dedup silences every later
+    publish -- so wait 2 here loses its wakes to wait 1's leftover.
+    """
+    backend = FailingRemovals(failures=99)
+    manager = make_manager(backend, RecordingNotifier())
+    try:
+        for wait_id in (1, 2):
+            manager.register(
+                run_id=RUN_ID,
+                wait_id=wait_id,
+                stream_key=stream_key,
+                backend_name="tokens",
+            )
+        assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING, 2: BEGINNING})
+
+        await manager.cancel(RUN_ID, 1)
+
+        assert manager.subscription(RUN_ID, 1) is None, (
+            "the close must still drop the subscription -- one kept registered "
+            "while a removal is retried is an orphaned watcher"
+        )
+        assert await backend.parked_wait_ids(stream_key) == [1, 2], (
+            "this case is only meaningful while the removal is genuinely failing"
+        )
+        backend.failures = 0
+
+        await manager.resolve_park(RUN_ID)
+
+        assert await backend.parked_wait_ids(stream_key) == [], (
+            "the closed wait's intent survived the only path that could still "
+            "have removed it, and it suppresses the unparked wake for wait 2 too"
+        )
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_closing_a_wait_removes_an_intent_it_only_inherited(
+    stream_key: StreamKey,
+) -> None:
+    """The second door, which needs no failure of its own to open.
+
+    ``installed_park_generation`` is set only by a park *this* Worker installed,
+    so for an inherited intent it is ``None`` and the removal short-circuits
+    silently -- the close attempts nothing at all. That is why the close is not
+    a backstop for a reconciliation that has already failed: it is disabled by
+    exactly the condition that made the reconciliation necessary.
+    """
+    backend = FailingRemovals(failures=99)
+    await _inherit(backend, stream_key, RUN_ID)
+    manager = make_manager(backend, RecordingNotifier())
+    try:
+        manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+        await until(
+            lambda: backend.removal_attempts >= PARK_REMOVAL_ATTEMPTS,
+            "the reconciliation must have given up before the close is asked to "
+            "cover for it",
+        )
+        backend.failures = 0
+
+        await manager.cancel(RUN_ID, 1)
+
+        assert await backend.parked_wait_ids(stream_key) == [], (
+            "the close attempted no removal, because the intent it inherited is "
+            "mirrored in no generation of its own"
+        )
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_an_eviction_is_the_last_chance_an_owed_removal_gets(
+    stream_key: StreamKey,
+) -> None:
+    """The ledger and the park lock both go with the Run, so this is where it ends.
+
+    Installed intents are deliberately untouched by the same path: an eviction
+    is not the end of a park, and the intents of one that really is outstanding
+    have to survive the Worker losing the Run. Only a removal already decided on
+    is retried here.
+    """
+    backend = FailingRemovals(failures=99)
+    manager = make_manager(backend, RecordingNotifier())
+    try:
+        for wait_id in (1, 2):
+            manager.register(
+                run_id=RUN_ID,
+                wait_id=wait_id,
+                stream_key=stream_key,
+                backend_name="tokens",
+            )
+        assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING, 2: BEGINNING})
+        await manager.cancel(RUN_ID, 1)
+        backend.failures = 0
+
+        await manager.evict_run(RUN_ID)
+
+        assert await backend.parked_wait_ids(stream_key) == [2], (
+            "wait 1's removal was owed and the Run's last chance to make it went "
+            "unused, while wait 2's outstanding park had to survive"
+        )
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_drain_never_removes_the_intent_of_a_park_that_replaced_it(
+    stream_key: StreamKey,
+) -> None:
+    """An entry records a removal, not the claim that some intent exists.
+
+    A Continue-As-New successor re-uses this stream key with wait ids that start
+    again at 1, so an entry a predecessor Run left behind can name a live park's
+    key. Retiring it on the key alone would take the intent out from under a
+    park that really is outstanding -- manufacturing exactly the unwakeable Run
+    the ledger exists to prevent.
+    """
+    backend = FailingRemovals(failures=99)
+    manager = make_manager(backend, RecordingNotifier())
+    try:
+        manager.register(
+            run_id="run-a", wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+        assert not await manager.prepare_park("run-a", 4, {1: BEGINNING})
+        await manager.cancel("run-a", 1)
+        backend.failures = 0
+
+        # The successor's park, installed directly: what matters is that it is a
+        # different Run's intent sitting at the key run-a still owes a removal
+        # for, not how it got there.
+        await backend.install_park_intent(
+            stream_key,
+            ParkIntent(wait_id=1, cursor=BEGINNING, park_generation=1, run_id="run-b"),
+        )
+
+        await manager.resolve_park("run-a")
+
+        installed = await backend.park_intent(stream_key, 1)
+        assert installed is not None and installed.run_id == "run-b", (
+            "run-a's owed removal was retired against whatever it found, taking "
+            "out the intent of a park run-b is still sitting in"
+        )
+    finally:
+        await manager.shutdown()
+
+
+# --- a wake owed on the live path ---------------------------------------------
+
+
+class CountingWake:
+    """Records the ``wakes_owed`` each attempt would derive its request ID from.
+
+    A retry that re-counts is not a retry: the request ID moves with the
+    counter, so the server deduplicates nothing and answers with a second, empty
+    Workflow Task instead of resolving the wake that may in fact have arrived.
+    """
+
+    def __init__(self, failures: int) -> None:
+        self.failures = failures
+        self.counters: list[int] = []
+        #: Asked at each attempt, for tests about what has happened to the
+        #: subscription by the time an attempt is made. Assigned after the
+        #: manager exists, since that is what it usually asks about.
+        self.observe: Callable[[], object] | None = None
+        self.observed: list[object] = []
+
+    async def __call__(self, subscription) -> None:  # type: ignore[no-untyped-def]
+        self.counters.append(subscription.wakes_owed)
+        if self.observe is not None:
+            self.observed.append(self.observe())
+        if self.failures > 0:
+            self.failures -= 1
+            raise ConnectionError("service unavailable")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_live_wake_is_retried_as_the_same_wake(
+    stream_key: StreamKey,
+) -> None:
+    """One attempt on the live path is one attempt with nothing behind it.
+
+    The watcher has already moved ``prefetch_cursor`` past the buffered record
+    and returns on an empty read, so it never comes back here without a *new*
+    append. ``rearm_ready`` needs the activation the lost wake was supposed to
+    cause. And the idle timer only runs while a Workflow Task is retained, which
+    ``NoOpenWorkflowTask`` says there is not -- so no park handshake happens
+    either. The shutdown sweep already does this correctly, which is why the
+    retry belongs to both and not just to it.
+    """
+    backend = MemoryStreamBackend()
+    notifier = RecordingNotifier(answer=ReadinessResult.NO_OPEN_WORKFLOW_TASK)
+    wake = CountingWake(failures=1)
+    manager = make_manager(backend, notifier, send_wake=wake)
+    try:
+        manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+        await append(backend, stream_key, b"a")
+
+        await until(
+            lambda: len(wake.counters) >= 2,
+            "the failed wake was logged and forgotten; nothing on this path "
+            "ever attempts it again, so the buffered record is never announced",
+        )
+        assert wake.counters == [1, 1], (
+            "the retry derived a different request ID, so it asks for a second "
+            "empty Workflow Task rather than re-sending the wake that was owed"
+        )
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_wake_owed_by_a_vanished_run_is_retried_before_it_is_dropped(
+    stream_key: StreamKey,
+) -> None:
+    """The sharpest sub-case: after the pop there is no backstop at all.
+
+    ``RunNotFound`` takes the subscription out of ``_runs``, and the shutdown
+    sweep is driven by ``_runs`` -- so a wake given up on before that pop is not
+    merely delayed, it is unreachable by every remaining mechanism.
+    """
+    backend = MemoryStreamBackend()
+    notifier = RecordingNotifier(answer=ReadinessResult.RUN_NOT_FOUND)
+    wake = CountingWake(failures=1)
+    manager = make_manager(backend, notifier, send_wake=wake)
+    wake.observe = lambda: manager.subscription(RUN_ID, 1) is not None
+    try:
+        manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+        await append(backend, stream_key, b"a")
+
+        await until(
+            lambda: len(wake.counters) >= 2,
+            "the wake failed once and the subscription was dropped on top of "
+            "it, putting it out of reach of the sweep that would have retried it",
+        )
+        assert wake.counters == [1, 1]
+        assert wake.observed == [True, True], (
+            "an attempt was made after the subscription had already left "
+            "`_runs`, where the sweep that is supposed to back it up cannot "
+            "see it either"
+        )
+        await until(
+            lambda: manager.subscription(RUN_ID, 1) is None,
+            "a Run this Worker no longer holds must still be dropped once the "
+            "wake it owed has been attempted",
+        )
     finally:
         await manager.shutdown()

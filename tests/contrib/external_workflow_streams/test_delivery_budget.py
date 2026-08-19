@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections import Counter
 from datetime import timedelta
 from typing import Any
 
@@ -27,6 +28,7 @@ import pytest
 
 import temporalio.converter
 import temporalio.workflow
+from temporalio.contrib.external_workflow_streams import _runtime as _runtime_module
 from temporalio.contrib.external_workflow_streams._annotation import (
     SegmentEndReason,
     decode_annotation,
@@ -112,6 +114,10 @@ class NeverEmptyManager:
     def __init__(self, payload: bytes) -> None:
         self.payload = payload
         self.max_records_seen: list[int | None] = []
+        #: Every wait the runtime actually asked about. A wait that never
+        #: appears was not merely served nothing -- the Worker was never
+        #: enquired of on its behalf at all.
+        self.drained_waits: list[int] = []
         self.rearmed: list[str] = []
         self._next: dict[int, int] = {}
 
@@ -125,6 +131,7 @@ class NeverEmptyManager:
         self, run_id: str, wait_id: int, max_records: int | None = None
     ) -> list[StreamRecord]:
         self.max_records_seen.append(max_records)
+        self.drained_waits.append(wait_id)
         count = _UNBOUNDED_BATCH if max_records is None else max_records
         start = self._next.get(wait_id, 0)
         self._next[wait_id] = start + count
@@ -430,6 +437,195 @@ async def test_merge_does_not_starve_a_stream_behind_a_saturated_one(
         "whole activation budgets; the busy stream spent every one of them"
     )
     assert len(seen) <= 3 * MAX_RECORDS_PER_ACTIVATION + 1, (
+        "the budget must still bound the merged set as a whole"
+    )
+
+
+# --- fairness across activations ----------------------------------------------
+
+#: The budget the two fairness tests below run against, in place of the real
+#: 256. What they prove is a relationship between the *subscription count* and
+#: the budget -- more ready waits than the budget can pay for, or a count that
+#: does not divide it -- and the real constant only sets the scale at which that
+#: relationship bites. Standing up 257 subscriptions and handing out 768 records
+#: to watch it costs more than the property is worth, and destabilised the
+#: end-to-end tests that share the run.
+_SMALL_BUDGET = 8
+
+
+@pytest.fixture
+def small_budget(monkeypatch: pytest.MonkeyPatch) -> int:
+    """Shrinks the delivery budget for one test, and returns what it is now.
+
+    Patched on ``_runtime`` rather than on ``_api``, which is where the constant
+    is defined: ``_runtime`` binds the name at import, so it reads its own
+    module global, and a patch on the defining module would leave every check
+    that actually enforces the budget looking at 256.
+    """
+    monkeypatch.setattr(_runtime_module, "MAX_RECORDS_PER_ACTIVATION", _SMALL_BUDGET)
+    return _SMALL_BUDGET
+
+
+#: A subscription count that does not divide the budget, at the shrunk scale: 8
+#: records over 3 always-ready waits is two whole passes and two waits of a
+#: third, so the pass is always cut in the middle -- which is the arrangement a
+#: start position fixed at the lowest wait id turns into permanent, growing
+#: unfairness. The real-scale case is 100 waits against 256 records: two whole
+#: passes and 56 waits of a third, the same cut in the same place.
+_SKEWED_STREAMS = 3
+
+#: How many activations the skew is watched over. Whatever the scale, a pass
+#: cut in the middle hands the favoured waits exactly one record more per
+#: activation than the rest, so the gap is the activation count and nothing
+#: bounds it: five is five times the tolerance rather than a coin toss.
+_SKEW_CYCLES = 5
+
+
+async def run_budget_cycles(
+    runtime: WorkflowStreamRuntime,
+    task: asyncio.Task[None],
+    seen: list[Any],
+    cycles: int,
+    budget: int,
+) -> None:
+    """Runs `cycles` whole activations, doing what the Worker's completion does.
+
+    A fresh budget and readiness re-armed for the records the budget left
+    buffered -- which is what makes the next pass a *new activation* rather
+    than a continuation of this one, and so is the only place a start position
+    that never moves can show itself.
+
+    `budget` is passed rather than read from the constant because these callers
+    run against a patched one; a never-empty set delivers exactly that many
+    records per activation, which is how each cycle knows it has finished.
+    """
+    for cycle in range(1, cycles + 1):
+        await settle(task, seen, cycle * budget)
+        runtime.begin_activation()
+        runtime.resolve_all_pending()
+
+
+@pytest.mark.asyncio
+async def test_merge_reaches_a_wait_the_budget_cannot_pay_for_in_one_pass(
+    workflow_instance: FakeInstance,
+    backend: MemoryStreamBackend,
+    small_budget: int,
+) -> None:
+    """More ready subscriptions than one activation has records to hand out.
+
+    The budget is charged per record handed to Workflow code, once per
+    subscription per pass, so a pass over *budget + 1* ready waits runs out
+    exactly one short. A pass that began at the lowest wait id on every
+    activation ran out in the same place on every one of them: the last wait was
+    never yielded, and -- because ``_fill`` returns on the spent budget before it
+    reaches the manager -- never even drained. The Worker was not asked about
+    that stream at all, for the life of the Run.
+
+    Run against a budget of ``_SMALL_BUDGET`` rather than the real 256, because
+    "one more ready wait than the budget can pay for" is the whole property and
+    the constant only says how many that is: at full scale the starved case is
+    257 subscriptions, and it starves for exactly the reason nine do here.
+    """
+    manager = NeverEmptyManager(await encoded("x"))
+    runtime = make_runtime(manager, backend)
+    _install_runtime(workflow_instance, runtime)
+    runtime.begin_activation()
+    # The shrunk budget has to have reached the binding the runtime reads, or
+    # the counts below stand in a relationship to 256 that they were not chosen
+    # for and the test passes without exercising anything.
+    assert runtime.delivery_budget_remaining() == small_budget
+    subscriptions = [
+        external_stream.topic(f"s{i}", backend="tokens", type=str).subscribe()
+        for i in range(small_budget + 1)
+    ]
+    last = subscriptions[-1]
+
+    seen: list[int] = []
+
+    async def consume_merged() -> None:
+        async for subscription, _ in merge(*subscriptions):
+            seen.append(subscription.wait_id)
+
+    task = asyncio.ensure_future(consume_merged())
+    await run_budget_cycles(runtime, task, seen, 3, small_budget)
+    await cancel(task)
+
+    assert last.wait_id in set(seen), (
+        "the wait one past the budget was never yielded across three whole "
+        "activations; every one of them spent itself on the same prefix"
+    )
+    assert last.wait_id in manager.drained_waits, (
+        "the starved wait was never even drained -- the spent budget stopped "
+        "`_fill` before it reached the manager, so the Worker was never asked "
+        "whether that stream had anything at all"
+    )
+    assert len(seen) <= 3 * small_budget, (
+        "the budget must still bound the merged set as a whole"
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_keeps_the_skew_bounded_when_the_count_splits_the_budget(
+    workflow_instance: FakeInstance,
+    backend: MemoryStreamBackend,
+    small_budget: int,
+) -> None:
+    """The general defect, of which total starvation is only the extreme.
+
+    Nothing has to be starved outright for the merge to be unfair: a count that
+    does not divide the budget is enough. At full scale, 256 records over 100
+    always-ready waits leaves the pass cut at the 56th, and a pass that restarted
+    at the lowest wait id was cut there on every activation -- the first 56
+    taking three records per activation and the other 44 taking two, forever. The
+    gap between the best- and worst-served stream then grows by one per
+    activation and nothing bounds it: measured at 8 after eight activations, and
+    it would be 800 after eight hundred.
+
+    Run here at ``_SMALL_BUDGET`` over ``_SKEWED_STREAMS`` waits, which is the
+    same arrangement in miniature -- two whole passes and a cut in the middle of
+    a third -- because what makes the skew unbounded is the remainder, not its
+    size. The gap still grows by exactly one per activation, so
+    ``_SKEW_CYCLES`` activations separate a merge that resumes where the last
+    pass stopped from one that does not.
+
+    Taking at most one record per turn bounds the skew *within* a pass. Only
+    resuming after the wait that last took one bounds it *across* passes, which
+    is what the single-record bound was always claimed to be.
+    """
+    manager = NeverEmptyManager(await encoded("x"))
+    runtime = make_runtime(manager, backend)
+    _install_runtime(workflow_instance, runtime)
+    runtime.begin_activation()
+    # The shrunk budget has to have reached the binding the runtime reads, or
+    # the counts below stand in a relationship to 256 that they were not chosen
+    # for and the test passes without exercising anything.
+    assert runtime.delivery_budget_remaining() == small_budget
+    subscriptions = [
+        external_stream.topic(f"s{i}", backend="tokens", type=str).subscribe()
+        for i in range(_SKEWED_STREAMS)
+    ]
+
+    seen: list[int] = []
+
+    async def consume_merged() -> None:
+        async for subscription, _ in merge(*subscriptions):
+            seen.append(subscription.wait_id)
+
+    task = asyncio.ensure_future(consume_merged())
+    await run_budget_cycles(runtime, task, seen, _SKEW_CYCLES, small_budget)
+    await cancel(task)
+
+    per_wait = Counter(seen)
+    counts = [per_wait[s.wait_id] for s in subscriptions]
+    assert max(counts) - min(counts) <= 1, (
+        f"after {_SKEW_CYCLES} activations the best-served stream had "
+        f"{max(counts)} records and the worst-served {min(counts)}; the skew "
+        "grows by one per activation and is bounded by nothing, so a long-"
+        "running merge reads its later streams arbitrarily far behind its "
+        "earlier ones"
+    )
+    assert min(counts) > 0
+    assert len(seen) <= _SKEW_CYCLES * small_budget, (
         "the budget must still bound the merged set as a whole"
     )
 

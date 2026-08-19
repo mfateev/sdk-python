@@ -48,7 +48,7 @@ import contextlib
 import logging
 import threading
 from collections import deque
-from collections.abc import Awaitable, Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -64,16 +64,16 @@ from temporalio.contrib.external_workflow_streams._errors import (
     StreamError,
     StreamStorageError,
 )
-from temporalio.contrib.external_workflow_streams._replay import (
-    ReplayPlan,
-    ReplaySegment,
-    build_replay_plan,
-)
 from temporalio.contrib.external_workflow_streams._record import (
     AFTER,
     BEGINNING,
     Cursor,
     StreamRecord,
+)
+from temporalio.contrib.external_workflow_streams._replay import (
+    ReplayPlan,
+    ReplaySegment,
+    build_replay_plan,
 )
 from temporalio.contrib.external_workflow_streams._wake import new_sender_identity
 
@@ -175,16 +175,39 @@ Workflow Task, where giving up silently costs the record.
 STALE_RETRY_DELAY = timedelta(milliseconds=50)
 
 SHUTDOWN_WAKE_ATTEMPTS = 3
-"""How many times one owed wake is attempted before it is reported.
+"""How many times one owed wake is attempted before it is given up on.
 
 More than one because a Worker shutting down is often shutting down *because*
 something is unhealthy, so the first attempt is the one most likely to land in
 the middle of it. Bounded because the alternative to giving up is holding
 shutdown open, and the metric exists precisely so that giving up is visible.
+
+Governs the live path too, which owes wakes for exactly the same reason and has
+a far worse backstop: a wake owed *there* is the only thing that will ever
+produce a Workflow Task, so nothing re-attempts it -- see `_send_owed_wake`.
+The name is the shutdown sweep's because that is where the retry started.
 """
 
 SHUTDOWN_WAKE_RETRY_DELAY = timedelta(milliseconds=200)
 """Short enough that three attempts fit comfortably inside the grace period."""
+
+PARK_REMOVAL_ATTEMPTS = 3
+"""How many times an owed park-intent removal is retried in place.
+
+The cheap first line against a momentary backend blip, and *only* that: what
+makes giving up here survivable is the ledger the failure is recorded in, which
+outlives the Subscription and is drained again by the next park, resolve,
+registration, or eviction. Bounded because these retries sit on the close path
+and inside a registration, neither of which may wait on a backend indefinitely.
+"""
+
+PARK_REMOVAL_RETRY_DELAY = timedelta(milliseconds=100)
+"""Shorter than the wake delays: this backs off *between* park-lock holds.
+
+The lock is a Run's park handshake serialization, and `prepare_park` runs inside
+an activation under Core's deadlock timeout, so every millisecond spent backing
+off is a millisecond that budget may have to absorb.
+"""
 
 DEFAULT_SHUTDOWN_GRACE = timedelta(seconds=10)
 """How long the sweep may hold shutdown open.
@@ -278,9 +301,17 @@ class Subscription:
     The manager's mirror of one piece of backend state, kept so the invariant
     *an intent exists only while that park is outstanding* is enforceable from
     here: the manager is the only installer, so it is the only thing that can
-    know an intent is owed a removal. ``None`` means no intent of ours is
-    installed, and the removal path is then free -- which matters because a
-    resolve activation is the ordinary live-delivery path, not a rare one.
+    know an intent is owed a removal. ``None`` means no park *this manager
+    confirmed* is outstanding, and the removal path is then free -- which
+    matters because a resolve activation is the ordinary live-delivery path, not
+    a rare one.
+
+    It is deliberately **not** the only thing that can say a removal is owed.
+    An intent installed by a previous Worker is mirrored nowhere -- the mirror
+    went with the Worker -- and a removal that was attempted and failed is owed
+    after the Subscription holding this field has been dropped. Both live in the
+    manager's per-Run ledger instead; see
+    :meth:`StreamSubscriptionManager._remove_park_intent`.
     """
 
     def __post_init__(self) -> None:
@@ -471,6 +502,29 @@ class PreparedRecord(StreamRecord):
         return out
 
 
+@dataclass(frozen=True)
+class _OwedRemoval:
+    """One park intent this manager knows is installed and no park sits behind.
+
+    Not a Subscription field, and that is the whole point of it. Every removal
+    path this feature has reaches its intent *through* a Subscription -- the
+    resolve iterates the registered ones, the withdrawal walks the ones it just
+    installed, the close works on the one being dropped -- so a failure recorded
+    on the Subscription is a failure recorded on the very object the next step
+    throws away. Carrying the removal separately is what makes "still owed"
+    outlive the close, the eviction, and the Worker that installed nothing.
+
+    The generation and Run ID are what the intent looked like when it was
+    recorded, kept so a delayed retry can tell it apart from a *different*
+    intent that has since taken the same key -- see
+    :meth:`StreamSubscriptionManager._drain_owed_removals`.
+    """
+
+    backend: StreamBackend
+    park_generation: int
+    run_id: str
+
+
 class StreamSubscriptionManager:
     """Every subscription on one Worker, keyed by Run.
 
@@ -538,6 +592,12 @@ class StreamSubscriptionManager:
         self._park_locks: dict[str, asyncio.Lock] = {}
         #: Strong references to the in-flight registration-time reconciliations.
         self._reconciliations: set[asyncio.Task[None]] = set()
+        #: Removals this manager decided on and did not get confirmed, per Run
+        #: and then per `(stream key, wait_id)`. The durable half of the intent
+        #: invariant: a removal that failed is a claim about the *backend*, and
+        #: recording it anywhere that a close or an eviction takes away is the
+        #: same as not recording it at all. Drained under `_park_lock`.
+        self._owed_removals: dict[str, dict[tuple[StreamKey, int], _OwedRemoval]] = {}
 
     # --- registration -------------------------------------------------------
 
@@ -628,12 +688,57 @@ class StreamSubscriptionManager:
         server deduplicates it away. The Workflow then waits forever on a record
         that is durably present.
 
-        Best-effort for the same reason :meth:`resolve_park` is: this is the
-        registration path of a Run that is already running, and a momentary
-        backend failure here must not fail a Workflow Task. The next
-        registration -- the next eviction and pick-up -- asks again.
+        Best-effort in the sense that no failure here reaches a Workflow Task --
+        this is the registration path of a Run that is already running, and a
+        momentary backend failure must not fail one. It is *not* best-effort in
+        the sense of one attempt: the attempts below are the cheap first line
+        against a blip, and once the intent has been read it is recorded in this
+        Run's owed-removal ledger, which every later park, resolve, registration
+        and eviction drains. Waiting for "the next time this wait is registered"
+        is a coincidence of eviction, not a mechanism, and the Run that most
+        needs the removal -- one cached and blocked on something other than this
+        stream -- is precisely the one that never registers it again.
         """
-        async with self._park_lock(subscription.run_id):
+        for attempt in range(PARK_REMOVAL_ATTEMPTS):
+            if subscription._cancelled:
+                # Neither shutdown nor `evict_run` cancels this task -- it is
+                # held in `_reconciliations`, not on the Subscription -- so the
+                # flag they do set is what has to stop the loop. Anything read
+                # by now is in the ledger, and `evict_run` drains that.
+                return
+            if await self._reconcile_inherited_park_once(subscription, attempt):
+                return
+            if attempt + 1 < PARK_REMOVAL_ATTEMPTS:
+                await asyncio.sleep(PARK_REMOVAL_RETRY_DELAY.total_seconds())
+        logger.warning(
+            "Could not reconcile the inherited park intent for %s wait %s in %s "
+            "attempts; it stays in this Run's owed-removal ledger, which the "
+            "next park, resolve, registration or eviction drains",
+            subscription.stream_key,
+            subscription.wait_id,
+            PARK_REMOVAL_ATTEMPTS,
+        )
+
+    async def _reconcile_inherited_park_once(
+        self, subscription: Subscription, attempt: int
+    ) -> bool:
+        """One read-and-remove pass. Returns whether nothing is left to do.
+
+        The lock is taken per attempt rather than held across the backoff
+        between them, because `prepare_park` runs inside an activation under
+        Core's deadlock timeout: a reconciliation that kept this Run's lock
+        while it slept would spend that budget on cleanup for a park that is
+        already over.
+        """
+        run_id = subscription.run_id
+        key = (subscription.stream_key, subscription.wait_id)
+        async with self._park_lock(run_id):
+            # Drained first, because a previous attempt of this same loop may
+            # already have read the intent and failed only to remove it. The
+            # ledger is that retry; re-reading would find exactly what it holds.
+            await self._drain_owed_removals(run_id)
+            if key in self._owed_removals.get(run_id, {}):
+                return False
             if (
                 subscription._cancelled
                 or subscription.installed_park_generation is not None
@@ -641,46 +746,144 @@ class StreamSubscriptionManager:
                 # A park confirmed since this was scheduled is *this* manager's,
                 # and `resolve_park` owns it. Removing it here would take the
                 # intent out from under a park that really is outstanding.
-                return
+                return True
             try:
                 inherited = await subscription.backend.park_intent(
                     subscription.stream_key, subscription.wait_id
                 )
-                if inherited is None:
-                    # The ordinary case, and the reason this is a read before it
-                    # is a write: a Run that never parked owes the backend
-                    # nothing.
-                    return
-                if (
-                    subscription._cancelled
-                    or subscription.installed_park_generation is not None
-                ):
-                    # Asked again across the read, because this Run's state can
-                    # have moved on entirely while it was in flight: evicted and
-                    # picked up again, with a *new* park confirmed for the same
-                    # key. Removing what was found before that would strand the
-                    # park that replaced it.
-                    return
-                logger.info(
-                    "Removing an inherited external stream park intent for %s "
-                    "wait %s: park generation %s was confirmed by a Worker that "
-                    "no longer holds this Run",
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Reading the inherited park intent for %s wait %s failed on "
+                    "attempt %s/%s",
                     subscription.stream_key,
                     subscription.wait_id,
-                    inherited.park_generation,
+                    attempt + 1,
+                    PARK_REMOVAL_ATTEMPTS,
+                    exc_info=True,
                 )
+                return False
+            if inherited is None:
+                # The ordinary case, and the reason this is a read before it
+                # is a write: a Run that never parked owes the backend
+                # nothing.
+                return True
+            if (
+                subscription._cancelled
+                or subscription.installed_park_generation is not None
+            ):
+                # Asked again across the read, because this Run's state can
+                # have moved on entirely while it was in flight: evicted and
+                # picked up again, with a *new* park confirmed for the same
+                # key. Removing what was found before that would strand the
+                # park that replaced it.
+                return True
+            logger.info(
+                "Removing an inherited external stream park intent for %s "
+                "wait %s: park generation %s was confirmed by a Worker that "
+                "no longer holds this Run",
+                subscription.stream_key,
+                subscription.wait_id,
+                inherited.park_generation,
+            )
+            # Owed from the moment it is known to exist, not from the moment a
+            # removal fails: this is the only mirror an inherited intent ever
+            # gets, and without it `_remove_park_intent` goes on short-circuiting
+            # on an empty `installed_park_generation` and every removal path --
+            # the resolve, the withdrawal, the close -- stays disabled for it.
+            self._owe_removal(
+                run_id,
+                key,
+                _OwedRemoval(
+                    backend=subscription.backend,
+                    park_generation=inherited.park_generation,
+                    run_id=inherited.run_id,
+                ),
+            )
+            try:
                 await subscription.backend.remove_park_intent(
                     subscription.stream_key, subscription.wait_id
                 )
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception(
-                    "Failed removing an inherited park intent for %s wait %s; "
-                    "it will be retried the next time this wait is registered",
+                logger.warning(
+                    "Removing the inherited park intent for %s wait %s failed on "
+                    "attempt %s/%s",
                     subscription.stream_key,
                     subscription.wait_id,
+                    attempt + 1,
+                    PARK_REMOVAL_ATTEMPTS,
+                    exc_info=True,
                 )
+                return False
+            self._forget_owed_removal(run_id, key)
+            return True
+
+    def _owe_removal(
+        self, run_id: str, key: tuple[StreamKey, int], record: _OwedRemoval
+    ) -> None:
+        self._owed_removals.setdefault(run_id, {})[key] = record
+
+    def _forget_owed_removal(self, run_id: str, key: tuple[StreamKey, int]) -> None:
+        owed = self._owed_removals.get(run_id)
+        if owed is None:
+            return
+        owed.pop(key, None)
+        if not owed:
+            # Dropped rather than left empty, so a Run that owes nothing costs
+            # nothing to carry and `evict_run` can tell the two apart cheaply.
+            self._owed_removals.pop(run_id, None)
+
+    async def _drain_owed_removals(self, run_id: str) -> None:
+        """Retries every removal this Run still owes. Never raises.
+
+        A ledger entry is not "an intent exists"; it is a removal this manager
+        has already decided on and not had confirmed. That is what makes
+        draining safe from any holder of this Run's park lock rather than only
+        from the path that recorded it: ``remove_park_intent`` is specified
+        idempotent, and the entry retains nothing -- no watcher, no buffer, no
+        connection beyond the backend the removal has to go through.
+
+        The one thing an entry cannot know is whether the intent still at that
+        key is the one it recorded. A Continue-As-New successor re-uses the
+        stream key with wait ids that start again at 1, so an entry a
+        predecessor Run left could name a live park's key. Hence the read: only
+        an intent that still matches what was recorded is removed, and one that
+        does not is forgotten rather than taken out from under whoever installed
+        it. The read narrows that window to a single round trip; the park lock
+        closes it entirely for parks of this same Run.
+        """
+        owed = self._owed_removals.get(run_id)
+        if not owed:
+            return
+        for key, record in list(owed.items()):
+            stream_key, wait_id = key
+            try:
+                installed = await record.backend.park_intent(stream_key, wait_id)
+                if installed is not None and (
+                    installed.park_generation == record.park_generation
+                    and installed.run_id == record.run_id
+                ):
+                    await record.backend.remove_park_intent(stream_key, wait_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Retrying the owed park intent removal for %s wait %s "
+                    "failed; it stays owed",
+                    stream_key,
+                    wait_id,
+                    exc_info=True,
+                )
+                continue
+            self._forget_owed_removal(run_id, key)
+            subscription = self.subscription(run_id, wait_id)
+            if subscription is not None and subscription.stream_key == stream_key:
+                # The mirror is only cleared once the backend agrees, here for
+                # the same reason `_remove_park_intent` does it in that order.
+                subscription.installed_park_generation = None
 
     def _park_lock(self, run_id: str) -> asyncio.Lock:
         """Serializes one Run's park-intent work on the manager's loop.
@@ -860,7 +1063,9 @@ class StreamSubscriptionManager:
                 # runs would otherwise slip past a check that had already
                 # passed, and the retracted records would go into the buffer
                 # anyway. The check stays the last thing before the append.
-                prepared = await self._prepare(records)
+                prepared = await self._prepare(
+                    [(subscription.stream_key, record) for record in records]
+                )
 
                 if subscription._prefetch_epoch != epoch:
                     # Discarded rather than buffered: these were read from a
@@ -874,8 +1079,14 @@ class StreamSubscriptionManager:
         except asyncio.CancelledError:
             pass
 
-    async def _prepare(self, records: list[StreamRecord]) -> list[StreamRecord]:
+    async def _prepare(
+        self, records: Sequence[tuple[StreamKey, StreamRecord]]
+    ) -> list[StreamRecord]:
         """Runs the DataConverter's asynchronous half, here on the Worker's loop.
+
+        Records arrive paired with the stream they came from, because this
+        manager serves every Run on the Worker and the converter has to be bound
+        to the Workflow each individual record belongs to.
 
         Every record is prepared, including ones the Workflow may never take:
         this is the same bargain the Worker already makes for an activation's
@@ -894,23 +1105,58 @@ class StreamSubscriptionManager:
         Control records carry no payload by construction, so they pass through.
         """
         if self._data_converter is None:
-            return records
+            return [record for _, record in records]
         from temporalio.contrib.external_workflow_streams._codec import (
             StreamPayloadCodec,
         )
 
-        # No type: the type belongs to the topic, and the topic belongs to
-        # Workflow code. Nothing out here needs it, because nothing out here
-        # runs the payload converter.
-        codec: StreamPayloadCodec[Any] = StreamPayloadCodec(self._data_converter, None)
+        data_converter = self._data_converter
+        # One codec per Workflow, not one per manager. A converter bound at
+        # construction would be bound to nothing in particular: this manager
+        # outlives every Run on the Worker and prepares records for all of them
+        # at once, so the only correct context is the one the record's own
+        # stream carries.
+        #
+        # `workflow_id` rather than `run_id`, and both taken from the stream key
+        # rather than from a subscription: a stream spans the whole
+        # Continue-As-New chain, so a successor Run must decode its predecessor's
+        # records with the same key -- which is also why `decode_activation`
+        # keys on `workflow_id`.
+        #
+        # Memoized for this call only. Live batches are one stream, replay
+        # batches are one Workflow's waits, so the clone happens per batch
+        # rather than per record; holding the map on the manager instead would
+        # accumulate one entry per Workflow ID the Worker ever served.
+        codecs: dict[tuple[str, str], StreamPayloadCodec[Any]] = {}
+
+        def codec_for(key: StreamKey) -> StreamPayloadCodec[Any]:
+            cached = codecs.get((key.namespace, key.workflow_id))
+            if cached is None:
+                # No type: the type belongs to the topic, and the topic belongs
+                # to Workflow code. Nothing out here needs it, because nothing
+                # out here runs the payload converter.
+                cached = StreamPayloadCodec(
+                    data_converter.with_context(
+                        temporalio.converter.WorkflowSerializationContext(
+                            namespace=key.namespace,
+                            workflow_id=key.workflow_id,
+                        )
+                    ),
+                    None,
+                )
+                codecs[(key.namespace, key.workflow_id)] = cached
+            return cached
+
         prepared: list[StreamRecord] = []
-        for record in records:
+        for key, record in records:
             if record.is_control:
                 prepared.append(record)
                 continue
             try:
                 prepared.append(
-                    PreparedRecord.of(record, await codec.prepare(record.payload), None)
+                    PreparedRecord.of(
+                        record, await codec_for(key).prepare(record.payload), None
+                    )
                 )
             except asyncio.CancelledError:
                 raise
@@ -955,25 +1201,29 @@ class StreamSubscriptionManager:
 
         # Everything left means local readiness could not be delivered, so a
         # Signal is owed. They differ in what happens to the watcher afterwards.
+        #
+        # Counted once, and then retried inside `_send_owed_wake`, because a
+        # single attempt here has nothing behind it. The watcher has already
+        # moved `prefetch_cursor` past the buffered record and returns on `if
+        # not records`, so it never comes back through here without a *new*
+        # append; `rearm_ready` needs the activation this lost wake was supposed
+        # to cause; and the idle timer only runs while a Workflow Task is
+        # retained, which `NoOpenWorkflowTask` says there is not. One failed
+        # attempt was a lost record.
         subscription.wakes_owed += 1
-        if self._send_wake is not None:
-            try:
-                await self._send_wake(subscription)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                # The wake sender reports failure by raising, because a wake
-                # counted as delivered when it was not is the failure this whole
-                # path exists to prevent. `wakes_owed` stays incremented and the
-                # shutdown sweep remains the backstop.
-                logger.exception(
-                    "External stream wake failed for %s wait %s",
-                    subscription.stream_key,
-                    subscription.wait_id,
-                )
+        if not await self._send_owed_wake(subscription):
+            logger.warning(
+                "External stream wake for %s wait %s was not acknowledged; it "
+                "stays owed and the shutdown sweep is the only backstop left",
+                subscription.stream_key,
+                subscription.wait_id,
+            )
 
         if result == ReadinessResult.RUN_NOT_FOUND:
             # The Run is gone from this Worker. Nothing here can serve it again.
+            # Dropped only now, after the retries above: this pop is what takes
+            # the subscription out of `_runs`, and the shutdown sweep iterates
+            # `_runs`, so a wake given up on before it has no backstop at all.
             subscription._cancelled = True
             self._runs.get(subscription.run_id, {}).pop(subscription.wait_id, None)
         # PARKED and NO_OPEN_WORKFLOW_TASK both *keep* the watcher: the Run is
@@ -1069,6 +1319,11 @@ class StreamSubscriptionManager:
         self, run_id: str, park_generation: int, blocked: Mapping[int, Cursor]
     ) -> bool:
         """The handshake itself, under this Run's park lock."""
+        # A park is the one moment this Run is certain to reach a backend, so it
+        # is the cheapest place to retire whatever a previous close or resolve
+        # failed to remove -- and it must happen *before* the installs below,
+        # which would otherwise re-key the entries this is meant to retire.
+        await self._drain_owed_removals(run_id)
         subscriptions = [
             subscription
             for subscription in self.subscriptions(run_id)
@@ -1100,6 +1355,12 @@ class StreamSubscriptionManager:
                     ),
                 )
                 subscription.installed_park_generation = park_generation
+                # A fresh intent at this key supersedes anything owed for it: a
+                # removal recorded against the generation just overwritten would
+                # otherwise be retried against the park now sitting behind it.
+                self._forget_owed_removal(
+                    run_id, (subscription.stream_key, subscription.wait_id)
+                )
                 installed.append(subscription)
 
             became_ready = False
@@ -1109,9 +1370,7 @@ class StreamSubscriptionManager:
                 ):
                     became_ready = True
                     break
-        except asyncio.CancelledError:
-            raise
-        except Exception:
+        except BaseException:
             # A park that failed part-way through is still a park every producer
             # can see. The activation fails and Core confirms nothing, so those
             # intents describe a park that does not exist -- and an eviction then
@@ -1119,7 +1378,18 @@ class StreamSubscriptionManager:
             # keeps "all-or-nothing across the set" true of the failure path too.
             # Removal failures are swallowed: the storage error that got here is
             # the one worth reporting, and anything still installed stays owed
-            # through `installed_park_generation` for the next resolve to retry.
+            # in this Run's ledger for the next drain to retry.
+            #
+            # `BaseException`, not `Exception`, and not with the usual
+            # `except asyncio.CancelledError: raise` above it: cancellation is
+            # the *most* likely way a half-installed park is abandoned -- Core
+            # withdrawing the activation, the Worker shutting down -- and it
+            # derives from `BaseException`, so an `Exception` handler leaves
+            # exactly those intents behind. Deliberately not shielded: a single
+            # `Task.cancel()` still lets this await run to completion, whereas a
+            # shielded rollback would detach and land after `prepare_park` has
+            # released `_park_lock`, where it can strand a newer legitimate
+            # park's intent instead.
             await self._withdraw_park(installed)
             raise
 
@@ -1186,11 +1456,11 @@ class StreamSubscriptionManager:
           identity, so it comes out identical to the wake that already resolved
           that generation and the server deduplicates it away.
 
-        This is the half for parks *this* manager installed, and it is only
-        half. An intent whose installer is gone -- evicted, moved to another
-        Worker, shut down -- leaves no mirror here to remove it by, and is taken
-        out by :meth:`_reconcile_inherited_park` when the wait is registered
-        again instead.
+        This is the half for parks *this* manager installed, plus whatever the
+        Run's owed-removal ledger still holds. An intent whose installer is gone
+        -- evicted, moved to another Worker, shut down -- leaves no mirror here
+        to remove it by, and is put into that ledger by
+        :meth:`_reconcile_inherited_park` when the wait is registered again.
 
         Driven by ``ResolveExternalStreamWaits``, which is Core telling this
         Worker the wait set has moved on -- the one event that covers both ways a
@@ -1199,29 +1469,67 @@ class StreamSubscriptionManager:
 
         Failure is logged rather than raised. The removal is cleanup, and turning
         a momentary backend blip into a failed Workflow Task on the *delivery*
-        path would trade a stale intent for a repeated Workflow Task. The
-        generation stays recorded, so the next resolve retries it.
+        path would trade a stale intent for a repeated Workflow Task. It stays
+        in the ledger, so the next drain retries it.
         """
         async with self._park_lock(run_id):
+            # Ahead of the registered waits, because the ledger is the only
+            # thing that still names a wait this Run has closed -- and a stale
+            # intent on a closed wait is not confined to it: it keeps
+            # `parked_wait_ids` non-empty, which suppresses the unparked wake
+            # for the whole stream and silences every live wait on it.
+            await self._drain_owed_removals(run_id)
             for subscription in self.subscriptions(run_id):
                 try:
                     await self._remove_park_intent(subscription)
                 except Exception:
                     logger.exception(
                         "Failed removing the resolved park intent for %s wait %s; "
-                        "it will be retried when this Run's waits next resolve",
+                        "it stays in this Run's owed-removal ledger, which the "
+                        "next park, resolve, registration or eviction drains",
                         subscription.stream_key,
                         subscription.wait_id,
                     )
 
     async def _remove_park_intent(self, subscription: Subscription) -> None:
-        """Removes one installed intent, and forgets it only once it is gone."""
-        if subscription.installed_park_generation is None:
-            return
+        """Removes one installed intent, and forgets it only once it is gone.
+
+        Two things can say an intent is installed, and either one is enough.
+        ``installed_park_generation`` is the mirror of a park *this* manager
+        confirmed. The ledger is a removal already decided on and not yet
+        confirmed -- including every inherited intent, which is mirrored nowhere
+        because the Worker that installed it is gone. Keying on the mirror alone
+        is what left `resolve_park`, `_withdraw_park` and `cancel` all silently
+        doing nothing for exactly the intents that most need reaching.
+
+        No read guards this one, unlike :meth:`_drain_owed_removals`: it is
+        reached only with a Subscription of a Run this Worker still holds, under
+        that Run's park lock, so the successor Run whose intent a stale entry
+        could name does not exist yet.
+        """
+        run_id = subscription.run_id
+        key = (subscription.stream_key, subscription.wait_id)
+        if key not in self._owed_removals.get(run_id, {}):
+            if subscription.installed_park_generation is None:
+                return
+            # Recorded before the call rather than after it fails: a removal
+            # that never comes back -- the backend raised, or this task was
+            # cancelled mid-await -- is owed either way, and the Subscription
+            # this was reached through is frequently dropped in the same breath.
+            self._owe_removal(
+                run_id,
+                key,
+                _OwedRemoval(
+                    backend=subscription.backend,
+                    park_generation=subscription.installed_park_generation,
+                    run_id=run_id,
+                ),
+            )
         await subscription.backend.remove_park_intent(
             subscription.stream_key, subscription.wait_id
         )
         subscription.installed_park_generation = None
+        self._forget_owed_removal(run_id, key)
 
     async def prepare_replay(self, run_id: str, replay_annotation: bytes) -> ReplayPlan:
         """Reads and validates every recorded range, before any delivery.
@@ -1262,7 +1570,16 @@ class StreamSubscriptionManager:
                     (wait_id, prepared)
                     for (wait_id, _), prepared in zip(
                         segment.deliveries,
-                        await self._prepare([r for _, r in segment.deliveries]),
+                        # The annotation header is the only place a replayed
+                        # record's stream is written down: the Workflow has not
+                        # run far enough to have re-created the subscription
+                        # that would otherwise carry it.
+                        await self._prepare(
+                            [
+                                (stream_keys[wait_id], record)
+                                for wait_id, record in segment.deliveries
+                            ]
+                        ),
                     )
                 )
             )
@@ -1341,30 +1658,57 @@ class StreamSubscriptionManager:
     async def cancel(self, run_id: str, wait_id: int) -> None:
         """Cancels one subscription: remove its intent, drop its buffer, stop it.
 
-        The intent is removed **here**, not left to the resolve path. That path
-        can afford to log a failure and try again because the subscription stays
-        registered; this one drops it, so nothing later can retry and an intent
-        left behind is left behind for good. A stale intent is what
-        `current_park_generation` answers to every producer that asks, and a
-        producer naming a generation Core has discarded sends a wake Core
-        ignores as stale -- the record is appended, the Signal is sent, and the
-        Workflow is never woken.
+        The subscription leaves the Run's map **first**, so a close always stops
+        the watcher. Keeping a cancelled subscription registered while a removal
+        is retried would resurrect the orphaned-watcher bug from the other
+        direction: it goes on prefetching into a buffer nothing can drain, for
+        the rest of the Worker's life.
+
+        What makes dropping it safe is that the removal no longer lives *on* it.
+        It is attempted here, retried a bounded number of times, and whatever is
+        still owed after that stays in this Run's ledger -- which outlives the
+        subscription and is drained by the next park, resolve, registration or
+        eviction. Before that ledger existed there was no retry at all: the
+        resolve path iterates registered subscriptions, eviction and the
+        shutdown sweep remove no intents, and another wait's park cannot touch a
+        per-wait key, so an intent left behind here was left behind for good.
+
+        And it is not confined to the closed wait. A stale intent keeps
+        `parked_wait_ids` non-empty, which suppresses the unparked-wake fallback
+        for the **whole stream**: with no live wait parked, the producer sends
+        only the dead generation, Core discards it as stale, and dedup silences
+        every later publish -- so live waits across the Continue-As-New chain
+        lose their wakes too.
         """
         subscription = self._runs.get(run_id, {}).pop(wait_id, None)
         if subscription is None:
             return
-        async with self._park_lock(run_id):
-            try:
-                await self._remove_park_intent(subscription)
-            except Exception:
-                logger.exception(
-                    "Could not remove the park intent for %s wait %s while "
-                    "cancelling it; nothing will retry, so producers may go on "
-                    "reading a generation Core has discarded and their wakes "
-                    "will be ignored as stale",
-                    subscription.stream_key,
-                    subscription.wait_id,
-                )
+        for attempt in range(PARK_REMOVAL_ATTEMPTS):
+            async with self._park_lock(run_id):
+                try:
+                    await self._remove_park_intent(subscription)
+                    break
+                except Exception:
+                    logger.warning(
+                        "Removing the park intent for %s wait %s while closing "
+                        "it failed on attempt %s/%s",
+                        subscription.stream_key,
+                        subscription.wait_id,
+                        attempt + 1,
+                        PARK_REMOVAL_ATTEMPTS,
+                        exc_info=True,
+                    )
+            if attempt + 1 < PARK_REMOVAL_ATTEMPTS:
+                await asyncio.sleep(PARK_REMOVAL_RETRY_DELAY.total_seconds())
+        else:
+            logger.warning(
+                "Could not remove the park intent for %s wait %s while closing "
+                "it; it stays in this Run's owed-removal ledger, and until a "
+                "drain retires it producers read a generation Core has "
+                "discarded and their wakes are ignored as stale",
+                subscription.stream_key,
+                subscription.wait_id,
+            )
         await self._stop(subscription)
 
     async def evict_run(self, run_id: str) -> None:
@@ -1373,8 +1717,19 @@ class StreamSubscriptionManager:
         The same path serves eviction, Workflow Task failure mid-batch, and
         shutdown, because all three leave exactly the same thing behind:
         speculative reads that were never committed.
+
+        It is also the last chance any owed removal gets on this Worker: the
+        ledger and the lock both go with the Run here, so what is not retired
+        now is left to the next Worker's registration-time reconciliation.
+        Installed intents are deliberately untouched -- an eviction is not the
+        end of a park, and the intents of a park that really is outstanding must
+        survive it.
         """
         self._replay_plans.pop(run_id, None)
+        if self._owed_removals.get(run_id):
+            async with self._park_lock(run_id):
+                await self._drain_owed_removals(run_id)
+        self._owed_removals.pop(run_id, None)
         self._park_locks.pop(run_id, None)
         for subscription in self._runs.pop(run_id, {}).values():
             await self._stop(subscription)
@@ -1527,26 +1882,48 @@ class StreamSubscriptionManager:
         sits unannounced in a stream would make the wakeup-durability boundary
         false.
 
-        Retried because the common failure here is a momentary one -- a Worker
-        shutting down is often shutting down *because* something is unhealthy,
-        and the first attempt lands in the middle of it. The retry is safe and is
-        not a second wake: the request ID is derived from the wake's identity, so
-        the server deduplicates it against the attempt that may in fact have
-        arrived. The grace period bounds the whole sweep, so this cannot extend
-        shutdown past it.
+        The grace period bounds the whole sweep, so the retries cannot extend
+        shutdown past it, and a wake that never lands is reported rather than
+        dropped -- which is the only thing that makes giving up acceptable.
         """
         subscription.wakes_owed += 1
-        if self._send_wake is None:
+        if not await self._send_owed_wake(subscription):
             self._record_shutdown_wake_failure(subscription)
-            return
 
+    async def _send_owed_wake(self, subscription: Subscription) -> bool:
+        """Sends the one wake ``wakes_owed`` already counts. Returns whether it landed.
+
+        **The count belongs to the caller, and it is made exactly once, before
+        this is entered.** The wake's request ID is derived from it, so a retry
+        that re-counted would derive a *different* ID: the server would dedupe
+        nothing and answer with a second, empty Workflow Task, which is a
+        different thing from re-sending the wake that may in fact have arrived.
+        Every attempt below is therefore the same wake, which is precisely what
+        makes re-sending it safe.
+
+        Retried because the common failure is a momentary one, and because both
+        callers have the same problem if it is not: on the live path nothing
+        re-attempts an owed wake at all, and on the shutdown path the process is
+        about to exit.
+
+        Nothing but `CancelledError` leaves here. The live caller is reached
+        from the watcher loop, which an escaping exception would end for good --
+        taking every later record on that subscription with it.
+        """
+        if self._send_wake is None:
+            return False
         for attempt in range(SHUTDOWN_WAKE_ATTEMPTS):
             try:
                 await self._send_wake(subscription)
-                return
+                return True
+            except asyncio.CancelledError:
+                raise
             except Exception:
+                # The wake sender reports failure by raising, because a wake
+                # counted as delivered when it was not is the failure this whole
+                # path exists to prevent.
                 logger.warning(
-                    "External stream shutdown wake attempt %s/%s failed for %s wait %s",
+                    "External stream wake attempt %s/%s failed for %s wait %s",
                     attempt + 1,
                     SHUTDOWN_WAKE_ATTEMPTS,
                     subscription.stream_key,
@@ -1555,7 +1932,7 @@ class StreamSubscriptionManager:
                 )
                 if attempt + 1 < SHUTDOWN_WAKE_ATTEMPTS:
                     await asyncio.sleep(SHUTDOWN_WAKE_RETRY_DELAY.total_seconds())
-        self._record_shutdown_wake_failure(subscription)
+        return False
 
     def _record_shutdown_wake_failure(self, subscription: Subscription) -> None:
         """Surfaces the wake that could not be acknowledged.

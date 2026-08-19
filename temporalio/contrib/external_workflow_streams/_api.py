@@ -331,7 +331,8 @@ async def merge(
     the set would then fire against a Workflow that was not actually idle.
 
     Each pass takes **at most one record from each subscription**, in ``wait_id``
-    order. Both halves of that are load-bearing:
+    order, resuming after the subscription that last took one. All three of
+    those are load-bearing:
 
     - *In ``wait_id`` order*, which is what makes the interleaving reproduce.
       Records that arrived in one batch across two streams have no inherent
@@ -347,10 +348,18 @@ async def merge(
       the lowest ``wait_id`` spend the entire
       :py:data:`MAX_RECORDS_PER_ACTIVATION` budget by itself, and the next
       activation starts the same pass in the same order, so a continuously
-      backlogged first stream starves every later one forever. Because no
-      subscription may take a second record before every other ready one has
-      taken its first, the skew between any two streams is bounded by a single
-      record and no rotating start position is needed to keep it fair.
+      backlogged first stream starves every later one forever.
+    - *Resuming after the last take*, which is what makes "at most one each" add
+      up to fairness across activations rather than only within a pass. The
+      budget covers the merged set, so a pass can be cut anywhere inside it, and
+      a pass that always restarted at the lowest wait id would be cut in the
+      same place every activation and re-privilege the same prefix forever. With
+      257 ready subscriptions the 257th is never asked at all -- ``_fill``
+      returns on the spent budget before it reaches the manager, so that wait is
+      not merely served nothing, it is never enquired after. With 100 the first
+      56 take one record per activation more than the rest, and the gap grows
+      without bound. Rotating the start is what makes the skew between any two
+      continuously ready streams what it is claimed to be: a single record.
 
     A control record spends the subscription's turn: it is consumed, because it
     occupies an offset inside a run, and the pass moves on. Filling one record
@@ -380,6 +389,20 @@ async def merge(
             "would deliver every record to it twice"
         )
 
+    # The wait that last took a record, so the next pass resumes after it rather
+    # than restarting at the lowest wait id.
+    #
+    # Local to this generator, recorded nowhere, and that is what makes it
+    # replay-safe rather than merely convenient. Replay serves a drain from the
+    # **front** of the recorded segment and only while that front belongs to the
+    # asking wait, so a wait asked out of turn gets nothing and the record stays
+    # for whoever asks next. Every active wait is still asked exactly once per
+    # pass, so the yielded sequence is the recorded global order whatever
+    # position the pass starts at. Under replay the budget is unbounded, so
+    # passes are not cut where they were cut live and this cursor generally ends
+    # up somewhere else than it did -- which steers nothing but *later live*
+    # fairness, and no live schedule was ever recorded for History to contradict.
+    resume_after = 0
     while True:
         # A closed subscription leaves the set rather than blocking it: it has
         # no coroutine behind it, so including it in the wait would ask Core to
@@ -387,13 +410,24 @@ async def merge(
         active = [s for s in ordered if not s._finished]
         if not active:
             return
+        # The first wait past the last take, wrapping to the front when there is
+        # none -- which is also what happens when the wait the cursor named has
+        # since closed and left the set.
+        start = next((i for i, s in enumerate(active) if s.wait_id > resume_after), 0)
         delivered_any = False
-        for subscription in active:
+        for step in range(len(active)):
+            subscription = active[(start + step) % len(active)]
             subscription._fill(1)
             record = subscription._peek()
             if record is None:
                 continue
             delivered_any = True
+            # Advanced only where a record was actually taken, control records
+            # included, because those spend the turn and the budget too. A wait
+            # that had nothing has not had its turn, and moving the cursor past
+            # it would cost it the turn it never got -- which is the starvation
+            # this exists to end, reintroduced from the other side.
+            resume_after = subscription.wait_id
             if record.is_control:
                 subscription._commit(record)
                 continue
