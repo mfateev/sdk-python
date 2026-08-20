@@ -937,9 +937,18 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             # error or an integrity violation surfaces from here through the
             # activation-failure path rather than as a deadlock timeout, which
             # would misattribute a storage problem to the Workflow's own code.
-            await self._stream_manager().prepare_replay(
+            plan = await self._stream_manager().prepare_replay(
                 act.run_id, replay.replay_annotation
             )
+            # The other half of the same record's decoding. `prepare_replay`
+            # bound the codec to the stream key the *marker* recorded; the
+            # converter that runs inside `activate()` would otherwise stay bound
+            # to this Run's identity, and an offline `Replayer` supplies its own
+            # namespace for that -- one record, two Workflow identities. Bound
+            # out here for the reason `_create_external_stream_runtime` gives:
+            # `with_context` clones the user's component converters, and the
+            # runtime crosses into the Workflow sandbox.
+            runtime.install_replay_converters(self._replay_stream_converters(plan))
             return None
 
         if park is None and finalize is None:
@@ -1003,6 +1012,40 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
                 runtime.add_terminal()
             )
         return completion
+
+    def _replay_stream_converters(
+        self, plan: Any
+    ) -> dict[int, temporalio.converter.DataConverter]:
+        """One converter per wait the marker binds, in the recorded context.
+
+        From the annotation's header, which is the only place a replayed
+        record's stream is written down -- the Workflow has not run far enough
+        to have re-created the subscription that would otherwise carry it.
+
+        Bound from the Worker's own converter rather than from the runtime's,
+        which is already bound to this Run: a second `with_context` over the
+        first would ask a user's component converter to rebind itself, and
+        nothing in the protocol promises that composes.
+
+        Memoized per ``(namespace, workflow_id)`` exactly as the manager's own
+        preparation is, so a marker binding several waits of one Workflow clones
+        the component converters once rather than once per wait.
+        """
+        bound: dict[tuple[str, str], temporalio.converter.DataConverter] = {}
+        converters: dict[int, temporalio.converter.DataConverter] = {}
+        for wait_id, binding in plan.annotation.header.streams.items():
+            key = binding.stream_key
+            cached = bound.get((key.namespace, key.workflow_id))
+            if cached is None:
+                cached = self._data_converter.with_context(
+                    temporalio.converter.WorkflowSerializationContext(
+                        namespace=key.namespace,
+                        workflow_id=key.workflow_id,
+                    )
+                )
+                bound[(key.namespace, key.workflow_id)] = cached
+            converters[wait_id] = cached
+        return converters
 
     def _stream_manager(self) -> Any:
         """The Worker's subscription manager, created on first use.

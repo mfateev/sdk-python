@@ -118,8 +118,16 @@ class ExternalStreamRuntime(Protocol):
         """
         ...
 
-    def codec_for(self, value_type: type | None) -> StreamPayloadCodec[Any]:
-        """The Workflow's DataConverter, bound to a topic's declared type."""
+    def codec_for(
+        self, value_type: type | None, wait_id: int
+    ) -> StreamPayloadCodec[Any]:
+        """The Workflow's DataConverter, bound to a topic's declared type.
+
+        ``wait_id`` selects the *context* the converter carries. It is this
+        Run's own for a live record, and the one the marker recorded for a wait
+        a replayed record arrives on -- which an offline ``Replayer``, running
+        under its own namespace, is not otherwise able to reproduce.
+        """
         ...
 
     def new_readiness_future(self) -> asyncio.Future[None]:
@@ -791,7 +799,11 @@ class ExternalStreamSubscription(Generic[AnyType]):
         that is never delivered must not fail anything.
         """
         assert self._state.runtime is not None
-        codec = self._state.runtime.codec_for(self._topic.value_type)
+        # By wait, not by Run: the asynchronous half ran under the stream key
+        # the record's own wait was bound to, and on replay that key comes from
+        # the marker rather than from this Run's identity. Passing the wait is
+        # what lets the two halves agree.
+        codec = self._state.runtime.codec_for(self._topic.value_type, self._wait_id)
         prepared = getattr(record, "prepared_payload", None)
         failed = getattr(record, "prepare_error", None)
         try:

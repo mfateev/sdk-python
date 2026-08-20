@@ -59,6 +59,7 @@ from temporalio.contrib.external_workflow_streams._codec import StreamPayloadCod
 from temporalio.contrib.external_workflow_streams._continuation import Continuation
 from temporalio.contrib.external_workflow_streams._errors import (
     ExternalStreamCapacityError,
+    StreamStorageError,
 )
 from temporalio.contrib.external_workflow_streams._manager import (
     StreamSubscriptionManager,
@@ -286,6 +287,11 @@ class WorkflowStreamRuntime:
         #: only for the length of one replay job, which is what makes a
         #: registration made during it checkable against what was recorded.
         self._replay_bindings: dict[int, StreamBinding] | None = None
+        #: `wait_id -> the converter a *recorded* wait's records convert with`.
+        #: Installed by the Worker before a replay job reaches this thread; see
+        #: :meth:`install_replay_converters` for why it exists and why it is not
+        #: torn down when the replay ends.
+        self._replay_converters: dict[int, temporalio.converter.DataConverter] = {}
         #: Records this activation has put into Workflow code's hands, whether by
         #: delivering them or by starting with them already in a ready list.
         #: Counted here rather than per subscription because the cap is an
@@ -625,14 +631,25 @@ class WorkflowStreamRuntime:
                 point at which the answer is still "do not make this
                 subscription" rather than "this Workflow Task cannot be
                 completed".
+            temporalio.workflow.NondeterminismError: This wait's stream or
+                backend is not the one the predecessor Run recorded it against
+                -- see :meth:`restored_start`.
+            StreamStorageError: The backend this wait names no longer resolves to
+                the provider the predecessor read it through.
         """
-        if start_cursor is None:
-            start_cursor = self.restored_start(wait_id, stream_key.stream_name)
         if backend_name not in self._backends:
             known = ", ".join(sorted(self._backends)) or "<none>"
             raise KeyError(
                 f"no external stream backend named {backend_name!r} is registered on "
                 f"this Worker; registered backends are: {known}"
+            )
+        # Resolved before the cursor is restored, because restoration compares
+        # the predecessor's provider declaration against the backend this name
+        # now names: a name that resolves to nothing is a Worker configuration
+        # error and has to be reported as itself.
+        if start_cursor is None:
+            start_cursor = self.restored_start(
+                wait_id, stream_key.stream_name, backend_name
             )
         if self._replay_bindings is not None:
             # A subscription made while a marker is being replayed -- which is
@@ -719,6 +736,39 @@ class WorkflowStreamRuntime:
     def take_replay_plan(self) -> ReplayPlan | None:
         """The plan prepared for this Run, if a replay job is being delivered."""
         return self._manager.take_replay_plan(self._run_id)
+
+    def install_replay_converters(
+        self, converters: Mapping[int, temporalio.converter.DataConverter]
+    ) -> None:
+        """The context a recorded wait's records must be *converted* with.
+
+        Called on the Worker's loop, before the replay job reaches this thread,
+        because the converters are produced by ``with_context`` -- user code
+        that clones the component converters, and that this side of the sandbox
+        boundary must not run. See ``_handle_external_stream_jobs``.
+
+        The asynchronous half of decoding is already bound this way: the manager
+        prepares a replayed record under the *annotation's* stream key rather
+        than under anything the running Run knows, because the Workflow has not
+        run far enough to have re-created the subscription. Leaving the
+        synchronous half on the runtime's own converter converts one record
+        under two different Workflow identities, which is not hypothetical: an
+        offline ``Replayer`` runs under ``ReplayNamespace`` by default, so a
+        converter keyed on the namespace decodes a valid history to a different
+        value or refuses it outright. The same accommodation
+        :meth:`_verify_binding` makes for a replay harness's namespace, applied
+        to conversion.
+
+        Merged rather than replaced, and deliberately **not** cleared when the
+        replay ends. Delivery is not consumption: a batch drained during replay
+        can be consumed over several later activations, and the record's context
+        is a property of where it was recorded rather than of the marker that
+        happened to still be open. Keeping the entry costs nothing on a live
+        Worker -- a wait's stream key is the Run's own identity, so the recorded
+        context *is* the runtime's -- and the two only differ under a replay
+        harness, which delivers nothing live to mis-convert.
+        """
+        self._replay_converters.update(converters)
 
     def begin_replay(self, bindings: Mapping[int, StreamBinding]) -> None:
         """Holds the marker's bindings open, and checks the ones already made.
@@ -910,8 +960,16 @@ class WorkflowStreamRuntime:
         self._replay_ready = None
         self._replay_bindings = None
 
-    def codec_for(self, value_type: type | None) -> StreamPayloadCodec[Any]:
-        return StreamPayloadCodec(self._data_converter, value_type)
+    def codec_for(
+        self, value_type: type | None, wait_id: int
+    ) -> StreamPayloadCodec[Any]:
+        # The recorded context wins wherever one was installed, so that both
+        # halves of a replayed record's decoding see the same Workflow identity.
+        # Everything else -- every live record, and every wait no marker bound --
+        # converts with this Run's own converter, which is the same object the
+        # activation's other payloads used.
+        converter = self._replay_converters.get(wait_id, self._data_converter)
+        return StreamPayloadCodec(converter, value_type)
 
     def new_readiness_future(self) -> asyncio.Future[None]:
         """A future belonging to the Workflow's own deterministic event loop."""
@@ -1279,23 +1337,56 @@ class WorkflowStreamRuntime:
         and the observation delta covering these deliveries commits on that same
         path, so a continuation taken from the last *marker* would restart the
         successor at a stale cursor and lose the final segment.
+
+        Carried with each cursor is the whole binding it is a position in --
+        stream, backend, and the provider identity that backend declares -- and
+        it is taken from :meth:`_binding`, the same place the annotation header
+        takes it from. An offset means nothing outside the store that produced
+        it, so a successor that resumed on the wait number alone could hand it
+        to a store that never held those records.
         """
+        bindings = {
+            wait_id: self._binding(state)
+            for wait_id, state in self._subscriptions.items()
+        }
         return Continuation(
             cursors={
                 wait_id: state.consumption_cursor
                 for wait_id, state in self._subscriptions.items()
             },
             stream_names={
-                wait_id: state.stream_key.stream_name
-                for wait_id, state in self._subscriptions.items()
+                wait_id: binding.stream_key.stream_name
+                for wait_id, binding in bindings.items()
+            },
+            backend_names={
+                wait_id: binding.backend_name for wait_id, binding in bindings.items()
+            },
+            provider_ids={
+                wait_id: binding.provider_id for wait_id, binding in bindings.items()
+            },
+            provider_format_versions={
+                wait_id: binding.provider_format_version
+                for wait_id, binding in bindings.items()
             },
         )
 
-    def restored_start(self, wait_id: int, stream_name: str) -> Cursor:
+    def restored_start(
+        self, wait_id: int, stream_name: str, backend_name: str
+    ) -> Cursor:
         """The start cursor for a subscription, from the predecessor Run if any.
 
         ``BEGINNING`` on a first execution -- the same field, filled the same
         way, so replay reads an explicit boundary in either case.
+
+        The whole binding is compared before the cursor is handed back, because
+        a cursor is a position *in one store* and every other store will accept
+        it as if it were a position in theirs. This is the Continue-As-New
+        counterpart of :meth:`_verify_binding`, and it is split the same way:
+        the stream and the backend are what Workflow code chose, so a change
+        there is nondeterminism, while the provider behind a backend name is a
+        deployment fact and a change there is a storage failure. Both are raised
+        before the cursor reaches the manager, so no backend ever reads at a
+        boundary that was not produced against it.
         """
         if self._continuation is None:
             return BEGINNING
@@ -1304,11 +1395,10 @@ class WorkflowStreamRuntime:
             # A subscription the predecessor did not have. Safe: adding one on a
             # path the chain has not reached yet is the supported change.
             return BEGINNING
+        # Row four of the taxonomy, not integrity loss: the cursor is exactly
+        # what the predecessor committed, and it is the Workflow code that moved.
         recorded = self._continuation.stream_names.get(wait_id, "")
         if recorded and recorded != stream_name:
-            # Row four of the taxonomy, not integrity loss: the cursor is
-            # exactly what the predecessor committed, and it is the Workflow
-            # code that moved.
             raise temporalio.workflow.NondeterminismError(
                 f"the predecessor Run recorded external stream wait {wait_id} "
                 f"on stream {recorded!r}, but this Run subscribes it to "
@@ -1316,7 +1406,67 @@ class WorkflowStreamRuntime:
                 "reordered, which renumbers every later wait; gate the change "
                 "behind workflow.patched() exactly as an inserted timer would be."
             )
+        recorded_backend = self._continuation.backend_names.get(wait_id, "")
+        if recorded_backend and recorded_backend != backend_name:
+            raise temporalio.workflow.NondeterminismError(
+                f"the predecessor Run recorded external stream wait {wait_id} "
+                f"against backend {recorded_backend!r}, but this Run subscribes "
+                f"it against {backend_name!r}. The restored cursor is a position "
+                f"in {recorded_backend!r} and names nothing in {backend_name!r}, "
+                "which would resume the stream at an unrelated boundary; gate "
+                "the change behind workflow.patched() exactly as an inserted "
+                "timer would be."
+            )
+        self._verify_restored_provider(wait_id, backend_name)
         return restored
+
+    def _verify_restored_provider(self, wait_id: int, backend_name: str) -> None:
+        """Whether the name still resolves to what produced the cursor.
+
+        A deployment question rather than a Workflow one, and classified exactly
+        as :meth:`StreamSubscriptionManager._replay_backend` classifies it: the
+        Workflow is unchanged and neither store is damaged, so it is a storage
+        failure -- retried, and it clears when a Worker carrying the recorded
+        implementation picks the task up.
+
+        Marker replay makes this check for every recorded range it reads. A
+        successor Run's *first* read happens before it has written a marker that
+        could make it, which is why the continuation carries the provider
+        identity at all.
+
+        An empty recorded provider id means the predecessor had nothing to
+        record -- a version 1 header, or a backend that had already left the
+        Worker's registration when the continuation was taken -- and there is
+        nothing to compare against.
+        """
+        assert self._continuation is not None
+        recorded_id = self._continuation.provider_ids.get(wait_id, "")
+        if not recorded_id:
+            return
+        backend = self._backends.get(backend_name)
+        if backend is None:
+            # `register` refuses an unregistered name before it gets here.
+            return
+        declared_id = type(backend).provider_id
+        if declared_id != recorded_id:
+            raise StreamStorageError(
+                f"external stream wait {wait_id} was continued from a Run that "
+                f"read it through provider {recorded_id!r}, but the backend "
+                f"registered on this Worker as {backend_name!r} declares "
+                f"{declared_id!r}. The restored cursor is a position in the store "
+                "that produced it; register the recorded provider under that name."
+            )
+        recorded_version = self._continuation.provider_format_versions.get(wait_id, 0)
+        declared_version = type(backend).provider_format_version
+        if recorded_version and recorded_version != declared_version:
+            raise StreamStorageError(
+                f"external stream wait {wait_id} was continued from a Run that "
+                f"read it through provider {recorded_id!r} format version "
+                f"{recorded_version}, but the backend registered as "
+                f"{backend_name!r} implements format version {declared_version}. "
+                "Resuming would interpret the restored cursor under a format it "
+                "was not written in."
+            )
 
     def _ensure_accumulator(self) -> AnnotationAccumulator:
         if self._accumulator is None:

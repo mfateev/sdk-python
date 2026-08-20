@@ -30,7 +30,7 @@ can disagree about the name.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Generic
 
@@ -70,6 +70,7 @@ __all__ = [
     "AppendNotAcknowledgedError",
     "ExternalStreamProducer",
     "ExternalStreamProducerTopic",
+    "PrecedingWriteFailedError",
     "WakeNotAcknowledgedError",
     "WorkflowChainKey",
 ]
@@ -221,6 +222,42 @@ class AppendNotAcknowledgedError(Exception):
         """
 
 
+class PrecedingWriteFailedError(Exception):
+    """A write fence was not appended, because an earlier write was not either.
+
+    Raised from :meth:`ExternalStreamProducerTopic.finish_writing` when a
+    ``publish()`` invoked earlier on the same stream ended without a durable
+    record. The fence means every write in this producer session preceding it
+    has been appended, and a consumer that drains through one may park on that
+    assertion, so a fence written over a hole would tell it the batch is
+    complete when it is short a record.
+
+    Reachable only from *concurrent* calls: a publish that failed before the
+    fence was invoked is already finished and the fence covers what it says it
+    covers. Nothing was appended for this fence, so the recovery is the caller's
+    choice between the two halves -- publish the failed value again, which draws
+    a new sequence number and lands ahead of a later fence, or accept the batch
+    without it. Either way ``finish_writing()`` again appends the fence: the
+    failed write is no longer outstanding.
+
+    Distinct from :class:`AppendNotAcknowledgedError`, which the fence raises
+    instead when the earlier append's outcome is *unknown* rather than failed.
+    There the record may well be durable, the stream refuses appends until it is
+    settled, and the recovery is that operation's rather than this call's.
+    """
+
+    def __init__(self, message: str, *, stream_key: StreamKey, sequence: int) -> None:
+        super().__init__(message)
+        self.stream_key = stream_key
+        """The stream whose fence was refused."""
+        self.sequence = sequence
+        """The sequence number of the earlier write that did not land.
+
+        Names the operation rather than describing it: the failure itself is the
+        ``__cause__``, and the caller already saw it raised from its own call.
+        """
+
+
 @dataclass(frozen=True)
 class _UnresolvedAppend:
     """One append whose outcome the producer never learned.
@@ -253,6 +290,43 @@ class _UnresolvedAppend:
             lease=self.lease,
             cancelled=self.cancelled,
         )
+
+
+@dataclass(eq=False)
+class _StreamOperation:
+    """One publish or fence on a stream, from the moment it draws its sequence.
+
+    The entry in the producer's per-stream append order. It exists so that
+    :meth:`ExternalStreamProducerTopic.finish_writing` can tell which earlier
+    calls on that stream have not reached the backend yet -- which nothing else
+    records. ``publish()`` draws its sequence *before* awaiting the codec, so a
+    publish that is still encoding is invisible to :meth:`_refuse_while_unresolved`
+    (it has no unresolved append) and to the backend (it has appended nothing).
+
+    Compared by identity rather than by field, because two operations may hold
+    the same values and the order removes exactly the one that settled.
+    """
+
+    sequence: int
+    preceding: tuple[_StreamOperation, ...]
+    """The operations on this stream still unsettled when this one began.
+
+    Snapshotted at registration rather than re-read at wait time, because a
+    fence's claim is about the calls that came *before* it. A publish invoked
+    behind the fence is outside that claim -- it takes its place in the stream
+    after the fence, exactly as a later publish does -- and a fence that waited
+    for one would be held by work the caller started after asking for the fence.
+    """
+
+    settled: asyncio.Event = field(default_factory=asyncio.Event)
+    """Set once the append has an outcome -- durable, refused, or unknown."""
+
+    failure: BaseException | None = None
+    """Why no durable record came of it, or ``None`` if one did.
+
+    Read only after :attr:`settled`, and only by a fence waiting behind this
+    operation. The caller of the failed call has already been raised at.
+    """
 
 
 @dataclass(frozen=True)
@@ -367,6 +441,25 @@ class ExternalStreamProducer:
         #: both back at zero and recovers by re-running the same calls instead
         #: (ADR-038).
         self._unresolved: dict[StreamKey, list[_UnresolvedAppend]] = {}
+        #: Per stream, the operations that have drawn a sequence number and not
+        #: yet reached an append outcome. The ordered append coordinator a write
+        #: fence needs.
+        #:
+        #: A fence asserts that every preceding write in this session has been
+        #: appended, and nothing made that true: an earlier `publish()` could
+        #: still be inside its codec -- holding a lower sequence number, having
+        #: appended nothing, and unresolved nowhere -- while `finish_writing()`
+        #: appended the fence and sent the batch's only wake. A consumer then
+        #: parks on a fence whose data lands behind it, with the one wake that
+        #: would have moved it already spent.
+        #:
+        #: Keyed by stream because that is the scope of the fence's claim, and
+        #: held on the producer rather than the handle because `topic()` returns
+        #: a fresh handle per call: two handles for one name are one stream and
+        #: must join one order. Only the fence waits -- concurrent publishes have
+        #: no defined order between them to preserve, so ordering their appends
+        #: would serialize a batch for nothing.
+        self._appends: dict[StreamKey, list[_StreamOperation]] = {}
 
     @staticmethod
     async def connect(
@@ -512,6 +605,88 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
             "which owes the wake this error reports rather than the one the "
             "refused call asked for."
         )
+
+    def _begin(self, sequence: int) -> _StreamOperation:
+        """Joins this call to its stream's append order.
+
+        Synchronous, and called in the same uninterrupted step as
+        :meth:`_refuse_while_unresolved` and the sequence draw. An operation
+        registered after its first await would be invisible to a fence that
+        began in between, which is the entire race this closes.
+        """
+        outstanding = self._producer._appends.setdefault(self._stream_key, [])
+        operation = _StreamOperation(sequence=sequence, preceding=tuple(outstanding))
+        outstanding.append(operation)
+        return operation
+
+    def _settle(
+        self, operation: _StreamOperation, failure: BaseException | None = None
+    ) -> None:
+        """Reports this call's append outcome and releases anything behind it.
+
+        Called once the append has an outcome and **not** after the wake. The
+        fence asserts that preceding writes are *appended*, which a durable
+        record with a still-owed Signal already satisfies; holding the fence for
+        the wake as well would stall it on a state its own claim says nothing
+        about, and on the failure of one leave a caller unable to fence at all.
+        """
+        operation.failure = failure
+        operation.settled.set()
+        outstanding = self._producer._appends.get(self._stream_key)
+        if outstanding is None:
+            return
+        outstanding[:] = [held for held in outstanding if held is not operation]
+        if not outstanding:
+            del self._producer._appends[self._stream_key]
+
+    async def _await_preceding_appends(self, operation: _StreamOperation) -> None:
+        """Holds a fence until every earlier call on this stream has landed.
+
+        What makes :meth:`finish_writing`'s claim true rather than merely
+        documented. Each earlier operation is waited on rather than polled, and
+        it settles as soon as its append returns, so a fence with nothing
+        outstanding ahead of it does not yield at all.
+
+        An earlier *failure* is propagated as
+        :class:`PrecedingWriteFailedError` instead of being passed over: the
+        caller asked for that write before it asked for the fence, and a fence
+        appended over the hole tells a consumer the batch is complete when it is
+        short a record.
+
+        An earlier append whose *outcome is unknown* is the one case that is not
+        yet a failure, so it is re-checked against the producer's unresolved set
+        rather than answered from the caught error.
+        :meth:`resolve_append` may have settled it while this fence waited, and
+        then the record is durable and sits ahead of the fence exactly as the
+        claim requires. If it is still unsettled the fence is refused with that
+        operation's canonical error -- the same refusal
+        :meth:`_refuse_while_unresolved` gives at entry, because the stream
+        takes no further append until it is settled (ADR-038).
+        """
+        for earlier in operation.preceding:
+            await earlier.settled.wait()
+            failure = earlier.failure
+            if failure is None or isinstance(failure, AppendNotAcknowledgedError):
+                continue
+            raise PrecedingWriteFailedError(
+                f"the write at sequence {earlier.sequence} on stream "
+                f"{self._stream_key} did not produce a durable record, so this "
+                "fence was not appended: a fence means every preceding write in "
+                "this producer session has been appended, and a consumer that "
+                "drains through one may park on that. Publish the value again "
+                "-- it draws a new sequence number and lands ahead of a later "
+                "fence -- or accept the batch without it; either way "
+                "finish_writing() again appends the fence, since the failed "
+                "write is no longer outstanding.",
+                stream_key=self._stream_key,
+                sequence=earlier.sequence,
+            ) from failure
+        # Re-checked here and not only at entry: an append can lose its answer at
+        # any point while this fence is held, including one from a publish that
+        # began behind it, and appending the fence in front of a record that may
+        # yet be settled into the stream is the ordering this method exists to
+        # refuse.
+        self._refuse_while_unresolved()
 
     def _remember(self, pending: _UnresolvedAppend) -> _UnresolvedAppend:
         """Makes ``pending`` the canonical state for this unsettled operation.
@@ -844,13 +1019,27 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
         # for the same call.
         self._refuse_while_unresolved()
         sequence = self._producer._next_sequence()
-        record = StreamRecord(
-            kind=RecordKind.DATA,
-            payload=await self._codec.encode(value),
-            producer_session_id=self._producer.session_id,
-            sequence=sequence,
-        )
-        placed = await self._append(record, wake=wake, lease=lease)
+        # Registered in the same step, and for the same reason the sequence is
+        # drawn in it: a concurrent `finish_writing()` has to be able to see this
+        # call before the encode below hands the event loop away, or its fence
+        # asserts durability for a record that has not been appended yet.
+        operation = self._begin(sequence)
+        try:
+            record = StreamRecord(
+                kind=RecordKind.DATA,
+                payload=await self._codec.encode(value),
+                producer_session_id=self._producer.session_id,
+                sequence=sequence,
+            )
+            placed = await self._append(record, wake=wake, lease=lease)
+        except (Exception, asyncio.CancelledError) as err:
+            # Settled with the failure rather than merely dropped: a fence behind
+            # this call is waiting on it, and what it does next depends on
+            # whether a record landed. Settled *before* the raise, so the two are
+            # one uninterrupted step.
+            self._settle(operation, err)
+            raise
+        self._settle(operation)
         return await self._wake_for(placed, wake=wake, lease=lease)
 
     async def wake(
@@ -1080,7 +1269,21 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
         task parks early only when every active subscription is immediately
         parkable.
 
+        **Waits for every earlier call on this stream to reach a durable
+        append**, across every handle ``topic()`` has returned for the name. The
+        claim is otherwise not one this method can make: ``publish()`` draws its
+        sequence before awaiting the payload codec, so a publish invoked first
+        can still be encoding when this one is called, and a fence that overtook
+        it would park a consumer in front of data that had not been written --
+        having spent, if the publish was a ``wake=False`` member of a batch, the
+        one wake that would have moved it again.
+
         Raises:
+            PrecedingWriteFailedError: An earlier ``publish()`` on this stream,
+                still in flight when this call was made, ended with no durable
+                record. Nothing was appended for the fence; see that class for
+                what the two recoveries are.
+
             WakeNotAcknowledgedError: The fence is durable; the wake is not, on
                 exactly the terms :meth:`publish` describes -- cancellation after
                 the append included. Retrying ``finish_writing()`` appends a
@@ -1091,7 +1294,11 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
             AppendNotAcknowledgedError: The fence's append reported no outcome,
                 again on exactly :meth:`publish`'s terms. :meth:`resolve_append`
                 takes ``.record`` and settles it, leaving one fence whichever way
-                the interrupted attempt went.
+                the interrupted attempt went. **Also raised for an earlier
+                append on this stream whose outcome is unknown**, carrying that
+                operation's record rather than a fence: the record may be durable,
+                so the fence may not go in front of it, and the stream takes no
+                further append until it is settled (ADR-038).
         """
         # Drawn before the append for the same reason as in `publish`, though a
         # fence encodes nothing and so cannot be reordered by a codec: what the
@@ -1099,13 +1306,23 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
         # makes the same calls in the same order derives the same keys.
         self._refuse_while_unresolved()
         sequence = self._producer._next_sequence()
-        fence = StreamRecord(
-            kind=RecordKind.WRITE_FENCE,
-            payload=b"",
-            producer_session_id=self._producer.session_id,
-            sequence=sequence,
-        )
-        placed = await self._append(fence, wake=wake, lease=lease)
+        operation = self._begin(sequence)
+        try:
+            # The sequence identity is this call's, but the *append* is ordered:
+            # the fence enters the backend only once every earlier call on this
+            # stream has one.
+            await self._await_preceding_appends(operation)
+            fence = StreamRecord(
+                kind=RecordKind.WRITE_FENCE,
+                payload=b"",
+                producer_session_id=self._producer.session_id,
+                sequence=sequence,
+            )
+            placed = await self._append(fence, wake=wake, lease=lease)
+        except (Exception, asyncio.CancelledError) as err:
+            self._settle(operation, err)
+            raise
+        self._settle(operation)
         # A fence is the record most likely to find the Workflow parked -- it is
         # what a producer appends when it has nothing more to say -- so an
         # unsignalled one strands the Workflow for its whole idle timeout at

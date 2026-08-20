@@ -10,14 +10,16 @@ replays of one history could then diverge (ADR-022).
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import uuid
 from datetime import timedelta
+from typing import Any
 
 import pytest
 
 import temporalio.converter
 from temporalio import workflow
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowHandle
 from temporalio.contrib.external_workflow_streams._annotation import (
     AnnotationDecodeError,
 )
@@ -30,6 +32,7 @@ from temporalio.contrib.external_workflow_streams._continuation import (
     read_continuation_header,
     write_continuation_header,
 )
+from temporalio.contrib.external_workflow_streams._errors import StreamStorageError
 from temporalio.contrib.external_workflow_streams._manager import (
     ReadinessResult,
 )
@@ -41,7 +44,8 @@ from temporalio.contrib.external_workflow_streams._record import (
     StreamRecord,
 )
 from temporalio.contrib.external_workflow_streams._runtime import WorkflowStreamRuntime
-from temporalio.worker import Worker
+from temporalio.exceptions import ApplicationError
+from temporalio.worker import Replayer, Worker
 from tests.contrib.external_workflow_streams.memory_backend import MemoryStreamBackend
 
 with workflow.unsafe.imports_passed_through():
@@ -52,10 +56,10 @@ async def _notify(run_id: str, wait_id: int, generation: int) -> str:
     return ReadinessResult.ACCEPTED
 
 
-def make_runtime(manager, backend, continuation=None):  # type: ignore[no-untyped-def]
+def make_runtime(manager, backend, continuation=None, backends=None):  # type: ignore[no-untyped-def]
     return WorkflowStreamRuntime(
         manager=manager,
-        backends={"tokens": backend},
+        backends={"tokens": backend} if backends is None else backends,
         run_id="run-2",
         namespace="ns",
         workflow_id="wf",
@@ -69,6 +73,23 @@ def make_runtime(manager, backend, continuation=None):  # type: ignore[no-untype
 @pytest.fixture
 def backend() -> MemoryStreamBackend:
     return MemoryStreamBackend()
+
+
+class OtherProviderBackend(MemoryStreamBackend):
+    """The same name, mapped to a different implementation.
+
+    A deployment can do this without touching Workflow code, which is exactly
+    why the continuation has to carry what the cursor was produced by rather
+    than only what it was produced for.
+    """
+
+    provider_id = "other-memory"
+
+
+class NewerFormatBackend(MemoryStreamBackend):
+    """The recorded provider, at a format version that reads offsets differently."""
+
+    provider_format_version = 2
 
 
 class StubManager:
@@ -102,20 +123,24 @@ def manager() -> StubManager:
 
 
 def test_a_continuation_round_trips() -> None:
+    """Binding included: a cursor without one cannot be checked on restoration."""
     original = Continuation(
         cursors={1: AFTER(Offset("100-3")), 2: BEGINNING},
         stream_names={1: "tokens", 2: "tool-events"},
+        backend_names={1: "store-a", 2: "store-b"},
+        provider_ids={1: "memory", 2: "redis"},
+        provider_format_versions={1: 1, 2: 3},
     )
 
     assert decode_continuation(encode_continuation(original)) == original
 
 
 def test_the_encoding_is_stable_for_one_state() -> None:
-    """It rides on a command whose payload replay compares against History.
+    """The header is re-derived from live state every time the command is built.
 
     Encoding the same state two different ways -- by iterating a dict in
-    insertion order, say -- would make an otherwise identical Continue-As-New
-    command mismatch on replay.
+    insertion order, say -- would hand the successor a different cursor on a
+    Workflow Task the server retried.
     """
     forwards = Continuation({1: BEGINNING, 2: BEGINNING}, {1: "a", 2: "b"})
     backwards = Continuation({2: BEGINNING, 1: BEGINNING}, {2: "b", 1: "a"})
@@ -271,14 +296,136 @@ def test_a_renumbered_subscription_is_caught_rather_than_resumed_wrong(
         manager, backend, Continuation({1: AFTER(Offset("100-0"))}, {1: "tokens"})
     )
 
-    with pytest.raises(
-        temporalio.workflow.NondeterminismError, match="workflow.patched"
-    ):
+    with pytest.raises(workflow.NondeterminismError, match="workflow.patched"):
         runtime.register(
             wait_id=1,
             stream_key=runtime.stream_key("tool-events"),
             backend_name="tokens",
         )
+
+
+def test_a_changed_backend_is_caught_rather_than_resumed_wrong(
+    manager: StubManager, backend: MemoryStreamBackend
+) -> None:
+    """Two stores, one offset syntax: the new store accepts a foreign boundary.
+
+    The wait number and the stream name are both unchanged, so nothing before
+    this looks wrong -- and the records the new store holds below the restored
+    boundary would simply never be delivered. Nondeterminism rather than
+    integrity loss, for the same reason :meth:`_verify_binding` says so: the
+    backend a topic names is Workflow code.
+    """
+    other_store = MemoryStreamBackend()
+    runtime = make_runtime(
+        manager,
+        backend,
+        Continuation({1: AFTER(Offset("200-0"))}, {1: "tokens"}, {1: "old-store"}),
+        backends={"old-store": backend, "new-store": other_store},
+    )
+
+    with pytest.raises(workflow.NondeterminismError, match="workflow.patched"):
+        runtime.register(
+            wait_id=1,
+            stream_key=runtime.stream_key("tokens"),
+            backend_name="new-store",
+        )
+
+    assert manager.registered == [], "the cursor must not reach the manager"
+    assert other_store.range_reads == [], "the new store must not be read at all"
+
+
+def test_a_backend_name_pointing_at_another_provider_is_a_storage_failure(
+    manager: StubManager,
+) -> None:
+    """The Workflow is unchanged and neither store is damaged.
+
+    Marker replay reports this against a recorded range; here it is reported
+    against a restored cursor, which is the same question one Workflow Task
+    earlier -- and before any read, so the wrong implementation never gets to
+    interpret the boundary at all.
+    """
+    backend = OtherProviderBackend()
+    runtime = make_runtime(
+        manager,
+        backend,
+        Continuation(
+            {1: AFTER(Offset("200-0"))},
+            {1: "tokens"},
+            {1: "tokens"},
+            {1: "memory"},
+            {1: 1},
+        ),
+    )
+
+    with pytest.raises(StreamStorageError, match="'other-memory'"):
+        runtime.register(
+            wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
+        )
+
+    assert manager.registered == []
+    assert backend.range_reads == [], "raised before any backend read"
+
+
+def test_a_newer_provider_format_version_is_a_storage_failure(
+    manager: StubManager,
+) -> None:
+    """The implementation is the recorded one but reads offsets differently.
+
+    Resuming would interpret a boundary under a format it was not written in,
+    which is not something the offset itself can reveal.
+    """
+    backend = NewerFormatBackend()
+    runtime = make_runtime(
+        manager,
+        backend,
+        Continuation(
+            {1: AFTER(Offset("200-0"))},
+            {1: "tokens"},
+            {1: "tokens"},
+            {1: "memory"},
+            {1: 1},
+        ),
+    )
+
+    with pytest.raises(StreamStorageError, match="format version"):
+        runtime.register(
+            wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
+        )
+
+    assert manager.registered == []
+    assert backend.range_reads == [], "raised before any backend read"
+
+
+#: One wait at ``AFTER("100-3")`` on stream ``tokens``, as a Worker that only
+#: knew schema version 1 wrote it. Written out rather than produced by this
+#: module's encoder, so a change to the encoder cannot quietly redefine what a
+#: history in flight is expected to contain.
+VERSION_1_HEADER = bytes([1, 1, 1, 0x01, 5]) + b"100-3" + bytes([6]) + b"tokens"
+
+
+def test_a_version_1_continuation_still_restores(
+    manager: StubManager, backend: MemoryStreamBackend
+) -> None:
+    """A chain that continued as new before the fleet was upgraded.
+
+    Its successor's ``WorkflowExecutionStarted`` already holds version 1 bytes,
+    and that Run has to start where its predecessor stopped rather than at
+    ``BEGINNING``. Version 1 recorded no backend, so the checks that need one
+    are skipped -- not failed against nothing -- and re-encoding reproduces the
+    bytes the header arrived as.
+    """
+    restored = decode_continuation(VERSION_1_HEADER)
+
+    assert restored.cursors == {1: AFTER(Offset("100-3"))}
+    assert restored.backend_names == {}
+    assert encode_continuation(restored) == VERSION_1_HEADER
+
+    runtime = make_runtime(manager, backend, restored)
+    runtime.register(
+        wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
+    )
+
+    assert runtime._subscriptions[1].start_cursor == AFTER(Offset("100-3"))
 
 
 # --- what gets committed ------------------------------------------------------
@@ -415,3 +562,273 @@ async def test_a_chain_resumes_where_its_predecessor_stopped(
             "the successor Run redelivered records its predecessor had already "
             "consumed, so the continuation cursor did not survive Continue-As-New"
         )
+
+
+# --- the boundary the header is taken at --------------------------------------
+#
+# Creating the Continue-As-New command does not end the activation. The event
+# loop keeps draining what is already ready, and a stream consumer that runs in
+# that tail consumes records the predecessor's final marker *does* record -- so a
+# header taken when the command was created describes an earlier boundary than
+# History does, and the successor is handed those records a second time.
+
+
+@workflow.defn
+class LateConsumerContinueAsNewWorkflow:
+    """Schedules a consumer, then continues as new without yielding to it.
+
+    The scheduled task takes a record that is already buffered, so it finishes
+    without blocking -- it just does so after the terminal command exists.
+
+    Only the successor's records are returned. A Run that reported everything it
+    saw would hide the redelivery inside the predecessor's own list.
+    """
+
+    @workflow.run
+    async def run(self, remaining: int) -> list[str]:
+        tokens = external_stream.with_options(idle_timeout=timedelta(seconds=30)).topic(
+            "tokens", backend="tokens-memory", type=str
+        )
+        subscription = tokens.subscribe()
+        iterator = subscription.__aiter__()
+        first = await iterator.__anext__()
+        if remaining <= 1:
+            return [first, await iterator.__anext__()]
+        _require_a_buffered_record(subscription)
+
+        async def take_one() -> None:
+            await iterator.__anext__()
+
+        # On the ready queue, and able to finish without blocking. `_run_once`
+        # gives it its turn after the command below is created.
+        asyncio.create_task(take_one())
+        workflow.continue_as_new(remaining - 1)
+
+
+@workflow.defn
+class SignalContinueAsNewWorkflow:
+    """A signal handler continues as new while a consumer is being unblocked.
+
+    The consumer is parked on a condition the handler sets, and conditions are
+    re-checked *after* the ready queue drains -- which is after the terminal
+    command was created. So this reaches the same tail by the route ordinary
+    application structure reaches it by, rather than by scheduling a task next
+    to the Continue-As-New call.
+    """
+
+    def __init__(self) -> None:
+        self._release = False
+        self._staged = False
+
+    @workflow.run
+    async def run(self, remaining: int) -> list[str]:
+        tokens = external_stream.with_options(idle_timeout=timedelta(seconds=30)).topic(
+            "tokens", backend="tokens-memory", type=str
+        )
+        subscription = tokens.subscribe()
+        iterator = subscription.__aiter__()
+        first = await iterator.__anext__()
+        if remaining <= 1:
+            return [first, await iterator.__anext__()]
+        _require_a_buffered_record(subscription)
+
+        async def take_one() -> None:
+            await workflow.wait_condition(lambda: self._release)
+            await iterator.__anext__()
+
+        asyncio.create_task(take_one())
+        self._staged = True
+        # The handler ends this Run; nothing else does.
+        await workflow.wait_condition(lambda: False)
+        raise AssertionError("unreachable")
+
+    @workflow.query
+    def staged(self) -> bool:
+        """Whether the consumer is parked yet.
+
+        Signalling before it is would continue as new with nothing else ready,
+        and the test would pass without exercising anything.
+        """
+        return self._staged
+
+    @workflow.signal
+    async def wrap_up(self, remaining: int) -> None:
+        self._release = True
+        workflow.continue_as_new(remaining)
+
+
+def _require_a_buffered_record(subscription: object) -> None:
+    """Fails the Run rather than letting a thin test pass.
+
+    The whole shape depends on a record still sitting in the subscription's
+    ready list when the terminal command is created. If the batch arrived one
+    record at a time there is nothing for the tail to consume, and the
+    assertions below would hold for the wrong reason.
+    """
+    if not subscription._ready:  # type: ignore[attr-defined]
+        raise ApplicationError(
+            "no record was buffered when the terminal command was created, so "
+            "nothing was consumed after it and this Run proves nothing",
+            non_retryable=True,
+        )
+
+
+async def stage_stream(
+    client: Client,
+    backend: MemoryStreamBackend,
+    handle: WorkflowHandle[Any, Any],
+    values: list[str],
+) -> StreamKey:
+    """Puts the whole batch in the stream before any Worker can read it.
+
+    A record that arrives an activation later is delivered to the successor by
+    the ordinary path and says nothing about this boundary. Publishing before
+    the Worker exists is what makes the Run's first drain take the batch whole.
+    """
+    description = await handle.describe()
+    key = StreamKey(
+        client.namespace,
+        handle.id,
+        description.raw_description.workflow_execution_info.first_run_id,
+        "tokens",
+    )
+    await publish(backend, key, values)
+    return key
+
+
+async def _until_staged(handle: WorkflowHandle[Any, Any]) -> None:
+    for _ in range(300):
+        if await handle.query(SignalContinueAsNewWorkflow.staged):
+            return
+        await asyncio.sleep(0.1)
+    raise AssertionError("the consumer never parked on its condition")
+
+
+async def test_a_consumer_that_runs_after_the_terminal_command_is_still_consumed(
+    client: Client, backend: MemoryStreamBackend
+) -> None:
+    """The predecessor's marker and the successor's header are one boundary.
+
+    Both records the predecessor took are recorded in its final marker. A
+    continuation snapshot taken when the command was created holds only the
+    first, and the successor then starts one record too early.
+    """
+    task_queue = f"tq-{uuid.uuid4()}"
+    handle = await client.start_workflow(
+        LateConsumerContinueAsNewWorkflow.run,
+        2,
+        id=f"wf-{uuid.uuid4()}",
+        task_queue=task_queue,
+    )
+    await stage_stream(client, backend, handle, ["a", "b", "c", "d"])
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[LateConsumerContinueAsNewWorkflow],
+        external_stream_backends={"tokens-memory": backend},
+    ):
+        assert await asyncio.wait_for(handle.result(), 30) == ["c", "d"], (
+            "the successor was handed a record its predecessor consumed after "
+            "the Continue-As-New command was created, so the continuation "
+            "header was taken before the activation had finished"
+        )
+
+
+async def test_a_signal_handler_continuing_as_new_waits_for_the_consumer(
+    client: Client, backend: MemoryStreamBackend
+) -> None:
+    """The same boundary, reached through a condition rather than a new task."""
+    task_queue = f"tq-{uuid.uuid4()}"
+    handle = await client.start_workflow(
+        SignalContinueAsNewWorkflow.run,
+        2,
+        id=f"wf-{uuid.uuid4()}",
+        task_queue=task_queue,
+    )
+    await stage_stream(client, backend, handle, ["a", "b", "c", "d"])
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[SignalContinueAsNewWorkflow],
+        external_stream_backends={"tokens-memory": backend},
+    ):
+        await _until_staged(handle)
+        await handle.signal(SignalContinueAsNewWorkflow.wrap_up, 1)
+
+        assert await asyncio.wait_for(handle.result(), 30) == ["c", "d"], (
+            "the consumer the signal handler unblocked consumed a record after "
+            "the Continue-As-New command was created, and the successor "
+            "received it again"
+        )
+
+
+async def test_a_history_written_at_the_earlier_boundary_still_replays(
+    client: Client, backend: MemoryStreamBackend
+) -> None:
+    """A chain that continued as new before this Worker was deployed.
+
+    Replay regenerates the header at the *later* boundary, so it no longer
+    matches the recorded one. That is allowed and needs no compatibility flag:
+    Core matches a Continue-As-New command to its
+    ``WorkflowExecutionContinuedAsNew`` event by command type alone and never
+    compares headers. The successor of such a chain is unaffected either way --
+    it reads its cursor from its own ``WorkflowExecutionStarted``, which
+    replaying the predecessor does not rewrite.
+    """
+    task_queue = f"tq-{uuid.uuid4()}"
+    handle = await client.start_workflow(
+        LateConsumerContinueAsNewWorkflow.run,
+        2,
+        id=f"wf-{uuid.uuid4()}",
+        task_queue=task_queue,
+    )
+    key = await stage_stream(client, backend, handle, ["a", "b", "c", "d"])
+    first_run_id = handle.first_execution_run_id
+    assert first_run_id is not None
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[LateConsumerContinueAsNewWorkflow],
+        external_stream_backends={"tokens-memory": backend},
+    ):
+        await asyncio.wait_for(handle.result(), 30)
+        history = await client.get_workflow_handle(
+            handle.id, run_id=first_run_id
+        ).fetch_history()
+
+    continued = [
+        e
+        for e in history.events
+        if e.HasField("workflow_execution_continued_as_new_event_attributes")
+    ]
+    assert continued, "the predecessor did not continue as new"
+    attributes = continued[0].workflow_execution_continued_as_new_event_attributes
+    recorded = decode_continuation(attributes.header.fields[CONTINUATION_HEADER].data)
+
+    # What the earlier snapshot held: the first record, taken before the tail of
+    # the activation consumed the second.
+    first_offset = backend._records[key][0].offset
+    assert first_offset is not None
+    early = dataclasses.replace(
+        recorded, cursors={wait_id: AFTER(first_offset) for wait_id in recorded.cursors}
+    )
+    assert early != recorded, (
+        "the recorded header already holds the earlier boundary, so this "
+        "history is not the pre-fix one it is meant to stand in for"
+    )
+    attributes.header.fields[CONTINUATION_HEADER].CopyFrom(
+        write_continuation_header(early)
+    )
+
+    result = await Replayer(
+        workflows=[LateConsumerContinueAsNewWorkflow],
+        external_stream_backends={"tokens-memory": backend},
+    ).replay_workflow(history, raise_on_replay_failure=False)
+
+    assert result.replay_failure is None, (
+        "a history whose Continue-As-New header holds the earlier boundary no "
+        f"longer replays: {result.replay_failure}"
+    )

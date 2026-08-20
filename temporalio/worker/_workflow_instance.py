@@ -2410,6 +2410,10 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         actually started from instead of wherever the stream has since got to
         (ADR-022).
 
+        Written when the command is created and again once the activation has
+        quiesced -- see :meth:`_refresh_external_stream_continuations`, which is
+        what makes the second write the one that counts.
+
         Nothing is attached when the Run held no subscriptions -- an empty header
         on every Continue-As-New in every Workflow would be pure overhead.
         """
@@ -2427,6 +2431,42 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         command.headers[CONTINUATION_HEADER].CopyFrom(
             write_continuation_header(continuation)
         )
+
+    def _refresh_external_stream_continuations(self) -> None:
+        """Re-takes the continuation snapshot now the activation has quiesced.
+
+        Creating the Continue-As-New command does not end the activation.
+        :meth:`_run_once` drains ``self._ready`` until it is empty and then
+        re-checks conditions, so a stream consumer scheduled -- or unblocked --
+        before the terminal command still gets its turn afterwards, and every
+        record it takes calls ``record_consumption`` after the header was
+        serialized. Those consumptions do reach the predecessor's final stream
+        marker, which is closed on the way out; a header left at the earlier
+        boundary would therefore describe a different boundary than History
+        does, and the successor would be handed the record a second time.
+
+        No Workflow code runs from here on, so this is the first point at which
+        the consumption boundary is stable for the activation.
+
+        Every Continue-As-New command is refreshed rather than the last one,
+        because two top-level functions can each raise one and only Core decides
+        which terminal survives.
+
+        **Not gated behind an internal flag.** Core matches a Continue-As-New
+        command to its ``WorkflowExecutionContinuedAsNew`` event by command type
+        alone and never compares the command's headers against the recorded ones
+        (``continue_as_new_workflow_state_machine.rs``), so a replay that
+        regenerates the header at the later boundary cannot disagree with a
+        History written at the earlier one. What the successor resumes from is
+        the copy in its own ``WorkflowExecutionStarted``, which is durable and
+        which replaying the predecessor does not rewrite -- so a chain already in
+        flight keeps the boundary it started with.
+        """
+        for command in self._current_completion.successful.commands:
+            if command.HasField("continue_as_new_workflow_execution"):
+                self._attach_external_stream_continuation(
+                    command.continue_as_new_workflow_execution
+                )
 
     def _emit_external_stream_commands(self) -> None:
         """Answers the two independent questions every activation return poses.
@@ -2451,10 +2491,20 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         the second: the annotation is already in History, but the wait set the
         quiescent command registers is per-Worker runtime state that a replayed
         Run has to rebuild.
+
+        Quiescence is also what a Continue-As-New header has been waiting for, so
+        :meth:`_refresh_external_stream_continuations` runs from here too -- the
+        boundary it records and the boundary the delta below commits have to be
+        the same one.
         """
         runtime = self._external_stream_runtime
         if runtime is None or self._deleting:
             return
+
+        # First, because the boundary a Continue-As-New header has to carry is
+        # the one this activation is about to commit, and it only stops moving
+        # here.
+        self._refresh_external_stream_continuations()
 
         # Records still buffered when an activation ends have no readiness
         # notification coming: the watcher moved its prefetch cursor past them

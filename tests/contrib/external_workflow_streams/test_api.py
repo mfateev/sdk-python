@@ -93,7 +93,9 @@ class FakeRuntime:
     def record_consumption(self, wait_id: int, record: StreamRecord) -> None:
         self.consumed.append((wait_id, record))
 
-    def codec_for(self, value_type: type | None) -> StreamPayloadCodec[Any]:
+    def codec_for(
+        self, value_type: type | None, wait_id: int
+    ) -> StreamPayloadCodec[Any]:
         if self.codec is not None:
             return self.codec
         return StreamPayloadCodec(

@@ -964,6 +964,20 @@ class _CompletionStub:
     def _add_command(self) -> Any:
         return self._current_completion.successful.commands.add()
 
+    # Reached unbound for the same reason `_emit_external_stream_commands` is:
+    # the completion path calls these, and a stub that reimplemented them would
+    # let the shipped versions drift. Neither reads the runtime unless the
+    # completion carries a Continue-As-New command, which none of these do.
+    def _refresh_external_stream_continuations(self) -> None:
+        from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
+
+        _WorkflowInstanceImpl._refresh_external_stream_continuations(self)  # type: ignore[arg-type]
+
+    def _attach_external_stream_continuation(self, command: Any) -> None:
+        from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
+
+        _WorkflowInstanceImpl._attach_external_stream_continuation(self, command)  # type: ignore[arg-type]
+
 
 class _RecordingRuntime:
     """Answers the two questions the completion path asks, and records the call."""

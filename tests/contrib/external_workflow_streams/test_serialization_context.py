@@ -52,7 +52,7 @@ from temporalio.converter import (
     WithSerializationContext,
     WorkflowSerializationContext,
 )
-from temporalio.worker import Worker
+from temporalio.worker import Replayer, Worker
 from tests.contrib.external_workflow_streams.memory_backend import MemoryStreamBackend
 
 with workflow.unsafe.imports_passed_through():
@@ -72,6 +72,12 @@ _codec_contexts: list[SerializationContext | None] = []
 #: Contexts the payload converter saw while converting a stream record. Written
 #: from the Workflow thread, which is the half a codec-only probe cannot reach.
 _converter_contexts: list[SerializationContext | None] = []
+
+#: The same two observations, from the chain-keyed probes an offline replay is
+#: driven through. Kept apart from the pair above so the replay assertions can
+#: be exact rather than a suffix of everything the process has ever converted.
+_chain_codec_contexts: list[SerializationContext | None] = []
+_chain_converter_contexts: list[SerializationContext | None] = []
 
 
 class ContextRequiredCodec(PayloadCodec, WithSerializationContext):
@@ -149,6 +155,114 @@ class ContextRequiredPayloadConverter(
                     "a stream record was converted with no serialization context"
                 )
         return super().from_payloads(payloads, type_hints)
+
+
+def _chain_tag(context: SerializationContext | None) -> bytes:
+    """The Workflow identity a chain-keyed probe writes into the bytes.
+
+    Both the namespace and the Workflow id, because an offline ``Replayer``
+    keeps the Workflow id and substitutes only the namespace: a probe keyed on
+    the id alone reports success against a converter that never saw the
+    recorded namespace at all.
+    """
+    assert isinstance(context, WorkflowSerializationContext), (
+        f"a stream record's payload was handled with no Workflow context: {context}"
+    )
+    return f"|{context.namespace}|{context.workflow_id}".encode()
+
+
+def _chain_apply(
+    payloads: Sequence[temporalio.api.common.v1.Payload],
+    context: SerializationContext | None,
+    seen: list[SerializationContext | None],
+    encoding: bool,
+) -> list[temporalio.api.common.v1.Payload]:
+    """Appends or strips the tag, refusing bytes written under another context.
+
+    A probe that only *recorded* the context would pass against a converter
+    bound to the wrong Workflow, because a wrong context still decodes -- to a
+    different value, silently. Tagging makes the mismatch the failure it would
+    be for a real per-Workflow key.
+
+    Only the sentinel payload is touched, so the Workflow's own argument and
+    result -- which an offline replay legitimately handles under the replay
+    harness's own namespace -- travel through untouched.
+    """
+    out: list[temporalio.api.common.v1.Payload] = []
+    for payload in payloads:
+        if _SENTINEL not in payload.data:
+            out.append(payload)
+            continue
+        if not encoding:
+            seen.append(context)
+        tag = _chain_tag(context)
+        copied = temporalio.api.common.v1.Payload()
+        copied.CopyFrom(payload)
+        if encoding:
+            copied.data = payload.data + tag
+        else:
+            if not payload.data.endswith(tag):
+                raise RuntimeError(
+                    "a stream record written under one Workflow context was "
+                    f"read back under {context}"
+                )
+            copied.data = payload.data[: -len(tag)]
+        out.append(copied)
+    return out
+
+
+class ChainKeyedCodec(PayloadCodec, WithSerializationContext):
+    """The asynchronous half, keyed on the Workflow the record belongs to."""
+
+    def __init__(self, context: SerializationContext | None = None) -> None:
+        self.context = context
+
+    def with_context(self, context: SerializationContext) -> ChainKeyedCodec:
+        return ChainKeyedCodec(context)
+
+    async def encode(
+        self, payloads: Sequence[temporalio.api.common.v1.Payload]
+    ) -> list[temporalio.api.common.v1.Payload]:
+        return _chain_apply(payloads, self.context, _chain_codec_contexts, True)
+
+    async def decode(
+        self, payloads: Sequence[temporalio.api.common.v1.Payload]
+    ) -> list[temporalio.api.common.v1.Payload]:
+        return _chain_apply(payloads, self.context, _chain_codec_contexts, False)
+
+
+class ChainKeyedPayloadConverter(DefaultPayloadConverter, WithSerializationContext):
+    """The synchronous half, keyed the same way and run on the Workflow thread.
+
+    The half an offline ``Replayer`` gets wrong on its own: the manager binds
+    the codec to the stream key the marker recorded, while the converter that
+    runs inside ``activate()`` belongs to a runtime the harness built under its
+    own namespace.
+    """
+
+    def __init__(self, context: SerializationContext | None = None) -> None:
+        super().__init__()
+        self.context = context
+
+    def with_context(self, context: SerializationContext) -> ChainKeyedPayloadConverter:
+        return ChainKeyedPayloadConverter(context)
+
+    def to_payloads(
+        self, values: Sequence[object]
+    ) -> list[temporalio.api.common.v1.Payload]:
+        return _chain_apply(
+            super().to_payloads(values), self.context, _chain_converter_contexts, True
+        )
+
+    def from_payloads(
+        self,
+        payloads: Sequence[temporalio.api.common.v1.Payload],
+        type_hints: list[type] | None = None,
+    ) -> list[object]:
+        return super().from_payloads(
+            _chain_apply(payloads, self.context, _chain_converter_contexts, False),
+            type_hints,
+        )
 
 
 @workflow.defn
@@ -399,6 +513,102 @@ async def test_a_replayed_record_is_prepared_with_the_recorded_streams_context(
         "the replayed record was prepared with the wrong serialization "
         "context, so a Worker restart would fail to decode records the live "
         "path decodes without complaint"
+    )
+
+
+async def test_an_offline_replay_converts_a_record_under_the_recorded_context(
+    client: Client, backend: MemoryStreamBackend
+) -> None:
+    """Both halves of one record, through the real ``Replayer``.
+
+    A ``Replayer`` runs under its own ``ReplayNamespace`` -- deliberately, and
+    :meth:`_verify_binding` accommodates it by comparing only the stream name
+    from a recorded binding. The record's *conversion* has to make the same
+    accommodation from the other side: the manager prepares a replayed record
+    under the stream key the marker recorded, so a converter left on the
+    harness's namespace would see two different Workflow identities while
+    decoding one payload -- and a namespace-keyed converter then refuses a
+    history that is entirely valid.
+
+    Live execution cannot show this. There the recorded key and the runtime's
+    own identity are the same Workflow, so both halves agree whether or not
+    anything binds them separately. Only a harness that supplies its own
+    namespace pulls them apart, which is why this runs the history back through
+    the tool a user would.
+    """
+    assert client.namespace != "ReplayNamespace", (
+        "the Replayer's default namespace matches the live one, so this test "
+        "cannot tell a bound converter from an unbound one"
+    )
+    _chain_codec_contexts.clear()
+    _chain_converter_contexts.clear()
+    converter = DataConverter(
+        payload_converter_class=ChainKeyedPayloadConverter,
+        payload_codec=ChainKeyedCodec(),
+    )
+    config = client.config()
+    config["data_converter"] = converter
+    probe_client = Client(**config)
+
+    task_queue = f"tq-{uuid.uuid4()}"
+    async with Worker(
+        probe_client,
+        task_queue=task_queue,
+        workflows=[CountProbeTokensWorkflow],
+        external_stream_backends={"tokens-memory": backend},
+    ):
+        handle = await probe_client.start_workflow(
+            CountProbeTokensWorkflow.run,
+            1,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=task_queue,
+        )
+        key = await _stream_key(client, handle)
+        # Written under the *producing* Workflow's context, which is what the
+        # marker goes on to record and therefore what replay has to reproduce.
+        await _publish_probe_record(
+            backend,
+            key,
+            converter.with_context(
+                WorkflowSerializationContext(
+                    namespace=key.namespace, workflow_id=key.workflow_id
+                )
+            ),
+        )
+        assert await asyncio.wait_for(handle.result(), 30) == 1
+        history = await handle.fetch_history()
+
+    assert _chain_codec_contexts and _chain_converter_contexts, (
+        "the live run decoded no stream record, so there is nothing recorded "
+        "for the replay to disagree with"
+    )
+    # Only the replay's observations are asserted on; the live run's are the
+    # subject of the two tests above.
+    _chain_codec_contexts.clear()
+    _chain_converter_contexts.clear()
+
+    result = await Replayer(
+        workflows=[CountProbeTokensWorkflow],
+        data_converter=converter,
+        external_stream_backends={"tokens-memory": backend},
+    ).replay_workflow(history, raise_on_replay_failure=False)
+
+    assert result.replay_failure is None, (
+        "replaying a valid history failed because the record was converted "
+        "under the replay harness's namespace rather than the one the marker "
+        f"recorded: {result.replay_failure}"
+    )
+    recorded = WorkflowSerializationContext(
+        namespace=client.namespace, workflow_id=handle.id
+    )
+    assert _chain_codec_contexts == [recorded], (
+        "the asynchronous half of the replayed record's decoding did not run "
+        f"with the recorded context: {_chain_codec_contexts}"
+    )
+    assert _chain_converter_contexts == [recorded], (
+        "the synchronous half ran with a different context than the "
+        "asynchronous half of the same record; one payload was decoded under "
+        f"two Workflow identities: {_chain_converter_contexts}"
     )
 
 

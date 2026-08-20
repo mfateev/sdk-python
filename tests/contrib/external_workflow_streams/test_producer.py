@@ -16,8 +16,10 @@ from temporalio.contrib.external_workflow_streams._backend import (
     StreamKey,
 )
 from temporalio.contrib.external_workflow_streams._producer import (
+    AppendNotAcknowledgedError,
     ChainKeyMismatchError,
     ExternalStreamProducer,
+    PrecedingWriteFailedError,
     WorkflowChainKey,
     _default_session_id,
 )
@@ -430,6 +432,250 @@ async def test_reordered_encodes_cannot_duplicate_across_two_topics(
         "reversing the encode order appended a duplicate on a topic where the "
         "swapped key could not collide, so nothing raised"
     )
+
+
+# --- the fence's ordering claim ---------------------------------------------
+
+
+TOKENS = StreamKey("ns", "wf", "run-1", "tokens")
+EVENTS = StreamKey("ns", "wf", "run-1", "tool-events")
+
+
+async def _let_every_ready_task_run() -> None:
+    """Runs every task that can run without waiting for anything.
+
+    What makes "the fence has not appended" an assertion rather than a race.
+    Nothing here sleeps in wall-clock terms: an unordered ``finish_writing()``
+    reaches the backend without awaiting anything that yields, so one turn of
+    the loop is enough for it to have finished, and the extra turns only make
+    that margin obvious.
+    """
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+
+class GatedFailingCodec(GatedPayloadCodec):
+    """A gated codec whose release makes the encode *fail* rather than finish.
+
+    The payload store rejecting a value, at the point where a concurrent fence
+    is already waiting behind the publish.
+    """
+
+    async def encode(self, payloads):  # type: ignore[no-untyped-def]
+        await super().encode(payloads)
+        raise RuntimeError("the payload store rejected the value")
+
+
+class CommittingThenFailingBackend(MemoryStreamBackend):
+    """Commits an append and then loses the answer, on cue.
+
+    The unknown outcome the producer cannot see through: the record is durable
+    and its offset reached nobody, so it may not be treated as absent -- and a
+    fence appended in front of it would claim durability for a write whose place
+    in the stream is not yet fixed (ADR-038).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.committed = asyncio.Event()
+        self.lose_the_answer = asyncio.Event()
+        self.losing = True
+
+    async def append(self, key, record):  # type: ignore[no-untyped-def]
+        placed = await super().append(key, record)
+        if self.losing:
+            self.losing = False
+            self.committed.set()
+            await self.lose_the_answer.wait()
+            raise ConnectionError("connection reset")
+        return placed
+
+
+async def test_a_fence_waits_for_a_publish_still_inside_its_codec(
+    backend: MemoryStreamBackend,
+) -> None:
+    """The fence's claim is about invocation order, so it must hold under one.
+
+    ``publish()`` draws its sequence before awaiting the codec -- which is what
+    keeps idempotency keys stable across attempts -- so an earlier publish can
+    still be encoding when ``finish_writing()`` is called. A fence appended there
+    says every preceding write in this session is in the stream while the first
+    one has not been sent yet, and a consumer that drains through it may park on
+    exactly that. The unsafe shape is this test's: a ``wake=False`` publish
+    batched behind a fence that carries the batch's only wake, where the wake is
+    spent before the data exists.
+    """
+    codec = GatedPayloadCodec()
+    tokens = _gated_producer(backend, codec, "batch").topic("tokens", type=str)
+
+    publishing = asyncio.ensure_future(tokens.publish("a", wake=False))
+    await codec.wait_inside('"a"')
+    fencing = asyncio.ensure_future(tokens.finish_writing(wake=False))
+    await _let_every_ready_task_run()
+
+    assert not fencing.done(), (
+        "the fence completed while the publish was still encoding"
+    )
+    assert backend.all_records(TOKENS) == [], (
+        "the fence reached the backend ahead of a publish invoked before it, so "
+        "its durability claim was false when a consumer could act on it"
+    )
+
+    codec.release('"a"')
+    await publishing
+    await fencing
+
+    records = backend.all_records(TOKENS)
+    assert [(r.sequence, r.kind) for r in records] == [
+        (0, RecordKind.DATA),
+        (1, RecordKind.WRITE_FENCE),
+    ], "backend order and invocation order disagree"
+    assert backend.strictly_increasing([r.offset for r in records])  # type: ignore[arg-type]
+
+
+async def test_two_handles_for_one_topic_share_the_fence_order(
+    backend: MemoryStreamBackend,
+) -> None:
+    """``topic()`` returns a fresh handle per call; the stream is still one.
+
+    So the order cannot live on the handle. A producer that publishes through
+    one handle and fences through another -- the shape a helper that takes a
+    topic name rather than a handle produces -- is the same stream and the same
+    claim.
+    """
+    codec = GatedPayloadCodec()
+    producer = _gated_producer(backend, codec, "batch")
+    writing = producer.topic("tokens", type=str)
+    finishing = producer.topic("tokens", type=str)
+    assert writing is not finishing
+
+    publishing = asyncio.ensure_future(writing.publish("a", wake=False))
+    await codec.wait_inside('"a"')
+    fencing = asyncio.ensure_future(finishing.finish_writing(wake=False))
+    await _let_every_ready_task_run()
+
+    assert not fencing.done() and backend.all_records(TOKENS) == [], (
+        "the second handle fenced without waiting for the first handle's publish"
+    )
+
+    codec.release('"a"')
+    await publishing
+    await fencing
+
+    assert [r.kind for r in backend.all_records(TOKENS)] == [
+        RecordKind.DATA,
+        RecordKind.WRITE_FENCE,
+    ]
+
+
+async def test_a_fence_does_not_wait_for_another_stream(
+    backend: MemoryStreamBackend,
+) -> None:
+    """The claim is per stream, so the ordering must be too.
+
+    One connection serves several topics, and a publish blocked in a codec on
+    one of them says nothing about a fence on another -- stalling it there would
+    make an unrelated slow payload store hold up a finished topic.
+    """
+    codec = GatedPayloadCodec()
+    producer = _gated_producer(backend, codec, "batch")
+    tokens = producer.topic("tokens", type=str)
+    events = producer.topic("tool-events", type=str)
+
+    publishing = asyncio.ensure_future(tokens.publish("a", wake=False))
+    await codec.wait_inside('"a"')
+
+    await asyncio.wait_for(events.finish_writing(wake=False), 2)
+
+    assert [r.kind for r in backend.all_records(EVENTS)] == [RecordKind.WRITE_FENCE]
+    assert backend.all_records(TOKENS) == []
+
+    codec.release('"a"')
+    await publishing
+    assert [r.kind for r in backend.all_records(TOKENS)] == [RecordKind.DATA]
+
+
+async def test_a_fence_will_not_overtake_an_append_of_unknown_outcome() -> None:
+    """An append with no answer may still be in front of the fence.
+
+    The record is durable and its offset reached nobody, so the one thing that
+    cannot be assumed is that it is absent. The fence is refused with *that*
+    operation's error rather than its own, which is the refusal that already
+    governs the stream while an append is unsettled: settle it with
+    ``resolve_append()``, then fence.
+    """
+    backend = CommittingThenFailingBackend()
+    tokens = _offline_producer(backend, "batch").topic("tokens", type=str)
+
+    publishing = asyncio.ensure_future(tokens.publish("a", wake=False))
+    await asyncio.wait_for(backend.committed.wait(), 2)
+    fencing = asyncio.ensure_future(tokens.finish_writing(wake=False))
+    await _let_every_ready_task_run()
+
+    assert not fencing.done()
+    assert [r.sequence for r in backend.all_records(TOKENS)] == [0], (
+        "the fixture must actually have committed, or this asserts nothing"
+    )
+
+    backend.lose_the_answer.set()
+    with pytest.raises(AppendNotAcknowledgedError) as lost:
+        await publishing
+    with pytest.raises(AppendNotAcknowledgedError) as refused:
+        await fencing
+
+    assert refused.value.record.idempotency_key == lost.value.record.idempotency_key, (
+        "the fence must report the unsettled operation's recovery, not invent one "
+        "for a fence that was never appended"
+    )
+    assert [r.kind for r in backend.all_records(TOKENS)] == [RecordKind.DATA], (
+        "a fence was appended in front of a record whose position was not settled"
+    )
+
+    await tokens.resolve_append(lost.value.record, wake=False)
+    await tokens.finish_writing(wake=False)
+
+    records = backend.all_records(TOKENS)
+    assert [(r.sequence, r.kind) for r in records] == [
+        (0, RecordKind.DATA),
+        (2, RecordKind.WRITE_FENCE),
+    ], "the settled record must be in the stream once, ahead of the fence"
+
+
+async def test_a_fence_refuses_to_stand_in_for_a_failed_publish(
+    backend: MemoryStreamBackend,
+) -> None:
+    """A failed earlier write is propagated, not passed over.
+
+    The caller asked for that write before it asked for the fence, and a fence
+    appended over the gap tells a consumer the batch is complete when it is
+    short a record. Nothing is appended for the refused fence, so once the
+    failure has been dealt with -- by republishing the value or by accepting the
+    batch without it -- ``finish_writing()`` again appends one.
+    """
+    codec = GatedFailingCodec()
+    tokens = _gated_producer(backend, codec, "batch").topic("tokens", type=str)
+
+    publishing = asyncio.ensure_future(tokens.publish("a", wake=False))
+    await codec.wait_inside('"a"')
+    fencing = asyncio.ensure_future(tokens.finish_writing(wake=False))
+    await _let_every_ready_task_run()
+    codec.release('"a"')
+
+    with pytest.raises(RuntimeError):
+        await publishing
+    with pytest.raises(PrecedingWriteFailedError) as caught:
+        await fencing
+
+    assert caught.value.sequence == 0 and caught.value.stream_key == TOKENS
+    assert isinstance(caught.value.__cause__, RuntimeError), (
+        "the fence must carry what actually failed, not describe it"
+    )
+    assert backend.all_records(TOKENS) == []
+
+    await tokens.finish_writing(wake=False)
+    assert [(r.sequence, r.kind) for r in backend.all_records(TOKENS)] == [
+        (2, RecordKind.WRITE_FENCE)
+    ], "the failed write is no longer outstanding, so a fence must go in now"
 
 
 async def test_republishing_different_content_under_one_key_is_an_error(

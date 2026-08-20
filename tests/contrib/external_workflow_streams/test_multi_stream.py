@@ -491,7 +491,7 @@ class FakeRuntime:
     def delivery_budget_remaining(self) -> int:
         return self.budget
 
-    def codec_for(self, value_type: type | None):
+    def codec_for(self, value_type: type | None, wait_id: int):
         return StreamPayloadCodec(
             temporalio.converter.DataConverter.default, value_type
         )
