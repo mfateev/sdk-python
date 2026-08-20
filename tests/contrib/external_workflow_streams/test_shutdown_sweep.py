@@ -540,9 +540,19 @@ async def test_a_wake_the_live_path_delivered_is_not_counted_as_abandoned(
     # Run's subscription away -- which is what it does on `RunNotFound`, and only
     # once its own owed wake has been acknowledged. The sweep then reaches that Run,
     # finds no subscriptions, and moves on without saying anything about it.
+    #
+    # Both halves of that drop are reproduced, in the order the production path
+    # uses them: the flag first, then the pop. Popping alone takes the
+    # subscription out of the sweep's reach while leaving its watcher looping on
+    # `while not subscription._cancelled`, so the watcher outlives the test's
+    # event loop and reads from the backend after it closes -- an unraisable
+    # `RuntimeError: Event loop is closed` that this test's own shortcut, not the
+    # manager, is responsible for.
     async def drop_the_other(run_id: str) -> str:
         if run_id == RUN_ID:
-            harness.manager._runs.get(other_run, {}).pop(1, None)
+            dropped = harness.manager._runs.get(other_run, {}).pop(1, None)
+            if dropped is not None:
+                dropped._cancelled = True
         return RunStatus.PARKED
 
     harness.manager._run_status = drop_the_other  # type: ignore[assignment]

@@ -540,7 +540,17 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
         return pending
 
     def _forget(self, record: StreamRecord) -> None:
-        """Drops a record from the unresolved set, by identity."""
+        """Drops a settled append from the unresolved set.
+
+        Matched on the idempotency key, where :meth:`_remember` and
+        :meth:`_outstanding` match on the whole record. Not a discrepancy that
+        is reachable: a record with a stored key but different bytes cannot be
+        in the set, because `_outstanding` refuses it with a ``ValueError``
+        before the backend is touched and `publish` always draws an unused key.
+        If either of those ever stops holding, this drops both entries for the
+        key while the other two treat them as distinct, and one unsettled append
+        disappears without being settled.
+        """
         outstanding = self._producer._unresolved.get(self._stream_key)
         if not outstanding:
             return
