@@ -210,6 +210,10 @@ M1_COVERAGE: dict[int, str | tuple[str, ...]] = {
         "test_wake.py::test_an_unknown_append_can_only_be_resolved_on_its_originating_topic",
         "test_wake.py::test_recovery_is_bound_to_the_producer_instance_that_made_the_append",
     ),
+    # 79 follows the same operation through a second unknown outcome. The
+    # recovery attempt's effective wake and lease supersede the original
+    # publish's, while cancellation delivered on either attempt remains owed.
+    79: "test_wake.py::test_a_reinterrupted_append_recovery_preserves_its_latest_wake",
 }
 
 #: Case number -> what is still missing, for cases the suite does not fully

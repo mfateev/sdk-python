@@ -1136,6 +1136,90 @@ async def test_a_refused_append_preserves_the_unresolved_operations_recovery() -
 
 
 @pytest.mark.asyncio
+async def test_a_reinterrupted_append_recovery_preserves_its_latest_wake() -> None:
+    """A second lost response must not restore the first attempt's wake policy.
+
+    ``resolve_append`` may deliberately override the unresolved operation's wake
+    and lease. If that append also commits without returning, the error describes
+    the recovery attempt that was interrupted. Retaining the older operation
+    beside that newer error makes the next defaulted recovery silently use stale
+    instructions -- here it returns success without the Signal the error says is
+    owed.
+    """
+
+    class LoseThreeResponsesAfterCommit(MemoryStreamBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempt = 0
+            self.second_committed = asyncio.Event()
+
+        async def append(self, key, record):  # type: ignore[no-untyped-def]
+            placed = await super().append(key, record)
+            self.attempt += 1
+            if self.attempt == 1:
+                raise ConnectionError("the append committed but its response was lost")
+            if self.attempt == 2:
+                self.second_committed.set()
+                await asyncio.Event().wait()
+            if self.attempt == 3:
+                raise ConnectionError("the recovery response was also lost")
+            return placed
+
+    backend = LoseThreeResponsesAfterCommit()
+    client = RecordingClient()
+    topic = make_producer(backend, client).topic("tokens", type=str)
+    await park(backend, topic.stream_key, wait_id=1, gen=4)
+
+    with pytest.raises(AppendNotAcknowledgedError) as first:
+        await topic.publish("a", wake=False)
+
+    recovery_lease = timedelta(seconds=97)
+    recovery = asyncio.ensure_future(
+        topic.resolve_append(first.value.record, wake=True, lease=recovery_lease)
+    )
+    await asyncio.wait_for(backend.second_committed.wait(), 2)
+    recovery.cancel()
+    with pytest.raises(AppendNotAcknowledgedError) as second:
+        await recovery
+
+    assert second.value.record == first.value.record
+    assert second.value.wake is True
+    assert second.value.lease == recovery_lease
+    assert second.value.cancelled is True
+    assert not client.sent
+
+    with pytest.raises(AppendNotAcknowledgedError) as third:
+        await topic.resolve_append(second.value.record)
+
+    assert third.value.record == second.value.record
+    assert third.value.wake is True
+    assert third.value.lease == recovery_lease
+    assert third.value.cancelled is True, (
+        "a later connection failure erased the cancellation the caller still "
+        "has to honour after settling the operation"
+    )
+
+    with pytest.raises(AppendNotAcknowledgedError) as refused:
+        await topic.publish("b", wake=False, lease=timedelta(seconds=5))
+
+    assert refused.value.record == third.value.record
+    assert refused.value.wake is True
+    assert refused.value.lease == recovery_lease
+    assert refused.value.cancelled is True
+
+    offset = await topic.resolve_append(refused.value.record)
+
+    assert len(client.sent) == 1, (
+        "the second recovery defaulted to the original publish's wake=False "
+        "instead of the interrupted resolve_append's wake=True"
+    )
+    records = await backend.read_after(topic.stream_key, BEGINNING, max_records=10)
+    assert [(r.sequence, r.offset) for r in records] == [(0, offset)], (
+        "repeated recovery appended more than the one record being settled"
+    )
+
+
+@pytest.mark.asyncio
 async def test_an_unknown_append_can_only_be_resolved_on_its_originating_topic() -> (
     None
 ):

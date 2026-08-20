@@ -211,12 +211,13 @@ class AppendNotAcknowledgedError(Exception):
         self.lease = lease
         """The claim lease the interrupted call was going to use."""
         self.cancelled = cancelled
-        """Whether cancellation, rather than a failure, ended the attempt.
+        """Whether cancellation ended any attempt to settle this operation.
 
         Reported rather than propagated, for the reason ADR-036 already gives
         about the wake: a caller that wants to honour the cancellation re-raises
         *after* resolving the append, and that is the only order that leaves
-        nothing owed.
+        nothing owed. Sticky across recovery attempts: a later transport failure
+        must not erase a cancellation the caller still has to honour.
         """
 
 
@@ -243,7 +244,7 @@ class _UnresolvedAppend:
     cancelled: bool
 
     def error(self, message: str) -> AppendNotAcknowledgedError:
-        """This operation, reported. Every raise reproduces the same recovery."""
+        """Reports this operation's current canonical recovery."""
         return AppendNotAcknowledgedError(
             message,
             stream_key=self.stream_key,
@@ -512,12 +513,31 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
             "refused call asked for."
         )
 
-    def _remember(self, pending: _UnresolvedAppend) -> None:
-        """Records an unsettled append, without duplicating a re-interrupted one."""
+    def _remember(self, pending: _UnresolvedAppend) -> _UnresolvedAppend:
+        """Makes ``pending`` the canonical state for this unsettled operation.
+
+        A recovery may deliberately change the wake or lease. If its own append
+        then loses the response, the *recovery* is now the interrupted operation,
+        so retaining the older policy makes the next defaulted attempt contradict
+        the error it was handed. Cancellation is different: once delivered it is
+        still owed after every later failure, so it accumulates rather than being
+        replaced.
+        """
         outstanding = self._producer._unresolved.setdefault(self._stream_key, [])
-        if any(held.record == pending.record for held in outstanding):
-            return
+        for index, held in enumerate(outstanding):
+            if held.record != pending.record:
+                continue
+            pending = _UnresolvedAppend(
+                stream_key=pending.stream_key,
+                record=pending.record,
+                wake=pending.wake,
+                lease=pending.lease,
+                cancelled=held.cancelled or pending.cancelled,
+            )
+            outstanding[index] = pending
+            return pending
         outstanding.append(pending)
+        return pending
 
     def _forget(self, record: StreamRecord) -> None:
         """Drops a record from the unresolved set, by identity."""
@@ -564,7 +584,7 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
                 lease=lease,
                 cancelled=isinstance(err, asyncio.CancelledError),
             )
-            self._remember(pending)
+            pending = self._remember(pending)
             raise pending.error(
                 f"the append of {record.idempotency_key} did not report an "
                 f"outcome: {err!r}. Whether it landed is unknown -- a backend "
