@@ -105,6 +105,7 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         assert_local_activity_valid: Callable[[str], None],
         encode_headers: bool,
         max_workflow_task_external_storage_concurrency: int,
+        external_stream_continuation_schema_version: int | None = None,
         default_workflow_logic_flags: frozenset[_WorkflowLogicFlag] | None = None,
         external_stream_backends: Mapping[str, Any] | None = None,
         client: Any = None,
@@ -172,6 +173,9 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         # Worker's own event loop because that is the loop the watchers must run
         # on, and __init__ is not necessarily called from it.
         self._external_stream_backends = external_stream_backends
+        self._external_stream_continuation_schema_version = (
+            external_stream_continuation_schema_version
+        )
         #: Held only to send the reserved wake Signal, which is a raw service
         #: call rather than anything the bridge can do -- Core cannot signal a
         #: Workflow on this Worker's behalf.
@@ -1258,6 +1262,7 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             DEFAULT_IDLE_TIMEOUT,
         )
         from temporalio.contrib.external_workflow_streams._continuation import (
+            _DEFAULT_CONTINUATION_WRITE_SCHEMA_VERSION,
             read_continuation_header,
         )
         from temporalio.contrib.external_workflow_streams._runtime import (
@@ -1298,6 +1303,14 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
                 )
             ),
             default_idle_timeout=DEFAULT_IDLE_TIMEOUT,
+            # Resolved against the constant rather than against a literal, so
+            # moving the release's deployment stage is the one edit ADR-039 says
+            # it is instead of three that can disagree.
+            continuation_schema_version=(
+                self._external_stream_continuation_schema_version
+                if self._external_stream_continuation_schema_version is not None
+                else _DEFAULT_CONTINUATION_WRITE_SCHEMA_VERSION
+            ),
             # Read here, before the Workflow object exists and therefore before
             # any subscribe() call: a start cursor restored after a subscription
             # was established would already have been overwritten by BEGINNING

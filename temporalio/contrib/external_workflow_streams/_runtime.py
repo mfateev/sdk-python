@@ -56,7 +56,11 @@ from temporalio.contrib.external_workflow_streams._backend import (
     StreamKey,
 )
 from temporalio.contrib.external_workflow_streams._codec import StreamPayloadCodec
-from temporalio.contrib.external_workflow_streams._continuation import Continuation
+from temporalio.contrib.external_workflow_streams._continuation import (
+    _DEFAULT_CONTINUATION_WRITE_SCHEMA_VERSION,
+    Continuation,
+    _validate_continuation_schema_version,
+)
 from temporalio.contrib.external_workflow_streams._errors import (
     ExternalStreamCapacityError,
     StreamStorageError,
@@ -210,7 +214,18 @@ class WorkflowStreamRuntime:
         default_idle_timeout: timedelta,
         max_annotation_bytes: int = MAX_ANNOTATION_BYTES,
         continuation: Continuation | None = None,
+        continuation_schema_version: int = _DEFAULT_CONTINUATION_WRITE_SCHEMA_VERSION,
     ) -> None:
+        _validate_continuation_schema_version(continuation_schema_version)
+        if continuation is not None:
+            _validate_continuation_schema_version(continuation.schema_version)
+            # A reader-stage Worker may start a new chain at v1, but it must not
+            # turn an existing v2 chain back into bytes an old Worker accepts.
+            # That would discard must-understand binding proof already carried
+            # by the chain and recreate finding 9 on its following Run.
+            continuation_schema_version = max(
+                continuation_schema_version, continuation.schema_version
+            )
         self._manager = manager
         self._backends = backends
         self._run_id = run_id
@@ -234,6 +249,12 @@ class WorkflowStreamRuntime:
         #: read from the backend -- a cursor derived from mutable backend state
         #: would give replay whatever the stream holds now (ADR-022).
         self._continuation = continuation
+        #: The schema this deployment writes for a successor, raised to the
+        #: predecessor's version when necessary so a chain never sheds fields
+        #: an older reader must not ignore. Kept separately from what this
+        #: runtime can read so the v2 reader can be rolled out while new chains
+        #: remain pinned to v1 (ADR-039).
+        self._continuation_schema_version = continuation_schema_version
 
         self._subscriptions: dict[int, _SubscriptionState] = {}
         #: Where the *current* annotation begins, per wait. Captured when the
@@ -1368,6 +1389,7 @@ class WorkflowStreamRuntime:
                 wait_id: binding.provider_format_version
                 for wait_id, binding in bindings.items()
             },
+            schema_version=self._continuation_schema_version,
         )
 
     def restored_start(

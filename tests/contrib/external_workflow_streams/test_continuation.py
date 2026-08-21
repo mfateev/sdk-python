@@ -19,6 +19,10 @@ import pytest
 
 import temporalio.converter
 from temporalio import workflow
+from temporalio.bridge.proto.workflow_activation import (
+    InitializeWorkflow,
+    WorkflowActivation,
+)
 from temporalio.client import Client, WorkflowHandle
 from temporalio.contrib.external_workflow_streams._annotation import (
     AnnotationDecodeError,
@@ -26,6 +30,7 @@ from temporalio.contrib.external_workflow_streams._annotation import (
 )
 from temporalio.contrib.external_workflow_streams._backend import StreamKey
 from temporalio.contrib.external_workflow_streams._continuation import (
+    _DEFAULT_CONTINUATION_WRITE_SCHEMA_VERSION,
     CONTINUATION_HEADER,
     Continuation,
     decode_continuation,
@@ -57,7 +62,13 @@ async def _notify(run_id: str, wait_id: int, generation: int) -> str:
     return ReadinessResult.ACCEPTED
 
 
-def make_runtime(manager, backend, continuation=None, backends=None):  # type: ignore[no-untyped-def]
+def make_runtime(
+    manager,
+    backend,
+    continuation=None,
+    backends=None,
+    continuation_schema_version=1,
+):  # type: ignore[no-untyped-def]
     return WorkflowStreamRuntime(
         manager=manager,
         backends={"tokens": backend} if backends is None else backends,
@@ -68,6 +79,7 @@ def make_runtime(manager, backend, continuation=None, backends=None):  # type: i
         data_converter=temporalio.converter.DataConverter.default,
         default_idle_timeout=timedelta(seconds=1),
         continuation=continuation,
+        continuation_schema_version=continuation_schema_version,
     )
 
 
@@ -531,6 +543,159 @@ LIVE_CONTINUATION = Continuation(
     provider_ids={1: "memory", 2: "redis"},
     provider_format_versions={1: 1, 2: 3},
 )
+
+
+def test_the_v2_reader_can_be_staged_while_the_live_writer_remains_v1(
+    manager: StubManager, backend: MemoryStreamBackend
+) -> None:
+    """The decoder has to reach the fleet before any live Worker emits v2.
+
+    This is the production runtime path rather than a directly constructed
+    ``Continuation``: finding 10 was that the value exposed a schema field but
+    the runtime always took its v2 default, leaving no way to make a deployment
+    reader-only. The same module must read a v2 header while this runtime writes
+    a v1 header that the preceding Worker can still restore.
+    """
+    runtime = make_runtime(manager, backend)
+    runtime.register(
+        wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
+    )
+
+    live = runtime.continuation()
+    raw = encode_continuation(live)
+
+    assert live.schema_version == 1
+    assert raw[0] == 1
+    assert (
+        _restore_as_a_worker_without_the_binding(raw, subscribed_stream="tokens")
+        == BEGINNING
+    )
+    assert (
+        decode_continuation(encode_continuation(LIVE_CONTINUATION)) == LIVE_CONTINUATION
+    )
+
+
+def test_a_reader_stage_worker_does_not_downgrade_an_existing_v2_chain(
+    manager: StubManager, backend: MemoryStreamBackend
+) -> None:
+    """Once recorded, must-understand binding data cannot become optional.
+
+    A v1-pinned Worker may receive a v2 successor during rollback. Writing v1
+    from that Run would let a still-older Worker accept the following successor
+    without validating its backend, recreating the silent foreign-cursor restore
+    that v2 prevents.
+    """
+    runtime = make_runtime(
+        manager,
+        backend,
+        continuation=Continuation({}, {}, schema_version=2),
+        continuation_schema_version=1,
+    )
+
+    assert runtime.continuation().schema_version == 2
+
+
+def _runtime_from_a_real_worker(
+    worker: Worker, monkeypatch: pytest.MonkeyPatch
+) -> WorkflowStreamRuntime:
+    """The runtime a Worker builds for a Run, off the production path.
+
+    ``_create_external_stream_runtime`` is what an activation reaches, so it is
+    what has to be asked: finding 10 was that every path into it produced a
+    version 2 writer, which a test constructing ``Continuation`` directly cannot
+    see. Only the manager is stubbed, because nothing here talks to a backend.
+    """
+    assert worker._workflow_worker is not None
+    monkeypatch.setattr(
+        worker._workflow_worker, "_stream_manager", lambda: StubManager()
+    )
+    runtime = worker._workflow_worker._create_external_stream_runtime(
+        WorkflowActivation(run_id="run"),
+        InitializeWorkflow(workflow_id="workflow", first_execution_run_id="first"),
+    )
+    assert runtime is not None
+    return runtime
+
+
+async def test_a_worker_that_selects_nothing_is_the_reader_stage(
+    client: Client,
+    backend: MemoryStreamBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stage a release ships in is the stage its default deploys.
+
+    Pinned through the Worker rather than by reading the constant, because the
+    constant is only the answer if every layer between it and a live
+    Continue-As-New defers to it. Finding 10 was exactly a default that no
+    configuration could reach; a literal repeated down that path would let the
+    constant move while the default stayed put, so this fails if any layer
+    stops deferring -- and it fails on the release that moves the stage, which
+    is the release that must decide to.
+    """
+    worker = Worker(
+        client,
+        task_queue=f"tq-{uuid.uuid4()}",
+        workflows=[ChainedConsumerWorkflow],
+        external_stream_backends={"tokens-memory": backend},
+    )
+
+    assert worker.config().get("external_stream_continuation_schema_version") is None
+    runtime = _runtime_from_a_real_worker(worker, monkeypatch)
+
+    assert runtime.continuation().schema_version == 1
+    assert _DEFAULT_CONTINUATION_WRITE_SCHEMA_VERSION == 1, (
+        "moving the shipped stage is a deployment decision, so it must not ride "
+        "a release as a quiet constant edit"
+    )
+
+
+@pytest.mark.parametrize("schema_version", (1, 2))
+async def test_the_worker_threads_the_continuation_writer_version(
+    client: Client,
+    backend: MemoryStreamBackend,
+    monkeypatch: pytest.MonkeyPatch,
+    schema_version: int,
+) -> None:
+    """A serialization-only switch would not make a live rollout possible."""
+    worker = Worker(
+        client,
+        task_queue=f"tq-{uuid.uuid4()}",
+        workflows=[ChainedConsumerWorkflow],
+        external_stream_backends={"tokens-memory": backend},
+        external_stream_continuation_schema_version=schema_version,
+    )
+
+    assert (
+        worker.config().get("external_stream_continuation_schema_version")
+        == schema_version
+    )
+    assert worker._workflow_worker is not None
+    assert (
+        worker._workflow_worker._external_stream_continuation_schema_version
+        == schema_version
+    )
+    runtime = _runtime_from_a_real_worker(worker, monkeypatch)
+
+    assert runtime.continuation().schema_version == schema_version
+
+
+async def test_a_write_version_this_worker_cannot_read_fails_construction(
+    client: Client, backend: MemoryStreamBackend
+) -> None:
+    """A Worker that writes what it cannot read is caught before it polls.
+
+    The same reason the backend registry is validated in the constructor: the
+    alternative is failing the first Continue-As-New of a Run that has already
+    consumed records against that setting.
+    """
+    with pytest.raises(ValueError, match="must be one of 1, 2"):
+        Worker(
+            client,
+            task_queue=f"tq-{uuid.uuid4()}",
+            workflows=[ChainedConsumerWorkflow],
+            external_stream_backends={"tokens-memory": backend},
+            external_stream_continuation_schema_version=3,
+        )
 
 
 def test_a_live_header_is_refused_by_a_worker_without_the_binding() -> None:

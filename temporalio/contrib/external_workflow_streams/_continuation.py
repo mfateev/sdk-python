@@ -57,7 +57,7 @@ no cursor at all.
 """
 
 _SCHEMA_VERSION = 2
-"""What a live Continue-As-New writes.
+"""The newest continuation schema this SDK can write.
 
 Version 1 carried only a cursor and a stream name per wait, which is not enough
 to say *what the cursor is a position in*: an offset means nothing outside the
@@ -78,17 +78,31 @@ What that costs is stated rather than avoided: an old Worker fails the
 successor's first Workflow Task, and every retry identically, until a
 binding-aware Worker picks it up -- and a rollback to only old Workers blocks
 that Run until it is rolled forward. That is a blocked Run rather than a wrong
-one, which is the direction ADR-014 takes everywhere else in this feature, and
-it is why moving this constant is a staged deployment step: every Worker must
-*decode* the new version before any Worker *writes* it.
-:attr:`Continuation.schema_version` is what lets a writer be pinned behind its
-readers while that is arranged.
+one, which is the direction ADR-014 takes everywhere else in this feature.
+Every Worker must therefore *decode* the new version before any Worker *writes*
+it. A live runtime supplies the deployment's selected write version when it
+constructs :class:`Continuation`; the value's default is the newest version for
+direct callers, not the fleet rollout policy.
 
-The bump needs no SDK internal flag. Core matches a Continue-As-New command to
-its ``WorkflowExecutionContinuedAsNew`` event by command type alone -- it never
+The bump needs no replay flag. Core matches a Continue-As-New command to its
+``WorkflowExecutionContinuedAsNew`` event by command type alone -- it never
 compares the command's headers with the recorded ones -- so a replay that
 regenerates the command at this version cannot disagree with a History written
-at version 1. The only bytes that reach History are a live completion's.
+at version 1. The write-version selector is instead a deployment gate for the
+successor Run, which is the Run that reads the persisted bytes.
+"""
+
+_DEFAULT_CONTINUATION_WRITE_SCHEMA_VERSION = 1
+"""What a live Worker writes until its fleet's v2 readers are staged.
+
+Version 1 is deliberately still the deployment default even though direct
+``Continuation`` values default to the latest schema. That makes this build the
+reader-only stage ADR-039 requires: it can be rolled through a fleet without
+producing a header the previous build refuses. Once every Worker eligible for a
+successor can decode version 2 -- or Worker Versioning routes successors away
+from older builds -- the Worker setting can be moved to version 2. A chain that
+has already read version 2 stays there even on a Worker pinned to version 1;
+downgrading it would discard binding proof an old reader must not ignore.
 """
 
 _DECODABLE_SCHEMA_VERSIONS = (1, _SCHEMA_VERSION)
@@ -104,6 +118,20 @@ never recorded cannot be made, while a check that was recorded must never be
 discarded. The first is the residue of an upgrade and ends with the chain; the
 second would be a Worker choosing to ignore proof it was handed.
 """
+
+
+def _validate_continuation_schema_version(version: int) -> None:
+    """Rejects a write version this SDK cannot also read."""
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version not in _DECODABLE_SCHEMA_VERSIONS
+    ):
+        understood = ", ".join(str(v) for v in _DECODABLE_SCHEMA_VERSIONS)
+        raise ValueError(
+            f"external stream continuation schema version must be one of "
+            f"{understood}, got {version!r}"
+        )
 
 
 @dataclass(frozen=True)
@@ -151,17 +179,14 @@ class Continuation:
     """The version :func:`encode_continuation` will write this state at.
 
     Carried on the value rather than fixed by the encoder so a decoded header
-    re-encodes to the bytes it came from, and so a version can be pinned from
-    outside if a Run ever has to reproduce what another Worker wrote.
+    re-encodes to the bytes it came from, and so the live runtime can apply its
+    deployment's selected write version.
     """
 
 
 def encode_continuation(continuation: Continuation) -> bytes:
     version = continuation.schema_version
-    if version not in _DECODABLE_SCHEMA_VERSIONS:
-        raise ValueError(
-            f"cannot encode a Continue-As-New cursor header at schema version {version}"
-        )
+    _validate_continuation_schema_version(version)
     out = bytearray()
     _put_uvarint(out, version)
     _put_uvarint(out, len(continuation.cursors))
