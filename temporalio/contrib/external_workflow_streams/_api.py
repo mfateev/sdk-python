@@ -498,17 +498,17 @@ async def _await_any_readiness(
                 return True
         await asyncio.wait(futures, return_when=asyncio.FIRST_COMPLETED)
         return False
-    except BaseException:
-        # Abandoned rather than resolved -- cancellation, most often because
-        # this merge lost a race against a timer. Nothing is awaiting these
-        # waits any more, so they must leave the blocked set; leaving them in it
-        # asks Core to retain and eventually park the Workflow Task for a
-        # coroutine that no longer exists.
-        for subscription in subscriptions:
-            runtime.note_blocked(subscription.wait_id, False)
-        raise
     finally:
         for subscription in subscriptions:
+            # The merged wait is one scoped operation, so every member leaves
+            # the blocked set when that operation ends -- including members
+            # that did not win a successful wait. `_peek()` clears only a wait
+            # that has a record in hand; leaving the others blocked after their
+            # futures are discarded asks Core to retain and eventually park the
+            # Workflow Task for coroutines that no longer exist. A subsequent
+            # group wait marks every member blocked again and advances its wait
+            # generation as a new blocking epoch.
+            runtime.note_blocked(subscription.wait_id, False)
             subscription._pending_future = None
             runtime.discard_pending(subscription.wait_id)
         for future in futures:

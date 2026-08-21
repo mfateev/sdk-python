@@ -606,6 +606,10 @@ async def test_merge_marks_every_wait_blocked_when_nothing_is_ready(
         await pending
     except asyncio.CancelledError:
         pass
+    assert dict(fake_runtime.blocked) == {1: False, 2: False}, (
+        "cancelling the merged wait left members in the blocked set"
+    )
+    assert not fake_runtime.pending, "cancelling left readiness futures registered"
 
 
 @pytest.mark.asyncio
@@ -624,6 +628,90 @@ async def test_merge_resumes_when_any_one_wait_is_resolved(
     fake_runtime.pending[second.wait_id].set_result(None)
 
     assert await asyncio.wait_for(pending, 1) == (second, "b1")
+
+
+@pytest.mark.asyncio
+async def test_a_resolved_merge_leaves_no_nonwinning_wait_blocked(
+    public_api_runtime: WorkflowStreamRuntime,
+    manager: StubManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful group wait ends for every member, not only its winner.
+
+    The readiness activation resolves the group's futures together, while a
+    record may exist for only one wait. The others have no coroutine behind
+    them once the group returns, so leaving one in the quiescent snapshot asks
+    Core to retain and eventually park a Workflow Task for nobody.
+    """
+    first = external_stream.topic("a", backend="tokens", type=str).subscribe()
+    second = external_stream.topic("b", backend="tokens", type=str).subscribe()
+    iterator = merge(first, second)
+    pending = asyncio.ensure_future(iterator.__anext__())
+    await asyncio.sleep(0.05)
+
+    snapshot = public_api_runtime.quiescent_snapshot()
+    assert snapshot is not None and [wait.wait_id for wait in snapshot] == [1, 2]
+
+    record = (await encoded("b1"))[0].placed_at(Offset("00000001"))
+    delivered = False
+
+    def drain(run_id, wait_id, max_records=None):  # type: ignore[no-untyped-def]
+        nonlocal delivered
+        if wait_id == second.wait_id and not delivered:
+            delivered = True
+            return [record]
+        return []
+
+    monkeypatch.setattr(manager, "drain", drain)
+    public_api_runtime.resolve_all_pending()
+
+    assert await asyncio.wait_for(pending, 1) == (second, "b1")
+    snapshot_after_yield = public_api_runtime.quiescent_snapshot()
+    await iterator.aclose()
+
+    assert snapshot_after_yield is None, (
+        "the merge yielded one member but left its non-winning member blocked, "
+        "so Core would retain the Workflow Task for a discarded future"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_merge_double_check_leaves_no_nonwinning_wait_blocked(
+    public_api_runtime: WorkflowStreamRuntime,
+    manager: StubManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The post-registration early return has the same group cleanup contract.
+
+    A record can arrive after the initial pass found every stream empty but
+    before the pending futures are awaited. `_await_any_readiness()` finds it in
+    its double-check and returns early; that successful exit must still unblock
+    every member.
+    """
+    first = external_stream.topic("a", backend="tokens", type=str).subscribe()
+    second = external_stream.topic("b", backend="tokens", type=str).subscribe()
+    record = (await encoded("b1"))[0].placed_at(Offset("00000001"))
+    drain_calls: dict[int, int] = {}
+
+    def drain(run_id, wait_id, max_records=None):  # type: ignore[no-untyped-def]
+        drain_calls[wait_id] = drain_calls.get(wait_id, 0) + 1
+        # First call: the merge's initial pass. Second call: the registered
+        # wait's double-check immediately before `asyncio.wait()`.
+        if wait_id == second.wait_id and drain_calls[wait_id] == 2:
+            return [record]
+        return []
+
+    monkeypatch.setattr(manager, "drain", drain)
+    iterator = merge(first, second)
+
+    assert await asyncio.wait_for(iterator.__anext__(), 1) == (second, "b1")
+    snapshot_after_yield = public_api_runtime.quiescent_snapshot()
+    await iterator.aclose()
+
+    assert snapshot_after_yield is None, (
+        "the double-check returned a record but left another group member in "
+        "the quiescent snapshot"
+    )
 
 
 @pytest.mark.asyncio
