@@ -678,6 +678,234 @@ async def test_a_fence_refuses_to_stand_in_for_a_failed_publish(
     ], "the failed write is no longer outstanding, so a fence must go in now"
 
 
+async def test_a_cancelled_fence_does_not_refuse_a_later_fence(
+    backend: MemoryStreamBackend,
+) -> None:
+    """A failed *fence* is not a failed write, so it is not propagated as one.
+
+    Two concurrent fences make independent claims about the publishes each was
+    invoked after, and neither is inside the other's claim. Holding them in one
+    append order made a fence that never reached the backend -- cancelled here,
+    but a refusal does the same -- look to a later fence exactly like a publish
+    whose record went missing, so a fence with every preceding write durable
+    behind it was refused with ``PrecedingWriteFailedError``. That error is
+    documented as reporting a failed ``publish()``, and nothing else.
+    """
+    codec = GatedPayloadCodec()
+    tokens = _gated_producer(backend, codec, "batch").topic("tokens", type=str)
+
+    publishing = asyncio.ensure_future(tokens.publish("a", wake=False))
+    await codec.wait_inside('"a"')
+    abandoned = asyncio.ensure_future(tokens.finish_writing(wake=False))
+    await _let_every_ready_task_run()
+    fencing = asyncio.ensure_future(tokens.finish_writing(wake=False))
+    await _let_every_ready_task_run()
+
+    abandoned.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await abandoned
+    assert not fencing.done(), (
+        "the second fence appended while the publish it covers was still encoding"
+    )
+
+    codec.release('"a"')
+    await publishing
+    await fencing
+
+    assert [(r.sequence, r.kind) for r in backend.all_records(TOKENS)] == [
+        (0, RecordKind.DATA),
+        (2, RecordKind.WRITE_FENCE),
+    ], (
+        "the surviving fence must append behind the data, and the cancelled one "
+        "must leave nothing in the stream"
+    )
+
+
+class RefusingRecoveryBackend(MemoryStreamBackend):
+    """Loses the answer to a data append, then refuses its recovery.
+
+    Both halves are contract behaviour rather than a broken store: a backend
+    commits before it answers, so the answer can be lost, and
+    ``AppendConflictError`` is the one definite refusal the contract defines --
+    the key it names holds different bytes, so the record being recovered did
+    not land and never will. Together they are the case where "no longer
+    unresolved" and "durable" are not the same thing, which is reachable from a
+    session-id collision or a retry that reused the sequence for other bytes.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reached = asyncio.Event()
+        self.answer = asyncio.Event()
+        self.data_appends = 0
+
+    async def append(self, key, record):  # type: ignore[no-untyped-def]
+        if record.kind is not RecordKind.DATA:
+            return await super().append(key, record)
+        self.data_appends += 1
+        if self.data_appends == 1:
+            self.reached.set()
+            await self.answer.wait()
+            raise ConnectionError("connection reset")
+        # Refused without suspending, so nothing runs between the unresolved
+        # entry disappearing and the waiting fence reading the outcome. That is
+        # the window in which a stale "unknown" looked like durability.
+        raise AppendConflictError(record.idempotency_key)
+
+
+async def test_a_fence_is_refused_when_recovery_proves_the_write_absent() -> None:
+    """A resolved append is not a durable one, so the fence may not infer it.
+
+    An append whose answer was lost is unknown, not failed -- and the fence
+    waits rather than refusing outright. What ends the wait is
+    ``resolve_append()``, and it ends it *two* ways: the record is durable, or
+    the backend refuses the key and the record demonstrably never landed.
+    Deciding between them by whether the record is still in the producer's
+    unresolved set cannot work, because both outcomes remove it, and the fence
+    then appended over a hole while claiming the batch complete.
+    """
+    backend = RefusingRecoveryBackend()
+    tokens = _offline_producer(backend, "batch").topic("tokens", type=str)
+
+    async def publish_then_recover() -> None:
+        with pytest.raises(AppendNotAcknowledgedError) as lost:
+            await tokens.publish("a", wake=False)
+        with pytest.raises(AppendConflictError):
+            await tokens.resolve_append(lost.value.record, wake=False)
+
+    publishing = asyncio.ensure_future(publish_then_recover())
+    await asyncio.wait_for(backend.reached.wait(), 2)
+    fencing = asyncio.ensure_future(tokens.finish_writing(wake=False))
+    await _let_every_ready_task_run()
+
+    assert not fencing.done(), "the fence overtook an append of unknown outcome"
+
+    backend.answer.set()
+    await publishing
+    with pytest.raises(PrecedingWriteFailedError) as refused:
+        await fencing
+
+    assert refused.value.sequence == 0 and refused.value.stream_key == TOKENS
+    assert isinstance(refused.value.__cause__, AppendConflictError), (
+        "the fence must carry the refusal recovery learned, not the unknown "
+        "outcome the interrupted call reported"
+    )
+    assert backend.all_records(TOKENS) == [], (
+        "a fence was appended claiming a write that recovery proved absent"
+    )
+
+
+async def test_a_fence_goes_in_once_recovery_makes_the_write_durable() -> None:
+    """The other half of the same decision, and the one that must not refuse.
+
+    A recovery that finds the record already there resolves the unknown outcome
+    to *durable*, and the write the fence was waiting for is now in the stream
+    ahead of it. The fence has to be released, not refused: reporting
+    ``PrecedingWriteFailedError`` for a record that landed sends the caller to
+    republish a value the stream already holds.
+    """
+    backend = CommittingThenFailingBackend()
+    tokens = _offline_producer(backend, "batch").topic("tokens", type=str)
+
+    async def publish_then_recover() -> None:
+        with pytest.raises(AppendNotAcknowledgedError) as lost:
+            await tokens.publish("a", wake=False)
+        # The record did commit, so re-appending byte-identical content is the
+        # no-op the recovery depends on -- and it returns without suspending, so
+        # the fence's next turn is the first one after the resolution.
+        await tokens.resolve_append(lost.value.record, wake=False)
+
+    publishing = asyncio.ensure_future(publish_then_recover())
+    await asyncio.wait_for(backend.committed.wait(), 2)
+    fencing = asyncio.ensure_future(tokens.finish_writing(wake=False))
+    await _let_every_ready_task_run()
+
+    assert not fencing.done()
+
+    backend.lose_the_answer.set()
+    await publishing
+    await fencing
+
+    records = backend.all_records(TOKENS)
+    assert [(r.sequence, r.kind) for r in records] == [
+        (0, RecordKind.DATA),
+        (1, RecordKind.WRITE_FENCE),
+    ], "the recovered record must be in the stream once, ahead of the fence"
+
+
+class LosesOneAnswerThenRefusesIt(MemoryStreamBackend):
+    """Loses sequence 0's answer, refuses its recovery, and holds sequence 1.
+
+    Two data writes precede one fence, and only the *second* is still in flight
+    when the first is recovered -- which is the schedule that decides whether the
+    fence reads an outcome or a memory of one.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reached = asyncio.Event()
+        self.answer = asyncio.Event()
+        self.release_second = asyncio.Event()
+
+    async def append(self, key, record):  # type: ignore[no-untyped-def]
+        if record.kind is RecordKind.DATA and record.sequence == 0:
+            if not self.reached.is_set():
+                self.reached.set()
+                await self.answer.wait()
+                raise ConnectionError("connection reset")
+            raise AppendConflictError(record.idempotency_key)
+        if record.kind is RecordKind.DATA and record.sequence == 1:
+            await self.release_second.wait()
+        return await super().append(key, record)
+
+
+async def test_a_resolution_reached_while_the_fence_waits_on_a_later_write() -> None:
+    """An outcome read at wait time can still change; one read after cannot.
+
+    The fence waits on each earlier publish in turn, so it can pass the first
+    one -- reading "unknown", which is not yet a failure -- and then sit on the
+    second while ``resolve_append()`` proves the first absent. An outcome
+    captured on the way past is the stale one, and stale here means permissive:
+    the fence skips a write recovery has refused and appends over the hole.
+    """
+    backend = LosesOneAnswerThenRefusesIt()
+    tokens = _offline_producer(backend, "batch").topic("tokens", type=str)
+
+    first = asyncio.ensure_future(tokens.publish("a", wake=False))
+    await asyncio.wait_for(backend.reached.wait(), 2)
+    second = asyncio.ensure_future(tokens.publish("b", wake=False))
+    await _let_every_ready_task_run()
+    fencing = asyncio.ensure_future(tokens.finish_writing(wake=False))
+    await _let_every_ready_task_run()
+
+    assert not fencing.done()
+
+    backend.answer.set()
+    with pytest.raises(AppendNotAcknowledgedError) as lost:
+        await first
+    # Lets the fence take its turn on the *first* write and park on the second,
+    # which is the state this case is about.
+    await _let_every_ready_task_run()
+    assert not fencing.done(), "the fence must still be held by the second write"
+
+    with pytest.raises(AppendConflictError):
+        await tokens.resolve_append(lost.value.record, wake=False)
+
+    backend.release_second.set()
+    await second
+
+    with pytest.raises(PrecedingWriteFailedError) as refused:
+        await fencing
+
+    assert refused.value.sequence == 0, (
+        "the fence must report the write recovery refused, not the one that landed"
+    )
+    assert isinstance(refused.value.__cause__, AppendConflictError)
+    assert [(r.sequence, r.kind) for r in backend.all_records(TOKENS)] == [
+        (1, RecordKind.DATA)
+    ], "only the second write may be in the stream, and no fence behind it"
+
+
 async def test_republishing_different_content_under_one_key_is_an_error(
     backend: MemoryStreamBackend,
 ) -> None:

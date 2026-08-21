@@ -65,22 +65,44 @@ store that produced it. Version 2 carries the whole binding, so restoration can
 refuse a cursor whose backend moved instead of handing it to a store that will
 accept it and skip records.
 
-The bump is **not** gated behind an SDK internal flag. Core matches a
-Continue-As-New command to its ``WorkflowExecutionContinuedAsNew`` event by
-command type alone -- it never compares the command's headers with the recorded
-ones -- so a replay that regenerates the command at this version cannot
-disagree with a History written at version 1. The only bytes that reach History
-are a live completion's, and a live completion is free to write the current
-version. :attr:`Continuation.schema_version` is where such a gate would attach
-if that ever stopped being true.
+**The binding is must-understand data, and the version number is what enforces
+that.** The reader of this header is the *next Run's* Worker, which on an
+unversioned task queue may be an older one -- so a Worker that cannot validate
+the binding has to be a Worker that cannot start the Run. A version it refuses
+is the only thing that makes it one: no arrangement of bytes can make deployed
+code perform a check it has no code for, so a header an old Worker can parse is
+a header it restores with the check skipped, which is precisely the silent
+record-skipping the binding exists to prevent (ADR-039).
+
+What that costs is stated rather than avoided: an old Worker fails the
+successor's first Workflow Task, and every retry identically, until a
+binding-aware Worker picks it up -- and a rollback to only old Workers blocks
+that Run until it is rolled forward. That is a blocked Run rather than a wrong
+one, which is the direction ADR-014 takes everywhere else in this feature, and
+it is why moving this constant is a staged deployment step: every Worker must
+*decode* the new version before any Worker *writes* it.
+:attr:`Continuation.schema_version` is what lets a writer be pinned behind its
+readers while that is arranged.
+
+The bump needs no SDK internal flag. Core matches a Continue-As-New command to
+its ``WorkflowExecutionContinuedAsNew`` event by command type alone -- it never
+compares the command's headers with the recorded ones -- so a replay that
+regenerates the command at this version cannot disagree with a History written
+at version 1. The only bytes that reach History are a live completion's.
 """
 
-_DECODABLE_SCHEMA_VERSIONS = (1, 2)
+_DECODABLE_SCHEMA_VERSIONS = (1, _SCHEMA_VERSION)
 """Every version this Worker can read.
 
-A chain in flight when the Worker fleet was upgraded has a version 1 header
-sitting in its successor's ``WorkflowExecutionStarted`` already, and that Run has
-to start somewhere other than ``BEGINNING``.
+Version 1 stays readable because a chain in flight when the fleet was upgraded
+has a version 1 header sitting in its successor's ``WorkflowExecutionStarted``
+already, and that Run has to start somewhere other than ``BEGINNING``.
+
+Accepting it restores a cursor with the binding checks skipped, which is the
+same *outcome* an old Worker reaches and not the same *fault*: a check that was
+never recorded cannot be made, while a check that was recorded must never be
+discarded. The first is the residue of an upgrade and ends with the chain; the
+second would be a Worker choosing to ignore proof it was handed.
 """
 
 
@@ -110,9 +132,14 @@ class Continuation:
       read in a successor Run happens before that Run has written a marker that
       could perform the check, so the continuation has to carry them itself.
 
-    Absent or empty entries mean *not recorded* rather than *empty*: that is what
-    a version 1 header decodes to, and restoration skips the checks it cannot
-    make rather than reporting a mismatch against nothing.
+    A missing entry means *not recorded* -- which is what a header written before
+    the binding was carried decodes to -- and restoration skips the checks it
+    cannot make rather than reporting a mismatch against nothing. For the three
+    string maps an empty value means the same thing, because no wait is bound to
+    an unnamed stream, backend or provider. ``provider_format_versions`` is the
+    exception and is read by **membership**: zero is a format version a provider
+    may legitimately declare, so the entry's presence is the only thing that
+    distinguishes it from nothing having been recorded.
     """
 
     cursors: dict[int, Cursor]
@@ -125,7 +152,7 @@ class Continuation:
 
     Carried on the value rather than fixed by the encoder so a decoded header
     re-encodes to the bytes it came from, and so a version can be pinned from
-    outside if a Run ever has to reproduce what an older Worker wrote.
+    outside if a Run ever has to reproduce what another Worker wrote.
     """
 
 
@@ -147,6 +174,12 @@ def encode_continuation(continuation: Continuation) -> bytes:
         _put_cursor(out, continuation.cursors[wait_id])
         _put_str(out, continuation.stream_names.get(wait_id, ""))
         if version >= 2:
+            # Inline, per entry, rather than appended after them. A trailing
+            # block is what a reader that does not know the version steps over,
+            # and stepping over the binding is the one thing no reader may do:
+            # it restores the cursor with the check skipped. Interleaved, the
+            # bytes are unreadable to anything that has not been taught the
+            # version, which is what the version is for (ADR-039).
             _put_str(out, continuation.backend_names.get(wait_id, ""))
             _put_str(out, continuation.provider_ids.get(wait_id, ""))
             _put_uvarint(out, continuation.provider_format_versions.get(wait_id, 0))

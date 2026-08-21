@@ -22,6 +22,7 @@ from temporalio import workflow
 from temporalio.client import Client, WorkflowHandle
 from temporalio.contrib.external_workflow_streams._annotation import (
     AnnotationDecodeError,
+    _Reader,
 )
 from temporalio.contrib.external_workflow_streams._backend import StreamKey
 from temporalio.contrib.external_workflow_streams._continuation import (
@@ -396,6 +397,67 @@ def test_a_newer_provider_format_version_is_a_storage_failure(
     assert backend.range_reads == [], "raised before any backend read"
 
 
+def test_a_recorded_format_version_of_zero_is_still_compared(
+    manager: StubManager,
+) -> None:
+    """Zero is a format version, not a "nothing was recorded" sentinel.
+
+    The backend contract types ``provider_format_version`` as a plain integer
+    and reserves no value, and the header represents zero exactly. Deciding
+    whether a version was recorded by truthiness therefore skipped the
+    comparison for the one value that looks falsey, which made Continue-As-New
+    less safe than marker replay for the same binding: replay compares exactly.
+    """
+    backend = MemoryStreamBackend()
+    assert type(backend).provider_format_version == 1, (
+        "the fixture must declare a version the recorded zero disagrees with"
+    )
+    runtime = make_runtime(
+        manager,
+        backend,
+        Continuation(
+            {1: AFTER(Offset("200-0"))},
+            {1: "tokens"},
+            {1: "tokens"},
+            {1: "memory"},
+            {1: 0},
+        ),
+    )
+
+    with pytest.raises(StreamStorageError, match="format version"):
+        runtime.register(
+            wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
+        )
+
+    assert manager.registered == [], "the cursor must not reach the manager"
+    assert backend.range_reads == [], "raised before any backend read"
+
+
+def test_a_header_that_recorded_no_format_version_skips_the_check(
+    manager: StubManager, backend: MemoryStreamBackend
+) -> None:
+    """The other half of reading that map by membership.
+
+    A header written before the binding was carried has no entry at all, and
+    there is nothing to compare against; refusing it would strand every chain
+    that continued as new across the upgrade.
+    """
+    runtime = make_runtime(
+        manager,
+        backend,
+        Continuation({1: AFTER(Offset("200-0"))}, {1: "tokens"}),
+    )
+
+    runtime.register(
+        wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
+    )
+
+    assert runtime._subscriptions[1].start_cursor == AFTER(Offset("200-0"))
+
+
+# --- reading a header this Worker did not write -------------------------------
+
+
 #: One wait at ``AFTER("100-3")`` on stream ``tokens``, as a Worker that only
 #: knew schema version 1 wrote it. Written out rather than produced by this
 #: module's encoder, so a change to the encoder cannot quietly redefine what a
@@ -406,13 +468,14 @@ VERSION_1_HEADER = bytes([1, 1, 1, 0x01, 5]) + b"100-3" + bytes([6]) + b"tokens"
 def test_a_version_1_continuation_still_restores(
     manager: StubManager, backend: MemoryStreamBackend
 ) -> None:
-    """A chain that continued as new before the fleet was upgraded.
+    """A chain that continued as new before the binding was carried.
 
-    Its successor's ``WorkflowExecutionStarted`` already holds version 1 bytes,
-    and that Run has to start where its predecessor stopped rather than at
-    ``BEGINNING``. Version 1 recorded no backend, so the checks that need one
-    are skipped -- not failed against nothing -- and re-encoding reproduces the
-    bytes the header arrived as.
+    Its successor's ``WorkflowExecutionStarted`` already holds those bytes, and
+    that Run has to start where its predecessor stopped rather than at
+    ``BEGINNING``. Nothing was recorded about the store, so the checks that need
+    one are skipped -- not failed against nothing -- and re-encoding reproduces
+    the bytes the header arrived as, since a header carrying only cursors has no
+    extension to append.
     """
     restored = decode_continuation(VERSION_1_HEADER)
 
@@ -426,6 +489,112 @@ def test_a_version_1_continuation_still_restores(
     )
 
     assert runtime._subscriptions[1].start_cursor == AFTER(Offset("100-3"))
+
+
+def _restore_as_a_worker_without_the_binding(raw: bytes, subscribed_stream: str) -> Any:
+    """What a Worker deployed before the binding existed does with these bytes.
+
+    Written out rather than imported, because the behaviour under test is a
+    *shipped* one and is frozen. Both halves of it are: that decoder accepts
+    schema version 1 and nothing else, reads the count and exactly that many
+    entries, and returns without looking at what follows -- and its restoration
+    then compares the **stream name alone**, because a backend name is not
+    something it was ever given. Importing the current implementation would test
+    this Worker against itself, which is the one pair that is never mixed.
+
+    Returns the cursor that old Worker would hand its backend.
+    """
+    reader = _Reader(raw)
+    version = reader.uvarint()
+    if version != 1:
+        raise AnnotationDecodeError(
+            f"the Continue-As-New cursor header is schema version {version}, but "
+            "this Worker understands 1. The previous Run of this chain was "
+            "executed by a newer SDK."
+        )
+    cursors: dict[int, Any] = {}
+    stream_names: dict[int, str] = {}
+    for _ in range(reader.uvarint()):
+        wait_id = reader.uvarint()
+        cursors[wait_id] = reader.cursor()
+        stream_names[wait_id] = reader.string()
+    # The whole of the old restoration check.
+    if stream_names.get(1, "") not in ("", subscribed_stream):
+        raise AssertionError("this old Worker would have reported nondeterminism")
+    return cursors.get(1)
+
+
+LIVE_CONTINUATION = Continuation(
+    cursors={1: AFTER(Offset("100-3")), 2: BEGINNING},
+    stream_names={1: "tokens", 2: "tool-events"},
+    backend_names={1: "store-a", 2: "store-b"},
+    provider_ids={1: "memory", 2: "redis"},
+    provider_format_versions={1: 1, 2: 3},
+)
+
+
+def test_a_live_header_is_refused_by_a_worker_without_the_binding() -> None:
+    """The binding is must-understand data, so refusal is the required outcome.
+
+    A Worker that cannot validate the binding must not start the successor Run,
+    and the version number is the only thing that can make it one: no
+    arrangement of bytes makes deployed code perform a check it has no code for.
+    An envelope such a Worker *can* parse — the binding appended behind the
+    entries it reads, say — is one it restores with the check skipped, and this
+    test shows what that costs. The old restoration compares the stream name and
+    nothing else, so a fleet where `tokens` resolves to another store on the old
+    build hands it a cursor produced somewhere else, and every record below that
+    boundary is skipped in silence.
+
+    Refusing instead fails the successor's first Workflow Task until a
+    binding-aware Worker takes it, which is a blocked Run rather than a wrong
+    one — the direction ADR-014 takes throughout this feature.
+    """
+    raw = encode_continuation(LIVE_CONTINUATION)
+
+    assert raw[0] == 2, (
+        "a live header must announce a version that a Worker unable to check the "
+        "binding refuses outright"
+    )
+
+    with pytest.raises(AnnotationDecodeError, match="schema version 2"):
+        _restore_as_a_worker_without_the_binding(raw, subscribed_stream="tokens")
+
+    # What that refusal prevents: the same old Worker, handed a header it *can*
+    # parse, accepts the cursor on the strength of the stream name alone and
+    # never learns which store produced it.
+    version_1_shape = encode_continuation(
+        dataclasses.replace(
+            LIVE_CONTINUATION,
+            backend_names={},
+            provider_ids={},
+            provider_format_versions={},
+            schema_version=1,
+        )
+    )
+    assert _restore_as_a_worker_without_the_binding(
+        version_1_shape, subscribed_stream="tokens"
+    ) == AFTER(Offset("100-3")), (
+        "the old restoration must be shown accepting a cursor with no backend "
+        "check, or the refusal above is not protecting anything"
+    )
+
+
+def test_a_header_with_the_binding_inlined_still_decodes() -> None:
+    """Written only by a build between the binding landing and this envelope.
+
+    A chain that continued as new under one has a successor whose start header
+    holds those bytes, so they stay readable -- and re-encoding reproduces them
+    rather than silently rewriting a header this Worker only read.
+    """
+    inlined = dataclasses.replace(LIVE_CONTINUATION, schema_version=2)
+    raw = encode_continuation(inlined)
+
+    assert raw[0] == 2
+    decoded = decode_continuation(raw)
+
+    assert decoded == inlined
+    assert encode_continuation(decoded) == raw
 
 
 # --- what gets committed ------------------------------------------------------

@@ -1435,9 +1435,17 @@ class WorkflowStreamRuntime:
         identity at all.
 
         An empty recorded provider id means the predecessor had nothing to
-        record -- a version 1 header, or a backend that had already left the
-        Worker's registration when the continuation was taken -- and there is
-        nothing to compare against.
+        record -- a header from before the binding was carried, or a backend that
+        had already left the Worker's registration when the continuation was
+        taken -- and there is nothing to compare against.
+
+        The format version is decided by *membership* rather than truthiness. The
+        backend contract types it as a plain integer and reserves no value, so
+        zero is a version a provider may declare and the encoding represents it
+        exactly. Read as a "nothing recorded" sentinel it silently skipped the
+        comparison, which made Continue-As-New less safe than marker replay for
+        the same binding: a cursor written at version 0 was handed to a version 1
+        implementation.
         """
         assert self._continuation is not None
         recorded_id = self._continuation.provider_ids.get(wait_id, "")
@@ -1456,9 +1464,12 @@ class WorkflowStreamRuntime:
                 f"{declared_id!r}. The restored cursor is a position in the store "
                 "that produced it; register the recorded provider under that name."
             )
-        recorded_version = self._continuation.provider_format_versions.get(wait_id, 0)
+        recorded_versions = self._continuation.provider_format_versions
         declared_version = type(backend).provider_format_version
-        if recorded_version and recorded_version != declared_version:
+        if wait_id not in recorded_versions:
+            return
+        recorded_version = recorded_versions[wait_id]
+        if recorded_version != declared_version:
             raise StreamStorageError(
                 f"external stream wait {wait_id} was continued from a Run that "
                 f"read it through provider {recorded_id!r} format version "
