@@ -631,90 +631,6 @@ async def test_merge_resumes_when_any_one_wait_is_resolved(
 
 
 @pytest.mark.asyncio
-async def test_a_resolved_merge_leaves_no_nonwinning_wait_blocked(
-    public_api_runtime: WorkflowStreamRuntime,
-    manager: StubManager,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A successful group wait ends for every member, not only its winner.
-
-    The readiness activation resolves the group's futures together, while a
-    record may exist for only one wait. The others have no coroutine behind
-    them once the group returns, so leaving one in the quiescent snapshot asks
-    Core to retain and eventually park a Workflow Task for nobody.
-    """
-    first = external_stream.topic("a", backend="tokens", type=str).subscribe()
-    second = external_stream.topic("b", backend="tokens", type=str).subscribe()
-    iterator = merge(first, second)
-    pending = asyncio.ensure_future(iterator.__anext__())
-    await asyncio.sleep(0.05)
-
-    snapshot = public_api_runtime.quiescent_snapshot()
-    assert snapshot is not None and [wait.wait_id for wait in snapshot] == [1, 2]
-
-    record = (await encoded("b1"))[0].placed_at(Offset("00000001"))
-    delivered = False
-
-    def drain(run_id, wait_id, max_records=None):  # type: ignore[no-untyped-def]
-        nonlocal delivered
-        if wait_id == second.wait_id and not delivered:
-            delivered = True
-            return [record]
-        return []
-
-    monkeypatch.setattr(manager, "drain", drain)
-    public_api_runtime.resolve_all_pending()
-
-    assert await asyncio.wait_for(pending, 1) == (second, "b1")
-    snapshot_after_yield = public_api_runtime.quiescent_snapshot()
-    await iterator.aclose()
-
-    assert snapshot_after_yield is None, (
-        "the merge yielded one member but left its non-winning member blocked, "
-        "so Core would retain the Workflow Task for a discarded future"
-    )
-
-
-@pytest.mark.asyncio
-async def test_a_merge_double_check_leaves_no_nonwinning_wait_blocked(
-    public_api_runtime: WorkflowStreamRuntime,
-    manager: StubManager,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The post-registration early return has the same group cleanup contract.
-
-    A record can arrive after the initial pass found every stream empty but
-    before the pending futures are awaited. `_await_any_readiness()` finds it in
-    its double-check and returns early; that successful exit must still unblock
-    every member.
-    """
-    first = external_stream.topic("a", backend="tokens", type=str).subscribe()
-    second = external_stream.topic("b", backend="tokens", type=str).subscribe()
-    record = (await encoded("b1"))[0].placed_at(Offset("00000001"))
-    drain_calls: dict[int, int] = {}
-
-    def drain(run_id, wait_id, max_records=None):  # type: ignore[no-untyped-def]
-        drain_calls[wait_id] = drain_calls.get(wait_id, 0) + 1
-        # First call: the merge's initial pass. Second call: the registered
-        # wait's double-check immediately before `asyncio.wait()`.
-        if wait_id == second.wait_id and drain_calls[wait_id] == 2:
-            return [record]
-        return []
-
-    monkeypatch.setattr(manager, "drain", drain)
-    iterator = merge(first, second)
-
-    assert await asyncio.wait_for(iterator.__anext__(), 1) == (second, "b1")
-    snapshot_after_yield = public_api_runtime.quiescent_snapshot()
-    await iterator.aclose()
-
-    assert snapshot_after_yield is None, (
-        "the double-check returned a record but left another group member in "
-        "the quiescent snapshot"
-    )
-
-
-@pytest.mark.asyncio
 async def test_merging_a_subscription_with_itself_is_refused(
     fake_runtime: FakeRuntime,
 ) -> None:
@@ -996,3 +912,142 @@ async def test_closing_a_subscription_tells_the_worker_to_stop_serving_it(
     # replay and a Continue-As-New successor can still read it.
     subscription.close()
     assert manager.cancelled == [(RUN_ID, subscription.wait_id)]
+
+
+@pytest.mark.asyncio
+async def test_a_resolved_merge_leaves_no_nonwinning_wait_blocked(
+    public_api_runtime: WorkflowStreamRuntime,
+    manager: StubManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful group wait ends for every member, not only its winner.
+
+    The readiness activation resolves the group's futures together, while a
+    record may exist for only one wait. The others have no coroutine behind
+    them once the group returns, so leaving one in the quiescent snapshot asks
+    Core to retain and eventually park a Workflow Task for nobody.
+    """
+    first = external_stream.topic("a", backend="tokens", type=str).subscribe()
+    second = external_stream.topic("b", backend="tokens", type=str).subscribe()
+    iterator = merge(first, second)
+    pending = asyncio.ensure_future(iterator.__anext__())
+    await asyncio.sleep(0.05)
+
+    snapshot = public_api_runtime.quiescent_snapshot()
+    assert snapshot is not None and [wait.wait_id for wait in snapshot] == [1, 2]
+
+    record = (await encoded("b1"))[0].placed_at(Offset("00000001"))
+    delivered = False
+
+    def drain(run_id, wait_id, max_records=None):  # type: ignore[no-untyped-def]
+        nonlocal delivered
+        if wait_id == second.wait_id and not delivered:
+            delivered = True
+            return [record]
+        return []
+
+    monkeypatch.setattr(manager, "drain", drain)
+    public_api_runtime.resolve_all_pending()
+
+    assert await asyncio.wait_for(pending, 1) == (second, "b1")
+    snapshot_after_yield = public_api_runtime.quiescent_snapshot()
+    await iterator.aclose()
+
+    assert snapshot_after_yield is None, (
+        "the merge yielded one member but left its non-winning member blocked, "
+        "so Core would retain the Workflow Task for a discarded future"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_merge_double_check_leaves_no_nonwinning_wait_blocked(
+    public_api_runtime: WorkflowStreamRuntime,
+    manager: StubManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The post-registration early return has the same group cleanup contract.
+
+    A record can arrive after the initial pass found every stream empty but
+    before the pending futures are awaited. `_await_any_readiness()` finds it in
+    its double-check and returns early; that successful exit must still unblock
+    every member.
+    """
+    first = external_stream.topic("a", backend="tokens", type=str).subscribe()
+    second = external_stream.topic("b", backend="tokens", type=str).subscribe()
+    record = (await encoded("b1"))[0].placed_at(Offset("00000001"))
+    drain_calls: dict[int, int] = {}
+
+    def drain(run_id, wait_id, max_records=None):  # type: ignore[no-untyped-def]
+        drain_calls[wait_id] = drain_calls.get(wait_id, 0) + 1
+        # First call: the merge's initial pass. Second call: the registered
+        # wait's double-check immediately before `asyncio.wait()`.
+        if wait_id == second.wait_id and drain_calls[wait_id] == 2:
+            return [record]
+        return []
+
+    monkeypatch.setattr(manager, "drain", drain)
+    iterator = merge(first, second)
+
+    assert await asyncio.wait_for(iterator.__anext__(), 1) == (second, "b1")
+    snapshot_after_yield = public_api_runtime.quiescent_snapshot()
+    await iterator.aclose()
+
+    assert snapshot_after_yield is None, (
+        "the double-check returned a record but left another group member in "
+        "the quiescent snapshot"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_half_registered_merge_leaves_no_wait_blocked(
+    public_api_runtime: WorkflowStreamRuntime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Registering the group is covered by the cleanup that ends it.
+
+    The refusal pass is careful to check every member before claiming any, so
+    that a refused merge claims nothing. A raise part-way through the claim
+    itself reaches the same state by the other route: the members already
+    marked blocked have futures nothing can resolve, and the snapshot asks Core
+    to retain a Workflow Task on their behalf.
+    """
+    first = external_stream.topic("a", backend="tokens", type=str).subscribe()
+    second = external_stream.topic("b", backend="tokens", type=str).subscribe()
+
+    real = public_api_runtime.new_readiness_future
+    made = 0
+
+    def fail_on_the_second() -> asyncio.Future[None]:
+        nonlocal made
+        made += 1
+        if made == 2:
+            raise RuntimeError("no future for you")
+        return real()
+
+    monkeypatch.setattr(public_api_runtime, "new_readiness_future", fail_on_the_second)
+
+    with pytest.raises(RuntimeError, match="no future for you"):
+        await merge(first, second).__anext__()
+
+    assert public_api_runtime.quiescent_snapshot() is None, (
+        "a merge that failed while claiming its group left a wait blocked with "
+        "no future behind it, so Core would retain the Workflow Task for it"
+    )
+    assert public_api_runtime.resolve_all_pending() == 0, (
+        "a merge that failed while claiming its group left a readiness future "
+        "registered, which the next activation would resolve for nobody"
+    )
+    assert first._pending_future is None and second._pending_future is None
+
+    # And the group is claimable again rather than permanently refused: the
+    # single-slot claim each member holds is what the refusal reads.
+    monkeypatch.setattr(public_api_runtime, "new_readiness_future", real)
+    pending = asyncio.ensure_future(merge(first, second).__anext__())
+    await asyncio.sleep(0.05)
+    snapshot = public_api_runtime.quiescent_snapshot()
+    assert snapshot is not None and [wait.wait_id for wait in snapshot] == [1, 2]
+    pending.cancel()
+    try:
+        await pending
+    except asyncio.CancelledError:
+        pass

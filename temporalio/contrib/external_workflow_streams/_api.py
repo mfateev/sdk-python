@@ -21,7 +21,7 @@ it, so no name may collide -- and in particular no name here may begin with
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import Any, Generic, Protocol
@@ -326,7 +326,7 @@ class ExternalStreamTopic(Generic[AnyType]):
 
 async def merge(
     *subscriptions: ExternalStreamSubscription[Any],
-) -> AsyncIterator[tuple[ExternalStreamSubscription[Any], Any]]:
+) -> AsyncGenerator[tuple[ExternalStreamSubscription[Any], Any], None]:
     """Iterates several subscriptions as one wait, in delivery order.
 
     Yields ``(subscription, value)`` rather than bare values: the streams may
@@ -387,6 +387,17 @@ async def merge(
     :py:data:`MAX_RECORDS_PER_ACTIVATION` records. A per-subscription budget
     would let the activation run *n* times as long, which is the same deadlock
     with a larger constant in front of it.
+
+    **Ending a merge does not end the subscriptions it merged.** Stopping at a
+    value -- breaking out of the ``async for``, or ``aclose()`` on the generator
+    -- leaves every subscription open, at its own cursor, and consumable again
+    either singly or in another merge. Closing them is
+    :meth:`ExternalStreamSubscription.close`, and that is a separate decision,
+    because it is the one that drops what the buffer still holds without
+    consuming it. Nothing is left blocked in the meantime: the merged wait
+    unblocks every member when it ends, so a Workflow that stops consuming and
+    goes on to wait for something else is not holding a Workflow Task open for a
+    stream nobody is reading.
     """
     ordered = sorted(subscriptions, key=lambda s: s.wait_id)
     if not ordered:
@@ -458,9 +469,23 @@ async def _await_any_readiness(
 ) -> bool:
     """Blocks until any one of the waits is resolved. Returns whether it skipped.
 
-    Every wait is marked blocked, because the quiescent snapshot must name the
-    **complete** set the Workflow is waiting on: a set missing one member would
-    let Core park the Workflow Task while that member was still live.
+    **One scoped operation over the whole group**, and both halves of that follow
+    from it.
+
+    Every wait is marked blocked while it runs, because the quiescent snapshot
+    must name the **complete** set the Workflow is waiting on: a set missing one
+    member would let Core park the Workflow Task while that member was still
+    live.
+
+    And every wait leaves the blocked set when it ends, however it ends -- a
+    resolved future, the double-check below returning early, or cancellation.
+    Only one member can have a record in hand afterwards, and :meth:`_peek` clears
+    the flag only for that one, so a member left blocked here is one no coroutine
+    is awaiting: the quiescent snapshot names it, and Core retains and eventually
+    parks the Workflow Task on behalf of a group wait that is already over. The
+    next genuine group wait marks every member blocked again and advances its
+    wait generation, which is a new blocking epoch rather than a continuation of
+    this one.
     """
     runtime = subscriptions[0]._state.runtime
     assert runtime is not None
@@ -470,17 +495,21 @@ async def _await_any_readiness(
     # Workflow Task for nobody.
     for subscription in subscriptions:
         subscription._refuse_a_second_waiter()
-    futures = []
-    for subscription in subscriptions:
-        runtime.note_blocked(subscription.wait_id, True)
-        future = runtime.new_readiness_future()
-        runtime.register_pending(subscription.wait_id, future)
-        # Also on the subscription, so `close()` can resume a merge that is
-        # sitting on this wait: the runtime's map is keyed for the side that
-        # resolves readiness, and closing is neither that side nor this one.
-        subscription._pending_future = future
-        futures.append(future)
+    futures: list[asyncio.Future[None]] = []
     try:
+        # Inside the `try`, so that registering the group is covered by the same
+        # cleanup that ends it. A raise part-way through would otherwise leave
+        # the members already registered blocked with their futures unreachable
+        # -- the very state the refusal loop above is careful not to create.
+        for subscription in subscriptions:
+            runtime.note_blocked(subscription.wait_id, True)
+            future = runtime.new_readiness_future()
+            runtime.register_pending(subscription.wait_id, future)
+            # Also on the subscription, so `close()` can resume a merge that is
+            # sitting on this wait: the runtime's map is keyed for the side that
+            # resolves readiness, and closing is neither that side nor this one.
+            subscription._pending_future = future
+            futures.append(future)
         # The same last look the single-subscription path takes, for the same
         # reason: a record buffered before these waits were registered had its
         # readiness reported to nobody. And for the same reason as there, it
@@ -500,14 +529,12 @@ async def _await_any_readiness(
         return False
     finally:
         for subscription in subscriptions:
-            # The merged wait is one scoped operation, so every member leaves
-            # the blocked set when that operation ends -- including members
-            # that did not win a successful wait. `_peek()` clears only a wait
-            # that has a record in hand; leaving the others blocked after their
-            # futures are discarded asks Core to retain and eventually park the
-            # Workflow Task for coroutines that no longer exist. A subsequent
-            # group wait marks every member blocked again and advances its wait
-            # generation as a new blocking epoch.
+            # Unblocking belongs here, beside the removal of the futures it is
+            # the counterpart of: a wait whose readiness future has just been
+            # discarded is a wait nothing can be waiting on. See this function's
+            # docstring for what leaving one blocked would ask of Core -- and
+            # note that a member the loop above never reached is already
+            # unblocked, so this is a no-op for it rather than a claim about it.
             runtime.note_blocked(subscription.wait_id, False)
             subscription._pending_future = None
             runtime.discard_pending(subscription.wait_id)
