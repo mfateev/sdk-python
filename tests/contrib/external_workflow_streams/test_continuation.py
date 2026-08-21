@@ -536,7 +536,11 @@ def _restore_as_a_worker_without_the_binding(raw: bytes, subscribed_stream: str)
     return cursors.get(1)
 
 
-LIVE_CONTINUATION = Continuation(
+#: What a Worker writes once its deployment has moved to the writer stage, which
+#: is the only stage that emits the binding. Not what a default Worker writes:
+#: the reader stage ships first and emits version 1, so "live" says nothing about
+#: which of the two a header came from and the stage has to be in the name.
+WRITER_STAGE_CONTINUATION = Continuation(
     cursors={1: AFTER(Offset("100-3")), 2: BEGINNING},
     stream_names={1: "tokens", 2: "tool-events"},
     backend_names={1: "store-a", 2: "store-b"},
@@ -545,10 +549,10 @@ LIVE_CONTINUATION = Continuation(
 )
 
 
-def test_the_v2_reader_can_be_staged_while_the_live_writer_remains_v1(
+def test_the_v2_reader_can_be_staged_while_the_writer_remains_v1(
     manager: StubManager, backend: MemoryStreamBackend
 ) -> None:
-    """The decoder has to reach the fleet before any live Worker emits v2.
+    """The decoder has to reach the fleet before any Worker emits v2.
 
     This is the production runtime path rather than a directly constructed
     ``Continuation``: finding 10 was that the value exposed a schema field but
@@ -571,7 +575,8 @@ def test_the_v2_reader_can_be_staged_while_the_live_writer_remains_v1(
         == BEGINNING
     )
     assert (
-        decode_continuation(encode_continuation(LIVE_CONTINUATION)) == LIVE_CONTINUATION
+        decode_continuation(encode_continuation(WRITER_STAGE_CONTINUATION))
+        == WRITER_STAGE_CONTINUATION
     )
 
 
@@ -698,7 +703,7 @@ async def test_a_write_version_this_worker_cannot_read_fails_construction(
         )
 
 
-def test_a_live_header_is_refused_by_a_worker_without_the_binding() -> None:
+def test_a_writer_stage_header_is_refused_by_a_worker_without_the_binding() -> None:
     """The binding is must-understand data, so refusal is the required outcome.
 
     A Worker that cannot validate the binding must not start the successor Run,
@@ -715,11 +720,11 @@ def test_a_live_header_is_refused_by_a_worker_without_the_binding() -> None:
     binding-aware Worker takes it, which is a blocked Run rather than a wrong
     one — the direction ADR-014 takes throughout this feature.
     """
-    raw = encode_continuation(LIVE_CONTINUATION)
+    raw = encode_continuation(WRITER_STAGE_CONTINUATION)
 
     assert raw[0] == 2, (
-        "a live header must announce a version that a Worker unable to check the "
-        "binding refuses outright"
+        "a writer-stage header must announce a version that a Worker unable to "
+        "check the binding refuses outright"
     )
 
     with pytest.raises(AnnotationDecodeError, match="schema version 2"):
@@ -730,7 +735,7 @@ def test_a_live_header_is_refused_by_a_worker_without_the_binding() -> None:
     # never learns which store produced it.
     version_1_shape = encode_continuation(
         dataclasses.replace(
-            LIVE_CONTINUATION,
+            WRITER_STAGE_CONTINUATION,
             backend_names={},
             provider_ids={},
             provider_format_versions={},
@@ -752,7 +757,7 @@ def test_a_header_with_the_binding_inlined_still_decodes() -> None:
     holds those bytes, so they stay readable -- and re-encoding reproduces them
     rather than silently rewriting a header this Worker only read.
     """
-    inlined = dataclasses.replace(LIVE_CONTINUATION, schema_version=2)
+    inlined = dataclasses.replace(WRITER_STAGE_CONTINUATION, schema_version=2)
     raw = encode_continuation(inlined)
 
     assert raw[0] == 2
@@ -896,6 +901,145 @@ async def test_a_chain_resumes_where_its_predecessor_stopped(
             "the successor Run redelivered records its predecessor had already "
             "consumed, so the continuation cursor did not survive Continue-As-New"
         )
+
+
+async def test_a_writer_stage_chain_carries_the_binding_through_history(
+    client: Client, backend: MemoryStreamBackend
+) -> None:
+    """The binding reaches the successor as History, and is checked on the way in.
+
+    The chain above runs at the stage this release ships, which writes version 1
+    and therefore carries no binding at all -- so nothing end-to-end exercises
+    the bytes the binding was added for. Everything else that does builds a
+    ``Continuation`` by hand, which cannot show that a live Worker puts the
+    binding on the command, that the server persists it into the successor's
+    ``WorkflowExecutionStarted``, or that the successor validates it rather than
+    merely tolerating it.
+
+    The last of those is asserted against the *recorded* bytes with only the
+    provider identity moved, so the run that must fail differs from the run that
+    must succeed in exactly the thing the binding exists to detect.
+    """
+    task_queue = f"tq-{uuid.uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[ChainedConsumerWorkflow],
+        external_stream_backends={"tokens-memory": backend},
+        external_stream_continuation_schema_version=2,
+    ):
+        handle = await client.start_workflow(
+            ChainedConsumerWorkflow.run,
+            2,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=task_queue,
+        )
+        description = await handle.describe()
+        first_run_id = description.raw_description.workflow_execution_info.first_run_id
+        key = StreamKey(client.namespace, handle.id, first_run_id, "tokens")
+        await asyncio.sleep(1)
+        # One call, carrying its own sequence: a second call would restart the
+        # producer sequence at zero and the backend would reject the appends as
+        # non-identical repeats, which presents as a hung Workflow.
+        await publish(backend, key, ["a", "b", "c", "d"])
+
+        assert await asyncio.wait_for(handle.result(), 60) == ["c", "d"]
+        predecessor = await client.get_workflow_handle(
+            handle.id, run_id=first_run_id
+        ).fetch_history()
+
+    continued = [
+        e
+        for e in predecessor.events
+        if e.HasField("workflow_execution_continued_as_new_event_attributes")
+    ]
+    assert continued, "the predecessor did not continue as new"
+    attributes = continued[0].workflow_execution_continued_as_new_event_attributes
+    recorded = decode_continuation(attributes.header.fields[CONTINUATION_HEADER].data)
+
+    assert recorded.schema_version == 2, (
+        "a Worker at the writer stage wrote a header with no binding in it"
+    )
+    assert recorded.backend_names == {1: "tokens-memory"}
+    assert recorded.provider_ids == {1: MemoryStreamBackend.provider_id}
+    assert recorded.provider_format_versions == {
+        1: MemoryStreamBackend.provider_format_version
+    }
+
+    # The bytes the successor actually reads. `read_continuation_header` is
+    # handed this event's headers, not the command's, so a header the server
+    # dropped or rewrote between the two would leave the successor starting at
+    # BEGINNING with nothing to say so.
+    successor = await client.get_workflow_handle(
+        handle.id, run_id=attributes.new_execution_run_id
+    ).fetch_history()
+    started = successor.events[0].workflow_execution_started_event_attributes
+    assert (
+        decode_continuation(started.header.fields[CONTINUATION_HEADER].data) == recorded
+    )
+
+    # Replayed against the provider that produced the cursor, the recorded
+    # binding has to agree; this is also what makes the mismatch below evidence
+    # about the binding rather than about the history.
+    matched = await Replayer(
+        workflows=[ChainedConsumerWorkflow],
+        external_stream_backends={"tokens-memory": backend},
+    ).replay_workflow(successor, raise_on_replay_failure=False)
+
+    assert matched.replay_failure is None, (
+        f"the successor's own history no longer replays: {matched.replay_failure}"
+    )
+
+    # Same history, same records, same stream and backend *names* -- only the
+    # implementation behind the name has moved, which is a deployment change no
+    # Workflow edit is visible for. Accepting the cursor would be finding 01: the
+    # boundary means nothing in this store, and every record below it is skipped
+    # in silence.
+    #
+    # Reported by *marker* replay, not by the continuation: the successor's
+    # `ReplayExternalStreams` job is handled before its Workflow code runs, so on
+    # a history that already carries a marker the marker binding is checked
+    # first. This is therefore the wrong layer to ask the continuation's own
+    # check about -- disabling `_verify_restored_provider` does not change this
+    # outcome, which is why that check is asked for separately below instead of
+    # being inferred from this failure.
+    foreign = OtherProviderBackend()
+    foreign._records = {k: list(v) for k, v in backend._records.items()}
+    moved = await Replayer(
+        workflows=[ChainedConsumerWorkflow],
+        external_stream_backends={"tokens-memory": foreign},
+    ).replay_workflow(successor, raise_on_replay_failure=False)
+
+    assert moved.replay_failure is not None, (
+        "the successor read records out of a store that did not produce them"
+    )
+    assert "other-memory" in str(moved.replay_failure), (
+        f"the failure does not name the provider that was found: {moved.replay_failure}"
+    )
+
+    # The continuation's own check, on the one Workflow Task that has to make it:
+    # the successor's *first*, which restores the cursor before any marker exists
+    # for marker replay to check in its place. Asked with the bytes History
+    # actually holds rather than with a hand-built `Continuation`, so what is
+    # validated is the recorded binding and not a shape a test chose.
+    first_task = make_runtime(
+        StubManager(),
+        foreign,
+        recorded,
+        backends={"tokens-memory": foreign},
+    )
+
+    with pytest.raises(StreamStorageError, match="'other-memory'"):
+        first_task.register(
+            wait_id=1,
+            stream_key=first_task.stream_key("tokens"),
+            backend_name="tokens-memory",
+        )
+
+    assert foreign.range_reads == [], (
+        "the mismatch was reported after a read, so the wrong implementation "
+        "already interpreted the recorded boundary"
+    )
 
 
 # --- the boundary the header is taken at --------------------------------------
