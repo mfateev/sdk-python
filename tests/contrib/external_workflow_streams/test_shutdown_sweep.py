@@ -107,7 +107,7 @@ def _swept_request_id(harness: Harness, subscription) -> str:  # type: ignore[no
             wait_id=subscription.wait_id,
             park_generation=0,
             sender_identity=harness.manager.wake_sender_identity,
-            wake_counter=subscription.wakes_owed,
+            wake_counter=subscription.wake_counter,
         )
     )
 

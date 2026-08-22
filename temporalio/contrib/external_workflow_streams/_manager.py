@@ -295,6 +295,19 @@ class Subscription:
     #: was needed and dropped".
     wakes_owed: int = 0
 
+    #: The sender's sequence number for the wake this subscription currently
+    #: owes, and what the unparked wake's request ID is derived from.
+    #:
+    #: Drawn from the *manager* rather than counted here, because this object
+    #: does not outlive its Run: an evicted Run that comes back gets a new
+    #: `Subscription` with `wakes_owed` back at zero, and a counter taken from
+    #: that would re-derive the request ID the previous incarnation's first
+    #: wake already used. The server deduplicates it, no Workflow Task is
+    #: created, and the Run waits on records it is already holding. The
+    #: derivation calls this "a per-sender monotonic counter", and the sender is
+    #: the manager.
+    wake_counter: int = 0
+
     installed_park_generation: int | None = None
     """The generation of the park intent this manager has in the backend, if any.
 
@@ -616,6 +629,11 @@ class StreamSubscriptionManager:
         #: gets a Workflow Task. Fixed for this manager's lifetime, so the
         #: shutdown sweep's retry stays the same wake rather than a new one.
         self.wake_sender_identity = new_sender_identity(client_identity)
+        #: The sequence the unparked wake counter is drawn from, monotonic for
+        #: this manager's lifetime -- which is what makes two wakes from one
+        #: sender distinct request IDs. Never reset: a repeat of any value this
+        #: sender has already used is a wake the server deduplicates away.
+        self._wake_sequence = 0
         #: Wakes the shutdown sweep could not get acknowledged. Reported through
         #: `external_stream_shutdown_wake_failed`; kept here so a test can tell
         #: "no wake was needed" from "a wake was needed and lost".
@@ -1289,7 +1307,7 @@ class StreamSubscriptionManager:
         # to cause; and the idle timer only runs while a Workflow Task is
         # retained, which `NoOpenWorkflowTask` says there is not. One failed
         # attempt was a lost record.
-        subscription.wakes_owed += 1
+        self._count_owed_wake(subscription)
         if not await self._send_owed_wake(subscription):
             logger.warning(
                 "External stream wake for %s wait %s was not acknowledged; it "
@@ -2033,7 +2051,7 @@ class StreamSubscriptionManager:
         :meth:`_account_unswept` counts it, which covers being cancelled and
         being never visited with the same rule.
         """
-        subscription.wakes_owed += 1
+        self._count_owed_wake(subscription)
         if await self._send_owed_wake(subscription):
             self._resolve_unaccounted([subscription])
         else:
@@ -2085,6 +2103,19 @@ class StreamSubscriptionManager:
                 subscription.wait_id,
             )
             self._record_shutdown_wake_failure(subscription)
+
+    def _count_owed_wake(self, subscription: Subscription) -> None:
+        """Counts one owed wake and draws the sequence number it is sent under.
+
+        Both halves happen here, exactly once per wake, because
+        :meth:`_send_owed_wake` retries *the same* wake: re-drawing the counter
+        between attempts would derive a second request ID and ask the server for
+        a second Workflow Task rather than re-sending the one that may already
+        have arrived.
+        """
+        subscription.wakes_owed += 1
+        self._wake_sequence += 1
+        subscription.wake_counter = self._wake_sequence
 
     async def _send_owed_wake(self, subscription: Subscription) -> bool:
         """Sends the one wake ``wakes_owed`` already counts. Returns whether it landed.

@@ -1492,7 +1492,7 @@ async def test_a_drain_never_removes_the_intent_of_a_park_that_replaced_it(
 
 
 class CountingWake:
-    """Records the ``wakes_owed`` each attempt would derive its request ID from.
+    """Records the counter each attempt would derive its request ID from.
 
     A retry that re-counts is not a retry: the request ID moves with the
     counter, so the server deduplicates nothing and answers with a second, empty
@@ -1509,7 +1509,7 @@ class CountingWake:
         self.observed: list[object] = []
 
     async def __call__(self, subscription) -> None:  # type: ignore[no-untyped-def]
-        self.counters.append(subscription.wakes_owed)
+        self.counters.append(subscription.wake_counter)
         if self.observe is not None:
             self.observed.append(self.observe())
         if self.failures > 0:
@@ -1549,6 +1549,59 @@ async def test_a_failed_live_wake_is_retried_as_the_same_wake(
         assert wake.counters == [1, 1], (
             "the retry derived a different request ID, so it asks for a second "
             "empty Workflow Task rather than re-sending the wake that was owed"
+        )
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_comes_back_does_not_reuse_its_last_wake_counter(
+    stream_key: StreamKey,
+) -> None:
+    """An evicted Run's replacement subscription owes a *new* wake, not the old one.
+
+    The unparked request ID is derived from the sender's identity and its
+    counter, and the identity is fixed for the Worker's lifetime -- so the
+    counter is the only thing keeping two of this Worker's wakes apart. A
+    counter held on the `Subscription` restarts at one every time an evicted Run
+    is rebuilt, which re-derives the request ID the previous incarnation already
+    used: the server deduplicates it, no Workflow Task is created, and a Run
+    holding buffered records waits for a wake that was thrown away as a
+    duplicate. The sequence therefore belongs to the manager, which outlives the
+    Run.
+    """
+    backend = MemoryStreamBackend()
+    notifier = RecordingNotifier(answer=ReadinessResult.NO_OPEN_WORKFLOW_TASK)
+    wake = CountingWake(failures=0)
+    manager = make_manager(backend, notifier, send_wake=wake)
+    try:
+        manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+        await append(backend, stream_key, b"a")
+        await until(
+            lambda: len(wake.counters) >= 1,
+            "the first incarnation never owed its wake, so there is nothing for "
+            "the second one to collide with",
+        )
+
+        # The Run is evicted and comes back: same Worker, same wait, a brand new
+        # `Subscription` -- and a record already waiting for it, exactly as after
+        # the replay this guards.
+        await manager.evict_run(RUN_ID)
+        manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+        await append(backend, stream_key, b"b")
+        await until(
+            lambda: len(wake.counters) >= 2,
+            "the rebuilt subscription never owed a wake for the record waiting for it",
+        )
+
+        assert wake.counters[0] != wake.counters[1], (
+            "the rebuilt Run drew the counter its predecessor had already used, "
+            "so both wakes derive one request ID and the server deduplicates "
+            f"the second away: {wake.counters}"
         )
     finally:
         await manager.shutdown()

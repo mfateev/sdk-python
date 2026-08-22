@@ -178,10 +178,14 @@ class _StubBackend:
 
 
 class _StubSubscription:
-    def __init__(self, wakes_owed: int = 1) -> None:
+    def __init__(self, wake_counter: int = 1) -> None:
         self.stream_key = StreamKey("ns", "wf-1", "first-run-1", "tokens")
         self.wait_id = 1
-        self.wakes_owed = wakes_owed
+        #: The sender's sequence number for this wake, which is what the
+        #: unparked request ID is derived from. Held by the subscription but
+        #: drawn from the manager, so it does not restart when a Run comes back.
+        self.wake_counter = wake_counter
+        self.wakes_owed = wake_counter
         self.backend = _StubBackend()
 
 
@@ -241,8 +245,8 @@ async def test_two_workers_sharing_one_client_derive_different_request_ids(
     first = _worker_sending_wakes("one-shared-client")
     second = _worker_sending_wakes("one-shared-client")
 
-    await first._send_external_stream_wake(_StubSubscription(wakes_owed=1))
-    await second._send_external_stream_wake(_StubSubscription(wakes_owed=1))
+    await first._send_external_stream_wake(_StubSubscription(wake_counter=1))
+    await second._send_external_stream_wake(_StubSubscription(wake_counter=1))
 
     assert sent_request_ids[0] != sent_request_ids[1], (
         "both Workers derived the same request ID, so the server would "
@@ -262,7 +266,7 @@ async def test_one_workers_retry_of_an_unparked_wake_keeps_its_request_id(
     arrived.
     """
     worker = _worker_sending_wakes("one-shared-client")
-    subscription = _StubSubscription(wakes_owed=1)
+    subscription = _StubSubscription(wake_counter=1)
 
     await worker._send_external_stream_wake(subscription)
     await worker._send_external_stream_wake(subscription)

@@ -1246,8 +1246,11 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
                     # Each owed wake is a separate ask, not a retry of the last
                     # one: two records arriving in two different windows both
                     # need a Workflow Task, and a shared request ID would let
-                    # the server deduplicate the second away.
-                    wake_counter=subscription.wakes_owed,
+                    # the server deduplicate the second away. Drawn from the
+                    # manager's own sequence rather than from this
+                    # subscription's owed count, which restarts at zero every
+                    # time an evicted Run comes back.
+                    wake_counter=subscription.wake_counter,
                 ),
             )
         except Exception:
