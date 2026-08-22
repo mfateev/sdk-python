@@ -180,8 +180,12 @@ class WorkflowInstanceDetails:
     watcher tasks, and a copy re-created inside the sandbox would watch nothing.
     Workflow code only ever sees this handle -- never a provider instance.
 
-    ``None`` when no ``external_stream_backends`` were registered on the Worker.
+    Present for validation even when no ``external_stream_backends`` were
+    registered on the Worker, because recorded state must be handled based on
+    History rather than current Worker configuration.
     """
+    external_streams_configured: bool = False
+    """Whether Workflow code may use the runtime for new subscriptions."""
 
 
 class WorkflowInstance(ABC):
@@ -297,6 +301,7 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
 
         self._extern_functions = det.extern_functions
         self._external_stream_runtime = det.external_stream_runtime
+        self._external_streams_configured = det.external_streams_configured
         self._pending_replay_finish: Any = None
         """A marker replay whose last segment the activation's own drain serves.
 
@@ -898,7 +903,10 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         del job
         runtime = self._external_stream_runtime
         if runtime is None:
-            return
+            raise RuntimeError(
+                "received an external stream replay job without the per-Run "
+                "validation runtime"
+            )
         plan = runtime.take_replay_plan()
         if plan is None:
             # Nothing was prepared -- the job reached the Workflow thread without
@@ -2966,7 +2974,10 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         # object rather than in a module global because per-Run state must share
         # the Run's lifetime exactly -- a global would outlive an evicted Run and
         # hand its wait ids to the next one.
-        if self._external_stream_runtime is not None:
+        if (
+            self._external_stream_runtime is not None
+            and self._external_streams_configured
+        ):
             from temporalio.contrib.external_workflow_streams._api import (
                 _install_runtime,
             )

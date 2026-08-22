@@ -217,8 +217,8 @@ async def build_replay_plan(
                     "against a backend name that is not registered on this "
                     "Worker. Either the Workflow now names a different backend "
                     "-- gate that behind workflow.patched() exactly as an "
-                    "inserted timer would be -- or this Worker is missing the "
-                    "backend registration the recorded Run had."
+                    "inserted timer would be -- or this Worker is missing that "
+                    "backend from external_stream_backends."
                 )
             if backend is None or key is None:
                 # Row four of the failure taxonomy, and **not** integrity loss.

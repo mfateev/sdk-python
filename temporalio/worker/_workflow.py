@@ -172,7 +172,16 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         # backend connection and watcher task; it is created lazily on the
         # Worker's own event loop because that is the loop the watchers must run
         # on, and __init__ is not necessarily called from it.
-        self._external_stream_backends = external_stream_backends
+        # The runtime exists even when this mapping is empty. Recorded stream
+        # state comes from History, so replay annotations and continuation
+        # headers must be decoded and validated independently of whether this
+        # Worker can create a new live subscription. Workflow code still sees
+        # the feature as unconfigured through `external_streams_configured` in
+        # its instance details below.
+        self._external_stream_backends: Mapping[str, Any] = (
+            external_stream_backends or {}
+        )
+        self._external_streams_configured = bool(external_stream_backends)
         self._external_stream_continuation_schema_version = (
             external_stream_continuation_schema_version
         )
@@ -852,8 +861,7 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
 
         # Create instance from details
         runtime = self._create_external_stream_runtime(act, init)
-        if runtime is not None:
-            self._external_stream_runtimes[act.run_id] = runtime
+        self._external_stream_runtimes[act.run_id] = runtime
         det = WorkflowInstanceDetails(
             payload_converter_factory=self._data_converter._new_payload_converter,
             failure_converter_class=self._data_converter.failure_converter_class,
@@ -869,6 +877,7 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             last_failure=last_failure,
             default_workflow_logic_flags=frozenset(self._default_workflow_logic_flags),
             external_stream_runtime=runtime,
+            external_streams_configured=self._external_streams_configured,
         )
         if defn.sandboxed:
             return self._workflow_runner.create_instance(det)
@@ -897,6 +906,11 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         """
         runtime = self._external_stream_runtimes.get(act.run_id)
         if runtime is None:
+            if any(j.HasField("replay_external_streams") for j in act.jobs):
+                raise RuntimeError(
+                    "received an external stream replay job without the per-Run "
+                    "validation runtime"
+                )
             return None
 
         if any(j.HasField("resolve_external_stream_waits") for j in act.jobs):
@@ -1063,7 +1077,6 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
                 StreamSubscriptionManager,
             )
 
-            assert self._external_stream_backends is not None
             self._external_stream_manager = StreamSubscriptionManager(
                 backends=self._external_stream_backends,
                 # The Worker's converter, for the **asynchronous half** of
@@ -1252,12 +1265,13 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
     ) -> Any:
         """The per-Run handle Workflow code reaches the manager through.
 
-        ``None`` when no backends are registered, which is what makes
-        ``subscribe()`` fail with a message naming the Worker option rather than
-        with an attribute error deep in the runtime.
+        Created even when no backends are registered because recorded state is
+        authoritative: continuation headers and replay annotations still need
+        to be decoded, and quiet marker bindings still need their reverse
+        nondeterminism check. The instance installs this handle into Workflow
+        code only when backends were configured, preserving ``subscribe()``'s
+        explicit error naming the Worker option.
         """
-        if not self._external_stream_backends:
-            return None
         from temporalio.contrib.external_workflow_streams._api import (
             DEFAULT_IDLE_TIMEOUT,
         )
@@ -1268,6 +1282,25 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         from temporalio.contrib.external_workflow_streams._runtime import (
             WorkflowStreamRuntime,
         )
+
+        # Decode before consulting configuration. The reserved header is
+        # must-understand History state, so an unsupported encoding cannot turn
+        # into an ordinary first execution on a Worker whose current Workflow
+        # code no longer calls subscribe(). A valid non-empty continuation also
+        # needs its recorded backend configuration even if current code removed
+        # every stream call; otherwise the successor silently discards the
+        # cursor and binding its predecessor committed.
+        continuation = read_continuation_header(dict(init.headers))
+        if (
+            continuation is not None
+            and continuation.cursors
+            and not self._external_streams_configured
+        ):
+            raise RuntimeError(
+                "Workflow History contains external stream continuation state, "
+                "but external streams are not configured on this Worker; pass "
+                "external_stream_backends={...} to the Worker"
+            )
 
         return WorkflowStreamRuntime(
             manager=self._stream_manager(),
@@ -1315,7 +1348,7 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             # any subscribe() call: a start cursor restored after a subscription
             # was established would already have been overwritten by BEGINNING
             # (ADR-022).
-            continuation=read_continuation_header(dict(init.headers)),
+            continuation=continuation,
         )
 
     def nondeterminism_as_workflow_fail(self) -> bool:

@@ -622,6 +622,38 @@ def _runtime_from_a_real_worker(
     return runtime
 
 
+async def test_a_worker_without_backends_still_decodes_the_continuation(
+    client: Client,
+) -> None:
+    """Recorded continuation state is handled before current configuration.
+
+    A successor whose new Workflow code makes no stream call cannot be allowed
+    to turn an unsupported reserved header into an ordinary first execution just
+    because this Worker has no backend mapping.
+    """
+    worker = Worker(
+        client,
+        task_queue=f"tq-{uuid.uuid4()}",
+        workflows=[ChainedConsumerWorkflow],
+    )
+    assert worker._workflow_worker is not None
+    init = InitializeWorkflow(workflow_id="workflow", first_execution_run_id="first")
+    init.headers[CONTINUATION_HEADER].data = b"\x03"
+
+    with pytest.raises(AnnotationDecodeError, match="schema version 3"):
+        worker._workflow_worker._create_external_stream_runtime(
+            WorkflowActivation(run_id="run"), init
+        )
+
+    init.headers[CONTINUATION_HEADER].CopyFrom(
+        write_continuation_header(Continuation({1: BEGINNING}, {1: "tokens"}))
+    )
+    with pytest.raises(RuntimeError, match="external_stream_backends"):
+        worker._workflow_worker._create_external_stream_runtime(
+            WorkflowActivation(run_id="run"), init
+        )
+
+
 async def test_a_worker_that_selects_nothing_is_the_reader_stage(
     client: Client,
     backend: MemoryStreamBackend,

@@ -466,9 +466,11 @@ class Worker:
         # this Worker could not also read has to fail Worker construction rather
         # than the first Continue-As-New that tries to write it. `None` means
         # "whatever stage this release ships", which `_WorkflowWorker` resolves
-        # against the one constant that holds it -- left unresolved here so the
-        # continuation module stays off the import path of a Worker that has no
-        # stream backends at all.
+        # against the one constant that holds it -- left unresolved here so
+        # Worker construction alone does not import the continuation module.
+        # The validation runtime resolves it when a Run starts so reserved
+        # continuation headers cannot be skipped by a Worker whose current code
+        # and configuration no longer use streams.
         external_stream_continuation_schema_version = config.get(
             "external_stream_continuation_schema_version"
         )

@@ -114,6 +114,25 @@ class EmptyStreamWorkflow:
         return "unexpected record"
 
 
+@workflow.defn(name="QuietSubscriptionWorkflow")
+class QuietSubscriptionWorkflow:
+    """Creates replay-visible stream state without reading a record."""
+
+    @workflow.run
+    async def run(self) -> str:
+        external_stream.topic("tokens", backend="tokens-memory", type=str).subscribe()
+        return "done"
+
+
+@workflow.defn(name="QuietSubscriptionWorkflow")
+class QuietSubscriptionRemovedWorkflow:
+    """The next version of ``QuietSubscriptionWorkflow``, with no stream call."""
+
+    @workflow.run
+    async def run(self) -> str:
+        return "done"
+
+
 @pytest.fixture
 def backend() -> MemoryStreamBackend:
     return MemoryStreamBackend()
@@ -267,6 +286,55 @@ async def test_a_history_with_stream_markers_needs_its_backends_to_replay(
     assert "external_stream_backends" in str(without.replay_failure), (
         "the failure must name the missing option rather than surface as an "
         f"attribute error: {without.replay_failure}"
+    )
+
+
+async def test_a_no_backend_replayer_validates_a_removed_quiet_subscription(
+    client: Client, backend: MemoryStreamBackend
+) -> None:
+    """History, not current Worker configuration, decides whether replay runs.
+
+    A quiet subscription still writes its binding into the marker. The next
+    Workflow version removes the only ``subscribe()`` call while leaving its
+    ordinary Temporal command sequence unchanged, and the Replayer deliberately
+    has no backend mapping. It must still decode the marker and apply the reverse
+    binding check rather than accepting the history because no live stream
+    runtime happened to be configured.
+    """
+    task_queue = f"tq-{uuid.uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[QuietSubscriptionWorkflow],
+        external_stream_backends={"tokens-memory": backend},
+    ):
+        handle = await client.start_workflow(
+            QuietSubscriptionWorkflow.run,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=task_queue,
+        )
+        assert await asyncio.wait_for(handle.result(), 30) == "done"
+        history = await handle.fetch_history()
+
+    markers = [
+        event
+        for event in history.events
+        if event.HasField("marker_recorded_event_attributes")
+        and event.marker_recorded_event_attributes.marker_name == EXTERNAL_STREAM_MARKER
+    ]
+    assert markers, "the quiet subscription produced no marker to validate"
+
+    result = await Replayer(
+        workflows=[QuietSubscriptionRemovedWorkflow]
+    ).replay_workflow(history, raise_on_replay_failure=False)
+
+    assert result.replay_failure is not None, (
+        "removing the recorded subscription replayed successfully when the "
+        "Replayer had no backend registry"
+    )
+    assert "never created" in str(result.replay_failure), (
+        "the marker's reverse binding check did not report the removed quiet "
+        f"subscription: {result.replay_failure}"
     )
 
 
