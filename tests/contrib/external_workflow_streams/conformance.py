@@ -491,6 +491,33 @@ async def check_an_intent_is_removable_and_removal_is_idempotent(
     assert await backend.park_intent(key, 1) is None
 
 
+async def check_conditional_removal_never_deletes_a_replacement(
+    backend: StreamBackend, key: StreamKey
+) -> None:
+    """A predecessor's delayed cleanup must not remove a successor's park."""
+    successor = ParkIntent(1, BEGINNING, park_generation=2, run_id="run-b")
+    await backend.install_park_intent(key, successor)
+
+    assert not await backend.remove_park_intent_if_matches(
+        key, 1, run_id="run-a", park_generation=2
+    )
+    assert await backend.park_intent(key, 1) == successor
+
+    assert not await backend.remove_park_intent_if_matches(
+        key, 1, run_id="run-b", park_generation=1
+    )
+    assert await backend.park_intent(key, 1) == successor
+
+    assert await backend.remove_park_intent_if_matches(
+        key, 1, run_id="run-b", park_generation=2
+    )
+    assert await backend.park_intent(key, 1) is None
+
+    assert not await backend.remove_park_intent_if_matches(
+        key, 1, run_id="run-b", park_generation=2
+    )
+
+
 async def check_a_new_runs_intent_replaces_its_predecessors(
     backend: StreamBackend, key: StreamKey
 ) -> None:
@@ -765,6 +792,7 @@ PARKING_CONFORMANCE_CHECKS: list[Check] = [
     check_intents_are_keyed_by_stream_and_wait_id,
     check_every_parked_subscription_is_enumerable,
     check_an_intent_is_removable_and_removal_is_idempotent,
+    check_conditional_removal_never_deletes_a_replacement,
     check_a_new_runs_intent_replaces_its_predecessors,
     check_recheck_sees_an_append_past_the_cursor,
     check_recheck_of_a_removed_intent_is_false,

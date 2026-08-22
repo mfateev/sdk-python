@@ -250,6 +250,28 @@ class StreamBackend(abc.ABC):
         """Removes one subscription's intent. Idempotent."""
 
     @abc.abstractmethod
+    async def remove_park_intent_if_matches(
+        self,
+        key: StreamKey,
+        wait_id: int,
+        *,
+        run_id: str,
+        park_generation: int,
+    ) -> bool:
+        """Atomically removes an intent only when its identity still matches.
+
+        The comparison and removal must be one backend operation. A delayed
+        cleanup can overlap a Continue-As-New successor installing a new intent
+        at the same ``(stream key, wait_id)``; implementing this as
+        :meth:`park_intent` followed by :meth:`remove_park_intent` can delete
+        that successor's live park.
+
+        Returns:
+            ``True`` when the matching intent was removed and ``False`` when
+            the key was absent or held a different Run or park generation.
+        """
+
+    @abc.abstractmethod
     async def park_intent(self, key: StreamKey, wait_id: int) -> ParkIntent | None:
         """The installed intent, if any."""
 

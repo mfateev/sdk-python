@@ -95,6 +95,20 @@ return {'appended', id}
 """
 
 
+#: Compare-and-remove one park intent, atomically. The claim belongs to the
+#: intent generation, so a successful removal retires both keys just like the
+#: unconditional operation does.
+_REMOVE_PARK_INTENT_IF_MATCHES_LUA: Final = """
+local run_id = redis.call('HGET', KEYS[1], 'run_id')
+local generation = redis.call('HGET', KEYS[1], 'generation')
+if run_id == ARGV[1] and generation == ARGV[2] then
+  redis.call('DEL', KEYS[1], KEYS[2])
+  return 1
+end
+return 0
+"""
+
+
 class RedisStreamBackend(StreamBackend):
     """Redis Streams as an external workflow stream provider."""
 
@@ -128,6 +142,9 @@ class RedisStreamBackend(StreamBackend):
         self._client = client
         self._key_prefix = key_prefix
         self._append_script = client.register_script(_APPEND_LUA)
+        self._remove_park_intent_if_matches_script = client.register_script(
+            _REMOVE_PARK_INTENT_IF_MATCHES_LUA
+        )
 
     # --- key layout ---------------------------------------------------------
 
@@ -230,6 +247,20 @@ class RedisStreamBackend(StreamBackend):
         await self._client.delete(
             self._intent_key(key, wait_id), self._claim_key(key, wait_id)
         )
+
+    async def remove_park_intent_if_matches(
+        self,
+        key: StreamKey,
+        wait_id: int,
+        *,
+        run_id: str,
+        park_generation: int,
+    ) -> bool:
+        removed = await self._remove_park_intent_if_matches_script(
+            keys=[self._intent_key(key, wait_id), self._claim_key(key, wait_id)],
+            args=[run_id, str(park_generation)],
+        )
+        return bool(removed)
 
     async def park_intent(self, key: StreamKey, wait_id: int) -> ParkIntent | None:
         stored = await self._client.hgetall(self._intent_key(key, wait_id))

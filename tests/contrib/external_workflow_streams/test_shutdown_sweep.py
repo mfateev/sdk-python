@@ -927,13 +927,26 @@ async def test_a_resolve_with_no_park_installed_touches_nothing(
     key = harness.register()
     removals: list[int] = []
 
-    original = harness.backend.remove_park_intent
+    original = harness.backend.remove_park_intent_if_matches
 
-    async def recording_remove(removed_key, wait_id: int) -> None:  # type: ignore[no-untyped-def]
+    async def recording_remove(
+        removed_key: StreamKey,
+        wait_id: int,
+        *,
+        run_id: str,
+        park_generation: int,
+    ) -> bool:
         removals.append(wait_id)
-        await original(removed_key, wait_id)
+        return await original(
+            removed_key,
+            wait_id,
+            run_id=run_id,
+            park_generation=park_generation,
+        )
 
-    harness.backend.remove_park_intent = recording_remove  # type: ignore[method-assign]
+    harness.backend.remove_park_intent_if_matches = (  # type: ignore[method-assign]
+        recording_remove
+    )
 
     await harness.manager.resolve_park(RUN_ID)
     assert removals == [], "a Run that never parked owes the backend nothing"
@@ -964,16 +977,29 @@ async def test_a_backend_failure_during_removal_leaves_it_owed(
     key = harness.register()
     await harness.manager.prepare_park(RUN_ID, 1, {1: BEGINNING})
 
-    original = harness.backend.remove_park_intent
+    original = harness.backend.remove_park_intent_if_matches
     failures = [True]
 
-    async def flaky_remove(removed_key, wait_id: int) -> None:  # type: ignore[no-untyped-def]
+    async def flaky_remove(
+        removed_key: StreamKey,
+        wait_id: int,
+        *,
+        run_id: str,
+        park_generation: int,
+    ) -> bool:
         if failures:
             failures.pop()
             raise ConnectionError("backend unavailable")
-        await original(removed_key, wait_id)
+        return await original(
+            removed_key,
+            wait_id,
+            run_id=run_id,
+            park_generation=park_generation,
+        )
 
-    harness.backend.remove_park_intent = flaky_remove  # type: ignore[method-assign]
+    harness.backend.remove_park_intent_if_matches = (  # type: ignore[method-assign]
+        flaky_remove
+    )
 
     await harness.manager.resolve_park(RUN_ID)
     assert await harness.backend.current_park_generation(key, 1) == 1

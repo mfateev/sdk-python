@@ -132,6 +132,23 @@ class MemoryStreamBackend(StreamBackend):
         self._intents.pop((key, wait_id), None)
         self._claims.pop((key, wait_id), None)
 
+    async def remove_park_intent_if_matches(
+        self,
+        key: StreamKey,
+        wait_id: int,
+        *,
+        run_id: str,
+        park_generation: int,
+    ) -> bool:
+        intent = self._intents.get((key, wait_id))
+        if intent is None or (
+            intent.run_id != run_id or intent.park_generation != park_generation
+        ):
+            return False
+        self._intents.pop((key, wait_id), None)
+        self._claims.pop((key, wait_id), None)
+        return True
+
     async def parked_wait_ids(self, key: StreamKey) -> list[int]:
         return sorted(wait_id for (stored, wait_id) in self._intents if stored == key)
 

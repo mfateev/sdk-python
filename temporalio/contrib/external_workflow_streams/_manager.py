@@ -196,9 +196,9 @@ PARK_REMOVAL_ATTEMPTS = 3
 
 The cheap first line against a momentary backend blip, and *only* that: what
 makes giving up here survivable is the ledger the failure is recorded in, which
-outlives the Subscription and is drained again by the next park, resolve,
-registration, or eviction. Bounded because these retries sit on the close path
-and inside a registration, neither of which may wait on a backend indefinitely.
+outlives the Subscription and has its own retry loop. Bounded because these
+inline retries sit on the close path and inside a registration, neither of
+which may wait on a backend indefinitely.
 """
 
 PARK_REMOVAL_RETRY_DELAY = timedelta(milliseconds=100)
@@ -208,6 +208,9 @@ The lock is a Run's park handshake serialization, and `prepare_park` runs inside
 an activation under Core's deadlock timeout, so every millisecond spent backing
 off is a millisecond that budget may have to absorb.
 """
+
+PARK_REMOVAL_MAX_RETRY_DELAY = timedelta(seconds=5)
+"""Caps autonomous removal backoff while still retrying indefinitely."""
 
 DEFAULT_SHUTDOWN_GRACE = timedelta(seconds=10)
 """How long the sweep may hold shutdown open.
@@ -673,6 +676,15 @@ class StreamSubscriptionManager:
         #: recording it anywhere that a close or an eviction takes away is the
         #: same as not recording it at all. Drained under `_park_lock`.
         self._owed_removals: dict[str, dict[tuple[StreamKey, int], _OwedRemoval]] = {}
+        #: One autonomous retry loop per Run with outstanding removals. The
+        #: tasks are held strongly here because the ledger, rather than any
+        #: Subscription, owns their lifetime and can outlive cache eviction.
+        self._owed_removal_retries: dict[str, asyncio.Task[None]] = {}
+        #: Wakes a sleeping retry when another removal is added to its Run or
+        #: the last one is retired. A new debt should not wait behind an old
+        #: entry's maximum backoff, and an empty loop should stop promptly.
+        self._owed_removal_wakeups: dict[str, asyncio.Event] = {}
+        self._stopping_owed_removal_retries = False
 
     # --- registration -------------------------------------------------------
 
@@ -768,18 +780,20 @@ class StreamSubscriptionManager:
         momentary backend failure must not fail one. It is *not* best-effort in
         the sense of one attempt: the attempts below are the cheap first line
         against a blip, and once the intent has been read it is recorded in this
-        Run's owed-removal ledger, which every later park, resolve, registration
-        and eviction drains. Waiting for "the next time this wait is registered"
-        is a coincidence of eviction, not a mechanism, and the Run that most
-        needs the removal -- one cached and blocked on something other than this
+        Run's owed-removal ledger. Its autonomous retry makes backend recovery
+        sufficient; later parks, resolves, registrations and evictions remain
+        eager fast paths. Waiting for "the next time this wait is registered" is
+        a coincidence of eviction, not a mechanism, and the Run that most needs
+        the removal -- one cached and blocked on something other than this
         stream -- is precisely the one that never registers it again.
         """
         for attempt in range(PARK_REMOVAL_ATTEMPTS):
             if subscription._cancelled:
-                # Neither shutdown nor `evict_run` cancels this task -- it is
-                # held in `_reconciliations`, not on the Subscription -- so the
-                # flag they do set is what has to stop the loop. Anything read
-                # by now is in the ledger, and `evict_run` drains that.
+                # Eviction does not cancel this task -- it is held in
+                # `_reconciliations`, not on the Subscription -- and shutdown
+                # cancels it only after Run teardown, so this flag stops it in
+                # either path. Anything read by now is in the ledger and its
+                # autonomous retry.
                 return
             if await self._reconcile_inherited_park_once(subscription, attempt):
                 return
@@ -787,8 +801,8 @@ class StreamSubscriptionManager:
                 await asyncio.sleep(PARK_REMOVAL_RETRY_DELAY.total_seconds())
         logger.warning(
             "Could not reconcile the inherited park intent for %s wait %s in %s "
-            "attempts; it stays in this Run's owed-removal ledger, which the "
-            "next park, resolve, registration or eviction drains",
+            "attempts; its autonomous owed-removal retry continues in the "
+            "background",
             subscription.stream_key,
             subscription.wait_id,
             PARK_REMOVAL_ATTEMPTS,
@@ -877,8 +891,11 @@ class StreamSubscriptionManager:
                 ),
             )
             try:
-                await subscription.backend.remove_park_intent(
-                    subscription.stream_key, subscription.wait_id
+                await subscription.backend.remove_park_intent_if_matches(
+                    subscription.stream_key,
+                    subscription.wait_id,
+                    run_id=inherited.run_id,
+                    park_generation=inherited.park_generation,
                 )
             except asyncio.CancelledError:
                 raise
@@ -899,7 +916,19 @@ class StreamSubscriptionManager:
     def _owe_removal(
         self, run_id: str, key: tuple[StreamKey, int], record: _OwedRemoval
     ) -> None:
-        self._owed_removals.setdefault(run_id, {})[key] = record
+        owed = self._owed_removals.setdefault(run_id, {})
+        previous = owed.get(key)
+        owed[key] = record
+        retry = self._owed_removal_retries.get(run_id)
+        if retry is None or retry.done():
+            if not self._stopping_owed_removal_retries:
+                self._owed_removal_wakeups.setdefault(run_id, asyncio.Event())
+                retry = self._loop.create_task(self._retry_owed_removals(run_id))
+                self._owed_removal_retries[run_id] = retry
+        elif previous != record:
+            # Do not make newly discovered debt wait behind the capped backoff
+            # of an older failing entry for this Run.
+            self._owed_removal_wakeups[run_id].set()
 
     def _forget_owed_removal(self, run_id: str, key: tuple[StreamKey, int]) -> None:
         owed = self._owed_removals.get(run_id)
@@ -910,6 +939,39 @@ class StreamSubscriptionManager:
             # Dropped rather than left empty, so a Run that owes nothing costs
             # nothing to carry and `evict_run` can tell the two apart cheaply.
             self._owed_removals.pop(run_id, None)
+            wakeup = self._owed_removal_wakeups.get(run_id)
+            if wakeup is not None:
+                wakeup.set()
+
+    async def _retry_owed_removals(self, run_id: str) -> None:
+        """Retries one Run's ledger without needing another lifecycle event."""
+        this_task = asyncio.current_task()
+        initial = PARK_REMOVAL_RETRY_DELAY.total_seconds()
+        delay = initial
+        maximum = PARK_REMOVAL_MAX_RETRY_DELAY.total_seconds()
+        wakeup = self._owed_removal_wakeups[run_id]
+        try:
+            while self._owed_removals.get(run_id):
+                try:
+                    await asyncio.wait_for(wakeup.wait(), delay)
+                    delay = initial
+                except asyncio.TimeoutError:
+                    pass
+                wakeup.clear()
+
+                before = len(self._owed_removals.get(run_id, {}))
+                async with self._park_lock(run_id):
+                    await self._drain_owed_removals(run_id)
+                after = len(self._owed_removals.get(run_id, {}))
+                if after == 0:
+                    return
+                delay = initial if after < before else min(maximum, delay * 2)
+        finally:
+            if self._owed_removal_retries.get(run_id) is this_task:
+                self._owed_removal_retries.pop(run_id, None)
+                self._owed_removal_wakeups.pop(run_id, None)
+            if run_id not in self._runs and not self._owed_removals.get(run_id):
+                self._park_locks.pop(run_id, None)
 
     async def _drain_owed_removals(self, run_id: str) -> None:
         """Retries every removal this Run still owes. Never raises.
@@ -917,18 +979,16 @@ class StreamSubscriptionManager:
         A ledger entry is not "an intent exists"; it is a removal this manager
         has already decided on and not had confirmed. That is what makes
         draining safe from any holder of this Run's park lock rather than only
-        from the path that recorded it: ``remove_park_intent`` is specified
-        idempotent, and the entry retains nothing -- no watcher, no buffer, no
-        connection beyond the backend the removal has to go through.
+        from the path that recorded it. The entry retains nothing -- no watcher,
+        no buffer, no connection beyond the backend the removal has to go
+        through.
 
-        The one thing an entry cannot know is whether the intent still at that
-        key is the one it recorded. A Continue-As-New successor re-uses the
-        stream key with wait ids that start again at 1, so an entry a
-        predecessor Run left could name a live park's key. Hence the read: only
-        an intent that still matches what was recorded is removed, and one that
-        does not is forgotten rather than taken out from under whoever installed
-        it. The read narrows that window to a single round trip; the park lock
-        closes it entirely for parks of this same Run.
+        A Continue-As-New successor re-uses the stream key with wait ids that
+        start again at 1, so an entry a predecessor Run left could name a live
+        park's key. The backend therefore compares both the Run ID and park
+        generation as part of the delete. A read followed by an unconditional
+        removal would leave a cross-Run window in which this retry could delete
+        the successor's park.
         """
         owed = self._owed_removals.get(run_id)
         if not owed:
@@ -936,12 +996,12 @@ class StreamSubscriptionManager:
         for key, record in list(owed.items()):
             stream_key, wait_id = key
             try:
-                installed = await record.backend.park_intent(stream_key, wait_id)
-                if installed is not None and (
-                    installed.park_generation == record.park_generation
-                    and installed.run_id == record.run_id
-                ):
-                    await record.backend.remove_park_intent(stream_key, wait_id)
+                await record.backend.remove_park_intent_if_matches(
+                    stream_key,
+                    wait_id,
+                    run_id=record.run_id,
+                    park_generation=record.park_generation,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1538,8 +1598,8 @@ class StreamSubscriptionManager:
             except Exception as err:
                 logger.exception(
                     "Failed removing the park intent for %s wait %s while "
-                    "withdrawing an unconfirmed park; it stays owed and the "
-                    "next resolve retries it",
+                    "withdrawing an unconfirmed park; its autonomous "
+                    "owed-removal retry continues in the background",
                     subscription.stream_key,
                     subscription.wait_id,
                 )
@@ -1598,8 +1658,8 @@ class StreamSubscriptionManager:
                 except Exception:
                     logger.exception(
                         "Failed removing the resolved park intent for %s wait %s; "
-                        "it stays in this Run's owed-removal ledger, which the "
-                        "next park, resolve, registration or eviction drains",
+                        "its autonomous owed-removal retry continues in the "
+                        "background",
                         subscription.stream_key,
                         subscription.wait_id,
                     )
@@ -1638,8 +1698,12 @@ class StreamSubscriptionManager:
                     run_id=run_id,
                 ),
             )
-        await subscription.backend.remove_park_intent(
-            subscription.stream_key, subscription.wait_id
+        record = self._owed_removals[run_id][key]
+        await subscription.backend.remove_park_intent_if_matches(
+            subscription.stream_key,
+            subscription.wait_id,
+            run_id=record.run_id,
+            park_generation=record.park_generation,
         )
         subscription.installed_park_generation = None
         self._forget_owed_removal(run_id, key)
@@ -1780,11 +1844,12 @@ class StreamSubscriptionManager:
         What makes dropping it safe is that the removal no longer lives *on* it.
         It is attempted here, retried a bounded number of times, and whatever is
         still owed after that stays in this Run's ledger -- which outlives the
-        subscription and is drained by the next park, resolve, registration or
-        eviction. Before that ledger existed there was no retry at all: the
-        resolve path iterates registered subscriptions, eviction and the
-        shutdown sweep remove no intents, and another wait's park cannot touch a
-        per-wait key, so an intent left behind here was left behind for good.
+        subscription and retries autonomously. Parks, resolves, registrations
+        and eviction also drain it eagerly. Before that ledger existed there was
+        no retry at all: the resolve path iterates registered subscriptions,
+        eviction and the shutdown sweep remove no intents, and another wait's
+        park cannot touch a per-wait key, so an intent left behind here was left
+        behind for good.
 
         And it is not confined to the closed wait. A stale intent keeps
         `parked_wait_ids` non-empty, which suppresses the unparked-wake fallback
@@ -1831,21 +1896,22 @@ class StreamSubscriptionManager:
         shutdown, because all three leave exactly the same thing behind:
         speculative reads that were never committed.
 
-        It is also the last chance any owed removal gets on this Worker: the
-        ledger and the lock both go with the Run here, so what is not retired
-        now is left to the next Worker's registration-time reconciliation.
-        Installed intents are deliberately untouched -- an eviction is not the
-        end of a park, and the intents of a park that really is outstanding must
-        survive it.
+        Owed removals belong to the manager rather than its cache. Eviction
+        makes one eager attempt but leaves any failure in the autonomous retry
+        loop, so backend recovery is sufficient even if this Run never returns
+        to the Worker. Installed intents are deliberately untouched -- an
+        eviction is not the end of a park, and the intents of a park that really
+        is outstanding must survive it.
         """
         self._replay_plans.pop(run_id, None)
-        if self._owed_removals.get(run_id):
+        if self._owed_removals.get(run_id) and not self._shutting_down:
             async with self._park_lock(run_id):
                 await self._drain_owed_removals(run_id)
-        self._owed_removals.pop(run_id, None)
-        self._park_locks.pop(run_id, None)
         for subscription in self._runs.pop(run_id, {}).values():
             await self._stop(subscription)
+        retry = self._owed_removal_retries.get(run_id)
+        if not self._owed_removals.get(run_id) and (retry is None or retry.done()):
+            self._park_locks.pop(run_id, None)
 
     async def probe_runs(self, *, grace: timedelta = DEFAULT_PROBE_GRACE) -> None:
         """Records what state Core says each Run is in. The sweep's first half.
@@ -1958,9 +2024,35 @@ class StreamSubscriptionManager:
         the sweep: its records are buffered in a process that is about to exit,
         and nothing else will ever tell the Workflow they arrived.
         """
+        deadline = self._loop.time() + max(0.0, grace.total_seconds())
         await self.sweep(grace=grace)
         for run_id in list(self._runs):
             await self.evict_run(run_id)
+        remaining = timedelta(seconds=max(0.0, deadline - self._loop.time()))
+        await self._stop_background_tasks(remaining)
+
+    async def _stop_background_tasks(self, grace: timedelta) -> None:
+        """Cancels manager-owned cleanup work without extending shutdown."""
+        self._stopping_owed_removal_retries = True
+        tasks = set(self._reconciliations)
+        tasks.update(self._owed_removal_retries.values())
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        # Give ordinary cancellation one turn even when the wake sweep consumed
+        # the whole grace period. Anything needing longer stays bounded by what
+        # remains rather than silently adding a second grace period to shutdown.
+        await asyncio.sleep(0)
+        pending = {task for task in tasks if not task.done()}
+        if pending and grace.total_seconds() > 0:
+            _, pending = await asyncio.wait(pending, timeout=grace.total_seconds())
+        if pending:
+            logger.warning(
+                "%s external stream cleanup task(s) did not stop within %s",
+                len(pending),
+                grace,
+            )
 
     async def _sweep(self) -> None:
         """Acts on each Run's state and owes a wake only where one is owed.

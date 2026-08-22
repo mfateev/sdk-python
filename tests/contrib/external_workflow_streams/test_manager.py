@@ -1232,16 +1232,34 @@ class FailingRemovals(MemoryStreamBackend):
         self.failures = failures
         self.removal_attempts = 0
 
-    async def remove_park_intent(self, key, wait_id):  # type: ignore[no-untyped-def]
+    async def remove_park_intent_if_matches(
+        self,
+        key: StreamKey,
+        wait_id: int,
+        *,
+        run_id: str,
+        park_generation: int,
+    ) -> bool:
         self.removal_attempts += 1
         if self.failures > 0:
             self.failures -= 1
             raise ConnectionError("backend unavailable")
-        return await super().remove_park_intent(key, wait_id)
+        return await super().remove_park_intent_if_matches(
+            key,
+            wait_id,
+            run_id=run_id,
+            park_generation=park_generation,
+        )
 
 
 async def _nothing_parked(backend: MemoryStreamBackend, key: StreamKey) -> bool:
     return await backend.parked_wait_ids(key) == []
+
+
+async def _only_wait_two_is_parked(
+    backend: MemoryStreamBackend, key: StreamKey
+) -> bool:
+    return await backend.parked_wait_ids(key) == [2]
 
 
 async def _inherit(backend: MemoryStreamBackend, key: StreamKey, run_id: str) -> None:
@@ -1290,7 +1308,7 @@ async def test_one_blip_does_not_end_the_inherited_park_reconciliation(
 
 
 @pytest.mark.asyncio
-async def test_an_inherited_intent_no_retry_could_remove_stays_owed(
+async def test_an_inherited_intent_is_retried_autonomously_after_recovery(
     stream_key: StreamKey,
 ) -> None:
     """Retries are the cheap first line; the ledger is what makes them optional.
@@ -1309,19 +1327,24 @@ async def test_an_inherited_intent_no_retry_could_remove_stays_owed(
             run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
         )
         await until(
-            lambda: backend.removal_attempts >= PARK_REMOVAL_ATTEMPTS,
+            lambda: (
+                not manager._reconciliations
+                and backend.removal_attempts >= PARK_REMOVAL_ATTEMPTS
+            ),
             "the reconciliation must exhaust its attempts before the ledger is "
             "the only thing left holding the removal",
         )
         backend.failures = 0
 
-        # Anything that takes this Run's park lock drains it; a resolve is the
-        # one that arrives without any prompting from this wait.
-        await manager.resolve_park(RUN_ID)
+        await until(
+            lambda: _nothing_parked(backend, stream_key),
+            "the inherited intent stayed installed after backend recovery even "
+            "though no park, resolve, registration, or eviction occurred",
+        )
 
         assert await backend.parked_wait_ids(stream_key) == [], (
-            "the reconciliation gave up and nothing remembered the removal, so "
-            "the intent outlives every attempt to take it out"
+            "the reconciliation exhausted its inline attempts and its ledger "
+            "had no autonomous retry"
         )
     finally:
         await manager.shutdown()
@@ -1377,6 +1400,87 @@ async def test_a_close_whose_removal_fails_leaves_the_removal_owed(
 
 
 @pytest.mark.asyncio
+async def test_a_failed_resolve_removal_retries_without_another_event(
+    stream_key: StreamKey,
+) -> None:
+    """Backend recovery alone retires a resolved park's stale intent."""
+    backend = FailingRemovals(failures=99)
+    manager = make_manager(backend, RecordingNotifier())
+    try:
+        manager.register(
+            run_id=RUN_ID,
+            wait_id=1,
+            stream_key=stream_key,
+            backend_name="tokens",
+        )
+        assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING})
+
+        await manager.resolve_park(RUN_ID)
+        assert await backend.current_park_generation(stream_key, 1) == 4
+        backend.failures = 0
+
+        await until(
+            lambda: _nothing_parked(backend, stream_key),
+            "the resolved intent stayed installed after backend recovery even "
+            "though no park, resolve, registration, or eviction occurred",
+        )
+        assert manager._owed_removals == {}
+    finally:
+        await manager.shutdown()
+
+
+class BlockingAutonomousRemoval(MemoryStreamBackend):
+    """Fails the eager attempt, then blocks the manager-owned retry."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+        self.retry_started = asyncio.Event()
+        self.retry_cancelled = asyncio.Event()
+
+    async def remove_park_intent_if_matches(
+        self,
+        key: StreamKey,
+        wait_id: int,
+        *,
+        run_id: str,
+        park_generation: int,
+    ) -> bool:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise ConnectionError("backend unavailable")
+        self.retry_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.retry_cancelled.set()
+            raise
+        return False
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_and_awaits_an_owed_removal_retry(
+    stream_key: StreamKey,
+) -> None:
+    backend = BlockingAutonomousRemoval()
+    manager = make_manager(backend, RecordingNotifier())
+    manager.register(
+        run_id=RUN_ID,
+        wait_id=1,
+        stream_key=stream_key,
+        backend_name="tokens",
+    )
+    assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING})
+    await manager.resolve_park(RUN_ID)
+    await asyncio.wait_for(backend.retry_started.wait(), 2)
+
+    await asyncio.wait_for(manager.shutdown(grace=timedelta(milliseconds=200)), 1)
+
+    assert backend.retry_cancelled.is_set()
+    assert manager._owed_removal_retries == {}
+
+
+@pytest.mark.asyncio
 async def test_closing_a_wait_removes_an_intent_it_only_inherited(
     stream_key: StreamKey,
 ) -> None:
@@ -1413,15 +1517,15 @@ async def test_closing_a_wait_removes_an_intent_it_only_inherited(
 
 
 @pytest.mark.asyncio
-async def test_an_eviction_is_the_last_chance_an_owed_removal_gets(
+async def test_an_owed_removal_outlives_eviction_and_keeps_retrying(
     stream_key: StreamKey,
 ) -> None:
-    """The ledger and the park lock both go with the Run, so this is where it ends.
+    """Cache ownership ending does not end backend-cleanup ownership.
 
     Installed intents are deliberately untouched by the same path: an eviction
     is not the end of a park, and the intents of one that really is outstanding
     have to survive the Worker losing the Run. Only a removal already decided on
-    is retried here.
+    is retried after it.
     """
     backend = FailingRemovals(failures=99)
     manager = make_manager(backend, RecordingNotifier())
@@ -1435,13 +1539,19 @@ async def test_an_eviction_is_the_last_chance_an_owed_removal_gets(
             )
         assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING, 2: BEGINNING})
         await manager.cancel(RUN_ID, 1)
-        backend.failures = 0
 
         await manager.evict_run(RUN_ID)
+        assert await backend.parked_wait_ids(stream_key) == [1, 2]
+        backend.failures = 0
+
+        await until(
+            lambda: _only_wait_two_is_parked(backend, stream_key),
+            "wait 1's owed removal stopped retrying when eviction dropped the "
+            "Run, while wait 2's outstanding park still had to survive",
+        )
 
         assert await backend.parked_wait_ids(stream_key) == [2], (
-            "wait 1's removal was owed and the Run's last chance to make it went "
-            "unused, while wait 2's outstanding park had to survive"
+            "the owed removal did not outlive the cached Run"
         )
     finally:
         await manager.shutdown()
