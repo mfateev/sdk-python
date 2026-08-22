@@ -17,6 +17,7 @@ from temporalio.contrib.external_workflow_streams._backend import (
     DEFAULT_WATCH_BLOCK,
     AppendConflictError,
     ParkIntent,
+    ParkIntentRemoval,
     StreamBackend,
     StreamKey,
 )
@@ -139,15 +140,15 @@ class MemoryStreamBackend(StreamBackend):
         *,
         run_id: str,
         park_generation: int,
-    ) -> bool:
+    ) -> ParkIntentRemoval:
         intent = self._intents.get((key, wait_id))
-        if intent is None or (
-            intent.run_id != run_id or intent.park_generation != park_generation
-        ):
-            return False
+        if intent is None:
+            return ParkIntentRemoval.ABSENT
+        if intent.run_id != run_id or intent.park_generation != park_generation:
+            return ParkIntentRemoval.MISMATCH
         self._intents.pop((key, wait_id), None)
         self._claims.pop((key, wait_id), None)
-        return True
+        return ParkIntentRemoval.REMOVED
 
     async def parked_wait_ids(self, key: StreamKey) -> list[int]:
         return sorted(wait_id for (stored, wait_id) in self._intents if stored == key)

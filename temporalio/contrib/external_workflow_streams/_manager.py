@@ -57,6 +57,7 @@ import temporalio.converter
 from temporalio.contrib.external_workflow_streams._annotation import StreamBinding
 from temporalio.contrib.external_workflow_streams._backend import (
     ParkIntent,
+    ParkIntentRemoval,
     StreamBackend,
     StreamKey,
 )
@@ -211,6 +212,31 @@ off is a millisecond that budget may have to absorb.
 
 PARK_REMOVAL_MAX_RETRY_DELAY = timedelta(seconds=5)
 """Caps autonomous removal backoff while still retrying indefinitely."""
+
+PARK_REMOVAL_CALL_TIMEOUT = timedelta(milliseconds=500)
+"""How long park-intent work off the activation path may hold a Run's park lock.
+
+Bounds the *call*, which counting attempts cannot. A backend that hangs rather
+than raises returns nothing to retry and raises nothing to catch, so the retry
+loop, the reconciliation and the close each stop where they are -- and hold this
+Run's park lock while they do, which the next park, resolve or eviction takes.
+
+The asymmetry is what makes giving up right: these holders retry, so an attempt
+abandoned costs them a backoff, while the activation waiting behind them is
+spending Core's deadlock timeout. Well inside that timeout, because waiting this
+out is only the first thing the activation then has to do.
+
+Holds an activation takes *itself* are deliberately not bounded. Those are the
+same backend exposure the park handshake already has -- `install_park_intent`
+can hang exactly as a removal can -- so a bound there would move the wait rather
+than remove it.
+
+Not a latency limit on the provider, though it becomes one for anything slower
+than it: these are single-key operations, and a coordination backend that cannot
+answer one in half a second cannot serve the park handshake either, which does
+two of them per wait inside an activation. A deployment that far out is failing
+Workflow Tasks before this timeout is what it notices.
+"""
 
 DEFAULT_SHUTDOWN_GRACE = timedelta(seconds=10)
 """How long the sweep may hold shutdown open.
@@ -778,35 +804,82 @@ class StreamSubscriptionManager:
         Best-effort in the sense that no failure here reaches a Workflow Task --
         this is the registration path of a Run that is already running, and a
         momentary backend failure must not fail one. It is *not* best-effort in
-        the sense of one attempt: the attempts below are the cheap first line
-        against a blip, and once the intent has been read it is recorded in this
-        Run's owed-removal ledger. Its autonomous retry makes backend recovery
-        sufficient; later parks, resolves, registrations and evictions remain
-        eager fast paths. Waiting for "the next time this wait is registered" is
-        a coincidence of eviction, not a mechanism, and the Run that most needs
-        the removal -- one cached and blocked on something other than this
-        stream -- is precisely the one that never registers it again.
+        the sense of one attempt, and neither half of the job may end with the
+        burst of cheap ones below.
+
+        Once the intent has been *read* it is recorded in this Run's
+        owed-removal ledger, whose own retry makes backend recovery sufficient;
+        this loop hands the entry over rather than draining it twice. Until it
+        has been read there is nothing to record -- the ledger holds an
+        identity, and the identity is what could not be obtained -- so
+        discovery keeps retrying here, with backoff, for as long as this Worker
+        holds the subscription. Both halves answer the same argument: waiting
+        for "the next time this wait is registered" is a coincidence of
+        eviction, not a mechanism, and the Run that most needs the removal --
+        one cached and blocked on something other than this stream -- is
+        precisely the one that never registers it again.
+
+        Later parks, resolves, registrations and evictions remain eager fast
+        paths for whatever is in the ledger.
         """
-        for attempt in range(PARK_REMOVAL_ATTEMPTS):
+        run_id = subscription.run_id
+        key = (subscription.stream_key, subscription.wait_id)
+        attempt = 0
+        delay = PARK_REMOVAL_RETRY_DELAY.total_seconds()
+        while True:
             if subscription._cancelled:
                 # Eviction does not cancel this task -- it is held in
                 # `_reconciliations`, not on the Subscription -- and shutdown
                 # cancels it only after Run teardown, so this flag stops it in
                 # either path. Anything read by now is in the ledger and its
                 # autonomous retry.
+                #
+                # It is also what keeps this loop *safe* to run indefinitely.
+                # Removing whatever is installed at this key is justified by
+                # this Worker holding the Run and this wait being registered on
+                # it: any intent there belongs to a park that is over. Once the
+                # subscription is gone that justification is gone with it, and
+                # the intent this would read could be a park a *different*
+                # Worker is sitting in.
                 return
             if await self._reconcile_inherited_park_once(subscription, attempt):
                 return
-            if attempt + 1 < PARK_REMOVAL_ATTEMPTS:
-                await asyncio.sleep(PARK_REMOVAL_RETRY_DELAY.total_seconds())
-        logger.warning(
-            "Could not reconcile the inherited park intent for %s wait %s in %s "
-            "attempts; its autonomous owed-removal retry continues in the "
-            "background",
-            subscription.stream_key,
-            subscription.wait_id,
-            PARK_REMOVAL_ATTEMPTS,
-        )
+            if key in self._owed_removals.get(run_id, {}):
+                # Discovery worked and the removal did not, which is the case
+                # the ledger exists for. It owns the retry from here; a second
+                # loop draining the same entry would only double the round
+                # trips.
+                logger.warning(
+                    "Could not remove the inherited park intent for %s wait %s "
+                    "in %s attempts; its autonomous owed-removal retry "
+                    "continues in the background",
+                    subscription.stream_key,
+                    subscription.wait_id,
+                    attempt + 1,
+                )
+                return
+            attempt += 1
+            if attempt == PARK_REMOVAL_ATTEMPTS:
+                # Past the cheap burst with nothing read, so there is no ledger
+                # entry to hand this to -- the ledger records an intent's
+                # identity, and that is precisely what could not be read. Giving
+                # up here is the liveness gap the ledger closed for removals,
+                # reopened for discovery: a backend down for the burst and
+                # healthy after it would leave the obsolete intent installed
+                # until this wait happens to be registered again, which for a
+                # Run that stays cached is never.
+                logger.warning(
+                    "Could not read the park intent for %s wait %s in %s "
+                    "attempts; this reconciliation keeps retrying it in the "
+                    "background, with backoff, until it can say whether one is "
+                    "installed",
+                    subscription.stream_key,
+                    subscription.wait_id,
+                    PARK_REMOVAL_ATTEMPTS,
+                )
+            if attempt >= PARK_REMOVAL_ATTEMPTS:
+                delay = min(PARK_REMOVAL_MAX_RETRY_DELAY.total_seconds(), delay * 2)
+            await asyncio.sleep(delay)
 
     async def _reconcile_inherited_park_once(
         self, subscription: Subscription, attempt: int
@@ -818,100 +891,136 @@ class StreamSubscriptionManager:
         Core's deadlock timeout: a reconciliation that kept this Run's lock
         while it slept would spend that budget on cleanup for a park that is
         already over.
+
+        Bounding the hold itself is the same argument carried one step further.
+        This runs on a task of its own, not inside the activation, so the calls
+        below can hang without anything above them noticing -- and this Run's
+        park lock hangs with them, which is what the next park, resolve or
+        eviction takes, and what the owed-removal retry loop takes. An attempt
+        that runs out of time is treated as a failed attempt, because that is
+        what it is; the entry was recorded before the call, so nothing read is
+        lost by giving up on it.
         """
-        run_id = subscription.run_id
-        key = (subscription.stream_key, subscription.wait_id)
-        async with self._park_lock(run_id):
-            # Drained first, because a previous attempt of this same loop may
-            # already have read the intent and failed only to remove it. The
-            # ledger is that retry; re-reading would find exactly what it holds.
-            await self._drain_owed_removals(run_id)
-            if key in self._owed_removals.get(run_id, {}):
-                return False
-            if (
-                subscription._cancelled
-                or subscription.installed_park_generation is not None
-            ):
-                # A park confirmed since this was scheduled is *this* manager's,
-                # and `resolve_park` owns it. Removing it here would take the
-                # intent out from under a park that really is outstanding.
-                return True
-            try:
-                inherited = await subscription.backend.park_intent(
-                    subscription.stream_key, subscription.wait_id
+        try:
+            async with self._park_lock(subscription.run_id):
+                return await asyncio.wait_for(
+                    self._reconcile_inherited_park_locked(subscription, attempt),
+                    PARK_REMOVAL_CALL_TIMEOUT.total_seconds(),
                 )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.warning(
-                    "Reading the inherited park intent for %s wait %s failed on "
-                    "attempt %s/%s",
-                    subscription.stream_key,
-                    subscription.wait_id,
-                    attempt + 1,
-                    PARK_REMOVAL_ATTEMPTS,
-                    exc_info=True,
-                )
-                return False
-            if inherited is None:
-                # The ordinary case, and the reason this is a read before it
-                # is a write: a Run that never parked owes the backend
-                # nothing.
-                return True
-            if (
-                subscription._cancelled
-                or subscription.installed_park_generation is not None
-            ):
-                # Asked again across the read, because this Run's state can
-                # have moved on entirely while it was in flight: evicted and
-                # picked up again, with a *new* park confirmed for the same
-                # key. Removing what was found before that would strand the
-                # park that replaced it.
-                return True
-            logger.info(
-                "Removing an inherited external stream park intent for %s "
-                "wait %s: park generation %s was confirmed by a Worker that "
-                "no longer holds this Run",
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Reconciling the inherited park intent for %s wait %s did not "
+                "finish within %s on attempt %s/%s; the park lock is released "
+                "and anything already read stays owed",
                 subscription.stream_key,
                 subscription.wait_id,
-                inherited.park_generation,
+                PARK_REMOVAL_CALL_TIMEOUT,
+                attempt + 1,
+                PARK_REMOVAL_ATTEMPTS,
             )
-            # Owed from the moment it is known to exist, not from the moment a
-            # removal fails: this is the only mirror an inherited intent ever
-            # gets, and without it `_remove_park_intent` goes on short-circuiting
-            # on an empty `installed_park_generation` and every removal path --
-            # the resolve, the withdrawal, the close -- stays disabled for it.
-            self._owe_removal(
-                run_id,
-                key,
-                _OwedRemoval(
-                    backend=subscription.backend,
-                    park_generation=inherited.park_generation,
-                    run_id=inherited.run_id,
-                ),
-            )
-            try:
-                await subscription.backend.remove_park_intent_if_matches(
-                    subscription.stream_key,
-                    subscription.wait_id,
-                    run_id=inherited.run_id,
-                    park_generation=inherited.park_generation,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.warning(
-                    "Removing the inherited park intent for %s wait %s failed on "
-                    "attempt %s/%s",
-                    subscription.stream_key,
-                    subscription.wait_id,
-                    attempt + 1,
-                    PARK_REMOVAL_ATTEMPTS,
-                    exc_info=True,
-                )
-                return False
-            self._forget_owed_removal(run_id, key)
+            return False
+
+    async def _reconcile_inherited_park_locked(
+        self, subscription: Subscription, attempt: int
+    ) -> bool:
+        """The pass itself, with this Run's park lock already held."""
+        run_id = subscription.run_id
+        key = (subscription.stream_key, subscription.wait_id)
+        # Drained first, because a previous attempt of this same loop may
+        # already have read the intent and failed only to remove it. The
+        # ledger is that retry; re-reading would find exactly what it holds.
+        await self._drain_owed_removals(run_id)
+        if key in self._owed_removals.get(run_id, {}):
+            return False
+        if (
+            subscription._cancelled
+            or subscription.installed_park_generation is not None
+        ):
+            # A park confirmed since this was scheduled is *this* manager's,
+            # and `resolve_park` owns it. Removing it here would take the
+            # intent out from under a park that really is outstanding.
             return True
+        try:
+            inherited = await subscription.backend.park_intent(
+                subscription.stream_key, subscription.wait_id
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "Reading the inherited park intent for %s wait %s failed on attempt %s",
+                subscription.stream_key,
+                subscription.wait_id,
+                attempt + 1,
+                exc_info=True,
+            )
+            return False
+        if inherited is None:
+            # The ordinary case, and the reason this is a read before it
+            # is a write: a Run that never parked owes the backend
+            # nothing.
+            return True
+        if (
+            subscription._cancelled
+            or subscription.installed_park_generation is not None
+        ):
+            # Asked again across the read, because this Run's state can
+            # have moved on entirely while it was in flight: evicted and
+            # picked up again, with a *new* park confirmed for the same
+            # key. Removing what was found before that would strand the
+            # park that replaced it.
+            return True
+        logger.info(
+            "Removing an inherited external stream park intent for %s "
+            "wait %s: park generation %s was confirmed by a Worker that "
+            "no longer holds this Run",
+            subscription.stream_key,
+            subscription.wait_id,
+            inherited.park_generation,
+        )
+        # Owed from the moment it is known to exist, not from the moment a
+        # removal fails: this is the only mirror an inherited intent ever
+        # gets, and without it `_remove_park_intent` goes on short-circuiting
+        # on an empty `installed_park_generation` and every removal path --
+        # the resolve, the withdrawal, the close -- stays disabled for it.
+        self._owe_removal(
+            run_id,
+            key,
+            _OwedRemoval(
+                backend=subscription.backend,
+                park_generation=inherited.park_generation,
+                run_id=inherited.run_id,
+            ),
+        )
+        try:
+            outcome = await subscription.backend.remove_park_intent_if_matches(
+                subscription.stream_key,
+                subscription.wait_id,
+                run_id=inherited.run_id,
+                park_generation=inherited.park_generation,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "Removing the inherited park intent for %s wait %s failed on "
+                "attempt %s",
+                subscription.stream_key,
+                subscription.wait_id,
+                attempt + 1,
+                exc_info=True,
+            )
+            return False
+        self._forget_owed_removal(run_id, key)
+        # This path is the *ordinary* one for an inherited intent -- the removal
+        # succeeding first time -- and it silences records exactly as a retried
+        # one does. `_start_watcher` runs this reconciliation and the watcher
+        # concurrently, so the watcher can read a record, find no open Workflow
+        # Task and send its wake naming the inherited generation while this is
+        # still in flight. Core discards that wake, and the watcher will not
+        # come back through here without a *new* append.
+        self._reannounce_after_cleanup(subscription, outcome)
+        return True
 
     def _owe_removal(
         self, run_id: str, key: tuple[StreamKey, int], record: _OwedRemoval
@@ -960,8 +1069,7 @@ class StreamSubscriptionManager:
                 wakeup.clear()
 
                 before = len(self._owed_removals.get(run_id, {}))
-                async with self._park_lock(run_id):
-                    await self._drain_owed_removals(run_id)
+                await self._bounded_drain(run_id)
                 after = len(self._owed_removals.get(run_id, {}))
                 if after == 0:
                     return
@@ -972,6 +1080,36 @@ class StreamSubscriptionManager:
                 self._owed_removal_wakeups.pop(run_id, None)
             if run_id not in self._runs and not self._owed_removals.get(run_id):
                 self._park_locks.pop(run_id, None)
+
+    async def _bounded_drain(
+        self, run_id: str, budget: timedelta = PARK_REMOVAL_CALL_TIMEOUT
+    ) -> None:
+        """Drains under this Run's park lock, and lets go of it either way.
+
+        The retry loop and the last pass at shutdown are the drains that take
+        this lock with no activation above them and nothing else bounding them --
+        the reconciliation's drain is bounded by the hold it sits inside, and
+        every other one is inside the activation whose budget a slow backend
+        spends regardless. A backend that hangs rather than raises would hold the
+        lock for as long as the call lasts, hence a timeout and not merely a
+        bounded number of attempts: attempts that never return are not bounded by
+        counting them.
+
+        A timeout leaves the entry owed, which is what the loop above does with a
+        failure -- back off and come round again.
+        """
+        try:
+            async with self._park_lock(run_id):
+                await asyncio.wait_for(
+                    self._drain_owed_removals(run_id), budget.total_seconds()
+                )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "A background owed-removal drain for run %s did not finish "
+                "within %s; the park lock is released and it stays owed",
+                run_id,
+                budget,
+            )
 
     async def _drain_owed_removals(self, run_id: str) -> None:
         """Retries every removal this Run still owes. Never raises.
@@ -996,7 +1134,7 @@ class StreamSubscriptionManager:
         for key, record in list(owed.items()):
             stream_key, wait_id = key
             try:
-                await record.backend.remove_park_intent_if_matches(
+                outcome = await record.backend.remove_park_intent_if_matches(
                     stream_key,
                     wait_id,
                     run_id=record.run_id,
@@ -1019,6 +1157,48 @@ class StreamSubscriptionManager:
                 # The mirror is only cleared once the backend agrees, here for
                 # the same reason `_remove_park_intent` does it in that order.
                 subscription.installed_park_generation = None
+                self._reannounce_after_cleanup(subscription, outcome)
+
+    def _reannounce_after_cleanup(
+        self, subscription: Subscription, outcome: ParkIntentRemoval
+    ) -> None:
+        """Announces again a record the retired intent had already silenced.
+
+        A stale intent does not only leak. While it was installed every wake for
+        this stream named the generation behind it -- the producer reads
+        `current_park_generation`, and so does the Worker's own sender -- and
+        Core discards a non-zero generation that is not the park it is holding.
+        A record that arrived in that window was therefore announced to nobody,
+        and *removing the intent does not announce it*: `_report_ready` counted
+        its wake as sent, the watcher has moved `prefetch_cursor` past it and
+        returns on the next empty read, and `_send_owed_wake` re-sends only a
+        wake that **raised**. Without this, a Run can sit blocked on a record
+        this Worker is already holding until some unrelated event happens to
+        create a Workflow Task.
+
+        Both outcomes that clear the key announce, and that is why the provider
+        contract does not answer with a Boolean. `ABSENT` is not "someone else's
+        intent is in the way", it is "the intent this entry named is gone" --
+        which is what a retry sees after the reply to a delete that in fact
+        succeeded was lost, and what one cleanup owner sees after another
+        finished the job. Reading that as a mismatch would leave the record the
+        intent silenced silent for good. `MISMATCH` announces nothing: an intent
+        is still installed there, the suppression it causes has not ended, and it
+        belongs to a park this entry knows nothing about.
+
+        Narrow otherwise. Only a wait still holding records, so a healthy park
+        costs no Workflow Task; and never during the sweep, which owns every wake
+        from that point and accounts for each one. Posted rather than awaited,
+        because callers hold the Run's park lock and `_report_ready` goes out to
+        Core.
+        """
+        if outcome is ParkIntentRemoval.MISMATCH:
+            return
+        if subscription._cancelled or not subscription.buffered:
+            return
+        if self._shutting_down:
+            return
+        self._loop.create_task(self._report_ready(subscription))
 
     def _park_lock(self, run_id: str) -> asyncio.Lock:
         """Serializes one Run's park-intent work on the manager's loop.
@@ -1864,7 +2044,15 @@ class StreamSubscriptionManager:
         for attempt in range(PARK_REMOVAL_ATTEMPTS):
             async with self._park_lock(run_id):
                 try:
-                    await self._remove_park_intent(subscription)
+                    # Bounded for the same reason the reconciliation's hold is:
+                    # this runs on a task of its own, and a call that hangs
+                    # rather than raises would hold this Run's park lock for as
+                    # long as it lasts. A timeout arrives here as one more
+                    # failed attempt, which is what it is.
+                    await asyncio.wait_for(
+                        self._remove_park_intent(subscription),
+                        PARK_REMOVAL_CALL_TIMEOUT.total_seconds(),
+                    )
                     break
                 except Exception:
                     logger.warning(
@@ -1902,6 +2090,14 @@ class StreamSubscriptionManager:
         to the Worker. Installed intents are deliberately untouched -- an
         eviction is not the end of a park, and the intents of a park that really
         is outstanding must survive it.
+
+        The eager attempt is skipped while shutting down, and that is not the
+        same as skipping cleanup. A retry loop stuck in a backend call holds this
+        Run's park lock, and a drain here would wait on it with no bound at all,
+        wedging the shutdown it is part of. The last attempt is made by
+        :meth:`_final_owed_removal_pass` instead, which runs after those loops
+        have been cancelled and awaited and is bounded by what is left of the
+        grace period.
         """
         self._replay_plans.pop(run_id, None)
         if self._owed_removals.get(run_id) and not self._shutting_down:
@@ -2030,6 +2226,51 @@ class StreamSubscriptionManager:
             await self.evict_run(run_id)
         remaining = timedelta(seconds=max(0.0, deadline - self._loop.time()))
         await self._stop_background_tasks(remaining)
+        await self._final_owed_removal_pass(
+            timedelta(seconds=max(0.0, deadline - self._loop.time()))
+        )
+
+    async def _final_owed_removal_pass(self, budget: timedelta) -> None:
+        """The last attempt at every removal still owed, and a count of what is left.
+
+        Reached only after :meth:`_stop_background_tasks`, which is both what
+        makes this the last attempt and what makes it safe: the retry loops that
+        own these entries are cancelled and awaited by then, so nothing holds a
+        park lock behind this pass and nothing restarts a loop after it.
+
+        Eviction is where this used to happen, and while shutting down it no
+        longer does -- a retry loop blocked in a backend call still held the lock
+        the eviction would have waited on. What was lost with it is the case this
+        exists for: an entry the loop failed once and is now sleeping out its
+        backoff, on a backend that has since recovered. Cancelling that sleep and
+        exiting would leave an intent installed that one call would have taken
+        out.
+
+        Bounded by whatever is left of the grace the sweep was given, because
+        cleanup may not extend shutdown -- and silent about nothing, since an
+        intent still installed as the process exits suppresses the unparked wake
+        for whoever picks the Run up next.
+        """
+        owed = list(self._owed_removals)
+        if not owed:
+            return
+        deadline = self._loop.time() + max(0.0, budget.total_seconds())
+        for run_id in owed:
+            left = deadline - self._loop.time()
+            if left <= 0:
+                break
+            await self._bounded_drain(
+                run_id, min(PARK_REMOVAL_CALL_TIMEOUT, timedelta(seconds=left))
+            )
+        still = sum(len(entries) for entries in self._owed_removals.values())
+        if still:
+            logger.warning(
+                "%s external stream park intent(s) are still installed as this "
+                "Worker exits, with no park behind them; the next Worker's "
+                "registration-time reconciliation is the only thing left that "
+                "removes them",
+                still,
+            )
 
     async def _stop_background_tasks(self, grace: timedelta) -> None:
         """Cancels manager-owned cleanup work without extending shutdown."""

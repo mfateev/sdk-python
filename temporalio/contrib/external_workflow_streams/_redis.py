@@ -32,6 +32,7 @@ from temporalio.contrib.external_workflow_streams._backend import (
     DEFAULT_WATCH_BLOCK,
     AppendConflictError,
     ParkIntent,
+    ParkIntentRemoval,
     StreamBackend,
     StreamKey,
 )
@@ -98,8 +99,15 @@ return {'appended', id}
 #: Compare-and-remove one park intent, atomically. The claim belongs to the
 #: intent generation, so a successful removal retires both keys just like the
 #: unconditional operation does.
+#:
+#: Returns 1 removed, 2 nothing installed, 0 someone else's intent. The absent
+#: case is answered before the comparison, so a key this script already cleared
+#: on a call whose reply was lost does not come back as a mismatch.
 _REMOVE_PARK_INTENT_IF_MATCHES_LUA: Final = """
 local run_id = redis.call('HGET', KEYS[1], 'run_id')
+if not run_id then
+  return 2
+end
 local generation = redis.call('HGET', KEYS[1], 'generation')
 if run_id == ARGV[1] and generation == ARGV[2] then
   redis.call('DEL', KEYS[1], KEYS[2])
@@ -107,6 +115,14 @@ if run_id == ARGV[1] and generation == ARGV[2] then
 end
 return 0
 """
+
+
+#: The script's return values, in the order it documents them.
+_REMOVAL_OUTCOMES: Final = {
+    0: ParkIntentRemoval.MISMATCH,
+    1: ParkIntentRemoval.REMOVED,
+    2: ParkIntentRemoval.ABSENT,
+}
 
 
 class RedisStreamBackend(StreamBackend):
@@ -255,12 +271,12 @@ class RedisStreamBackend(StreamBackend):
         *,
         run_id: str,
         park_generation: int,
-    ) -> bool:
-        removed = await self._remove_park_intent_if_matches_script(
+    ) -> ParkIntentRemoval:
+        outcome = await self._remove_park_intent_if_matches_script(
             keys=[self._intent_key(key, wait_id), self._claim_key(key, wait_id)],
             args=[run_id, str(park_generation)],
         )
-        return bool(removed)
+        return _REMOVAL_OUTCOMES[int(outcome)]
 
     async def park_intent(self, key: StreamKey, wait_id: int) -> ParkIntent | None:
         stored = await self._client.hgetall(self._intent_key(key, wait_id))

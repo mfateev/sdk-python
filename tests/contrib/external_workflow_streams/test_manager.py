@@ -17,7 +17,11 @@ from datetime import timedelta
 
 import pytest
 
-from temporalio.contrib.external_workflow_streams._backend import ParkIntent, StreamKey
+from temporalio.contrib.external_workflow_streams._backend import (
+    ParkIntent,
+    ParkIntentRemoval,
+    StreamKey,
+)
 from temporalio.contrib.external_workflow_streams._errors import (
     StreamStorageError,
 )
@@ -25,6 +29,7 @@ from temporalio.contrib.external_workflow_streams._manager import (
     PARK_REMOVAL_ATTEMPTS,
     ReadinessResult,
     StreamSubscriptionManager,
+    Subscription,
 )
 from temporalio.contrib.external_workflow_streams._record import (
     AFTER,
@@ -1239,7 +1244,7 @@ class FailingRemovals(MemoryStreamBackend):
         *,
         run_id: str,
         park_generation: int,
-    ) -> bool:
+    ) -> ParkIntentRemoval:
         self.removal_attempts += 1
         if self.failures > 0:
             self.failures -= 1
@@ -1445,7 +1450,7 @@ class BlockingAutonomousRemoval(MemoryStreamBackend):
         *,
         run_id: str,
         park_generation: int,
-    ) -> bool:
+    ) -> ParkIntentRemoval:
         self.attempts += 1
         if self.attempts == 1:
             raise ConnectionError("backend unavailable")
@@ -1455,7 +1460,7 @@ class BlockingAutonomousRemoval(MemoryStreamBackend):
         except asyncio.CancelledError:
             self.retry_cancelled.set()
             raise
-        return False
+        return ParkIntentRemoval.ABSENT
 
 
 @pytest.mark.asyncio
@@ -1478,6 +1483,382 @@ async def test_shutdown_cancels_and_awaits_an_owed_removal_retry(
 
     assert backend.retry_cancelled.is_set()
     assert manager._owed_removal_retries == {}
+
+
+class HangsOnceThenRecovers(MemoryStreamBackend):
+    """One removal call that never returns, and healthy ones after it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+        self.hanging = asyncio.Event()
+
+    async def remove_park_intent_if_matches(  # type: ignore[override]
+        self,
+        key: StreamKey,
+        wait_id: int,
+        *,
+        run_id: str,
+        park_generation: int,
+    ) -> ParkIntentRemoval:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise ConnectionError("backend unavailable")
+        if self.attempts == 2:
+            # A call that hangs rather than raises: no exception to catch, no
+            # return to act on, and nothing counting attempts can bound it.
+            self.hanging.set()
+            await asyncio.Event().wait()
+        return await super().remove_park_intent_if_matches(
+            key, wait_id, run_id=run_id, park_generation=park_generation
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_removal_call_that_hangs_does_not_end_the_autonomous_retry(
+    stream_key: StreamKey,
+) -> None:
+    """The loop's own liveness, which counting attempts cannot give it.
+
+    The retry loop is the only thing left holding a removal after the inline
+    attempts are spent, so a single call that never returns is not one lost
+    attempt -- it is the mechanism stopping. Nothing restarts the loop either:
+    `_owe_removal` starts one only when the task it finds is absent or done, and
+    a task awaiting a hung call is neither. The intent would stay installed on a
+    backend that had already recovered.
+
+    It also holds the Run's park lock while it waits, which every park, resolve
+    and eviction of this Run needs.
+    """
+    backend = HangsOnceThenRecovers()
+    manager = make_manager(backend, RecordingNotifier())
+    try:
+        manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+        assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING})
+        await manager.resolve_park(RUN_ID)
+        await asyncio.wait_for(backend.hanging.wait(), 2)
+        assert await backend.parked_wait_ids(stream_key) == [1]
+
+        await until(
+            lambda: _nothing_parked(backend, stream_key),
+            "the retry gave up its park lock and came back around after the "
+            "call that hung, or it did not",
+            timeout=4.0,
+        )
+        # And the lock an activation needs is reachable again: nothing is owed
+        # by now, so this resolve wants the lock and nothing else.
+        await asyncio.wait_for(manager.resolve_park(RUN_ID), 2)
+    finally:
+        await manager.shutdown(grace=timedelta(milliseconds=200))
+
+
+@pytest.mark.asyncio
+async def test_shutdown_makes_the_last_attempt_the_retry_loop_cannot(
+    stream_key: StreamKey,
+) -> None:
+    """A backend that recovered during a backoff, on a Worker that is exiting.
+
+    The retry loop is cancelled by shutdown, and cancelling it during its
+    backoff throws away an attempt that would have succeeded -- the failure that
+    started the backoff is not the state of the backend now. Eviction used to be
+    that last attempt and deliberately stands aside while shutting down, so the
+    pass after the loops are cancelled is what has to make it.
+    """
+    backend = FailingRemovals(failures=99)
+    manager = make_manager(backend, RecordingNotifier())
+    manager.register(
+        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+    )
+    assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING})
+    await manager.resolve_park(RUN_ID)
+    # Long enough for the backoff to have grown past the grace period below, so
+    # a sleeping loop cannot be what removes it.
+    await until(
+        lambda: backend.removal_attempts >= 4,
+        "the retry loop must have failed enough times to be backing off",
+        timeout=4.0,
+    )
+    attempts = backend.removal_attempts
+    backend.failures = 0
+
+    await asyncio.wait_for(manager.shutdown(grace=timedelta(seconds=1)), 3)
+
+    assert backend.removal_attempts > attempts, (
+        "shutdown cancelled the retry and exited without trying once itself"
+    )
+    assert await backend.parked_wait_ids(stream_key) == [], (
+        "the intent outlived a Worker whose backend was healthy again"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_re_announces_the_record_the_stale_intent_silenced(
+    stream_key: StreamKey,
+) -> None:
+    """Removing the intent is not the same as delivering what it suppressed.
+
+    Every wake sent while the stale intent was installed named the generation
+    behind it, and Core discards a non-zero generation that is not the park it
+    holds. The record that arrived in that window is buffered here, its wake is
+    counted as sent, and the watcher will not report it again without a *new*
+    append -- so retiring the intent stops the suppression and announces
+    nothing. The Run stays blocked on a record this Worker is already holding.
+    """
+    backend = FailingRemovals(failures=99)
+    sent: list[int] = []
+
+    async def send_wake(subscription: Subscription) -> None:
+        # What the Worker's sender does: read the generation at send time.
+        sent.append(
+            await subscription.backend.current_park_generation(
+                subscription.stream_key, subscription.wait_id
+            )
+            or 0
+        )
+
+    # No open Workflow Task, so local readiness cannot be delivered and each
+    # announcement becomes a wake Signal.
+    manager = make_manager(
+        backend,
+        RecordingNotifier(ReadinessResult.NO_OPEN_WORKFLOW_TASK),
+        send_wake=send_wake,
+    )
+    try:
+        manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+        assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING})
+        await manager.resolve_park(RUN_ID)
+        assert await backend.current_park_generation(stream_key, 1) == 4
+
+        await append(backend, stream_key, b"1")
+        await until(lambda: sent, "the record's wake must be sent")
+        assert sent == [4], "the wake named the generation Core has discarded"
+
+        backend.failures = 0
+        await until(
+            lambda: _nothing_parked(backend, stream_key),
+            "the autonomous retry must retire the stale intent",
+        )
+        await until(
+            lambda: len(sent) > 1,
+            "nothing announced the record again once the suppression ended",
+        )
+        assert sent[1] == 0, (
+            "the wake that follows the cleanup must be the unparked one Core "
+            "accepts unconditionally"
+        )
+    finally:
+        await manager.shutdown(grace=timedelta(milliseconds=200))
+
+
+class DelaysTheIntentRead(MemoryStreamBackend):
+    """Holds the reconciliation's read until the watcher has sent its wake."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.may_read = asyncio.Event()
+
+    async def park_intent(self, key: StreamKey, wait_id: int) -> ParkIntent | None:
+        await self.may_read.wait()
+        return await super().park_intent(key, wait_id)
+
+
+@pytest.mark.asyncio
+async def test_reconciling_an_inherited_intent_re_announces_what_it_silenced(
+    stream_key: StreamKey,
+) -> None:
+    """The ordinary reconciliation races the watcher, and can lose it a record.
+
+    `_start_watcher` starts the reconciliation and the watcher as two tasks, so
+    the watcher can read a record, find no open Workflow Task and send its wake
+    -- naming the inherited generation, which Core discards -- while the
+    reconciliation is still in flight. The removal then succeeds *first time*,
+    which is the path that never goes near the owed-removal ledger, so the
+    reannouncement the retry path does would never happen here. The record sits
+    buffered with its prefetch cursor already past it.
+    """
+    backend = DelaysTheIntentRead()
+    sent: list[int] = []
+
+    async def send_wake(subscription: Subscription) -> None:
+        sent.append(
+            await subscription.backend.current_park_generation(
+                subscription.stream_key, subscription.wait_id
+            )
+            or 0
+        )
+        # Only now may the reconciliation read: the wake naming the inherited
+        # generation is already gone.
+        backend.may_read.set()
+
+    manager = make_manager(
+        backend,
+        RecordingNotifier(ReadinessResult.NO_OPEN_WORKFLOW_TASK),
+        send_wake=send_wake,
+    )
+    try:
+        await _inherit(backend, stream_key, RUN_ID)
+        await append(backend, stream_key, b"1")
+        manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+
+        await until(lambda: sent, "the watcher must announce the buffered record")
+        assert sent[0] == 7, "the wake named the inherited generation"
+
+        await until(
+            lambda: _nothing_parked(backend, stream_key),
+            "the reconciliation must remove the intent it inherited",
+        )
+        await until(
+            lambda: len(sent) > 1,
+            "the ordinary reconciliation removed the intent and left the record "
+            "it had silenced unannounced",
+        )
+        assert sent[1] == 0, "the wake after cleanup must be the unparked one"
+    finally:
+        await manager.shutdown(grace=timedelta(milliseconds=200))
+
+
+class LosesTheReplyAfterCommitting(MemoryStreamBackend):
+    """Deletes the intent, then fails before the reply reaches the Worker."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+        self.removing = asyncio.Event()
+        self.wake_sent = asyncio.Event()
+
+    async def remove_park_intent_if_matches(  # type: ignore[override]
+        self,
+        key: StreamKey,
+        wait_id: int,
+        *,
+        run_id: str,
+        park_generation: int,
+    ) -> ParkIntentRemoval:
+        self.calls += 1
+        if self.calls == 1:
+            self.removing.set()
+            await self.wake_sent.wait()
+            await super().remove_park_intent_if_matches(
+                key, wait_id, run_id=run_id, park_generation=park_generation
+            )
+            raise ConnectionError("the reply never arrived")
+        return await super().remove_park_intent_if_matches(
+            key, wait_id, run_id=run_id, park_generation=park_generation
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_removal_whose_reply_was_lost_still_re_announces(
+    stream_key: StreamKey,
+) -> None:
+    """An absent key is cleanup that happened, not a park to leave alone.
+
+    A provider can commit the compare-and-delete and lose the connection before
+    its reply arrives. The removal raises, so it stays owed; the retry finds the
+    key clear. Reading that as "someone else's intent is there" would leave the
+    record whose wake named the dead generation buffered and unannounced --
+    which is why the outcome is three-valued rather than a Boolean.
+    """
+    backend = LosesTheReplyAfterCommitting()
+    sent: list[int] = []
+
+    async def send_wake(subscription: Subscription) -> None:
+        sent.append(
+            await subscription.backend.current_park_generation(
+                subscription.stream_key, subscription.wait_id
+            )
+            or 0
+        )
+
+    manager = make_manager(
+        backend,
+        RecordingNotifier(ReadinessResult.NO_OPEN_WORKFLOW_TASK),
+        send_wake=send_wake,
+    )
+    try:
+        manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+        assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING})
+
+        # Core has ended the park, so generation 4 is dead the moment this
+        # resolve starts -- and its removal is in flight when the record lands.
+        resolve = asyncio.ensure_future(manager.resolve_park(RUN_ID))
+        await asyncio.wait_for(backend.removing.wait(), 2)
+        await append(backend, stream_key, b"1")
+        await until(lambda: sent, "the record's wake must be sent")
+        assert sent == [4], "the wake named the generation Core has discarded"
+
+        backend.wake_sent.set()
+        await asyncio.wait_for(resolve, 2)
+
+        await until(
+            lambda: len(sent) > 1,
+            "the retry read the committed delete as a mismatch and left the "
+            "record it had silenced unannounced",
+        )
+        assert sent[1] == 0, "the wake after cleanup must be the unparked one"
+        assert manager._owed_removals == {}
+    finally:
+        await manager.shutdown(grace=timedelta(milliseconds=200))
+
+
+class FailingIntentReads(MemoryStreamBackend):
+    """Cannot say whether an intent exists until it is told to recover."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.healthy = False
+        self.reads = 0
+
+    async def park_intent(self, key: StreamKey, wait_id: int) -> ParkIntent | None:
+        self.reads += 1
+        if not self.healthy:
+            raise ConnectionError("backend unavailable")
+        return await super().park_intent(key, wait_id)
+
+
+@pytest.mark.asyncio
+async def test_discovering_an_inherited_intent_is_retried_after_recovery(
+    stream_key: StreamKey,
+) -> None:
+    """The ledger cannot hold what was never read, so the read needs the retry.
+
+    An owed removal is recorded from an intent's *identity*, and a read that
+    never succeeds produces no identity -- so a reconciliation that gave up
+    after its cheap attempts left no ledger entry, no retry task and no owner,
+    while logging that an autonomous retry was continuing. Recovery then needed
+    exactly the unrelated Workflow or Core event the ledger exists to stop
+    needing.
+    """
+    backend = FailingIntentReads()
+    manager = make_manager(backend, RecordingNotifier())
+    try:
+        await _inherit(backend, stream_key, RUN_ID)
+        manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+        await until(
+            lambda: backend.reads >= PARK_REMOVAL_ATTEMPTS,
+            "the inline attempts must be spent before recovery",
+        )
+        assert manager._owed_removals == {}, "nothing was read, so nothing can be owed"
+        backend.healthy = True
+
+        await until(
+            lambda: _nothing_parked(backend, stream_key),
+            "the inherited intent outlived a backend that recovered, with no "
+            "park, resolve, registration or eviction to prompt another read",
+            timeout=4.0,
+        )
+    finally:
+        await manager.shutdown(grace=timedelta(milliseconds=200))
 
 
 @pytest.mark.asyncio

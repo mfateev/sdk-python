@@ -15,7 +15,10 @@ from datetime import timedelta
 import pytest
 import pytest_asyncio
 
-from temporalio.contrib.external_workflow_streams._backend import StreamKey
+from temporalio.contrib.external_workflow_streams._backend import (
+    ParkIntentRemoval,
+    StreamKey,
+)
 from temporalio.contrib.external_workflow_streams._manager import (
     BEGINNING,
     SHUTDOWN_WAKE_ATTEMPTS,
@@ -935,7 +938,7 @@ async def test_a_resolve_with_no_park_installed_touches_nothing(
         *,
         run_id: str,
         park_generation: int,
-    ) -> bool:
+    ) -> ParkIntentRemoval:
         removals.append(wait_id)
         return await original(
             removed_key,
@@ -986,7 +989,7 @@ async def test_a_backend_failure_during_removal_leaves_it_owed(
         *,
         run_id: str,
         park_generation: int,
-    ) -> bool:
+    ) -> ParkIntentRemoval:
         if failures:
             failures.pop()
             raise ConnectionError("backend unavailable")

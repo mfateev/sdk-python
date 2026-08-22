@@ -29,6 +29,7 @@ suite exists to catch:
 from __future__ import annotations
 
 import abc
+import enum
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import timedelta
@@ -126,6 +127,31 @@ class AppendConflictError(Exception):
 
 #: How long a watch blocks before returning empty, when no timeout is given.
 DEFAULT_WATCH_BLOCK: Final = timedelta(seconds=5)
+
+
+class ParkIntentRemoval(enum.Enum):
+    """What a conditional park-intent removal found at the key.
+
+    Three outcomes rather than a Boolean, because two of them mean the intent
+    the consumer named is gone and one means it never got out of the way, and
+    the consumer acts differently on each: a removal that happened ends a wake
+    suppression that may owe a record an announcement, while a live intent that
+    replaced it does not.
+    """
+
+    REMOVED = 1
+    """The intent matched the named Run and park generation, and is gone."""
+
+    ABSENT = 2
+    """Nothing was installed at the key.
+
+    Reported for a key that is already clear -- including one this provider
+    itself cleared on a call whose reply never arrived. It is *not* the same as
+    a key some other intent holds.
+    """
+
+    MISMATCH = 3
+    """A different Run or park generation is installed, and was left alone."""
 
 
 class StreamBackend(abc.ABC):
@@ -257,7 +283,7 @@ class StreamBackend(abc.ABC):
         *,
         run_id: str,
         park_generation: int,
-    ) -> bool:
+    ) -> ParkIntentRemoval:
         """Atomically removes an intent only when its identity still matches.
 
         The comparison and removal must be one backend operation. A delayed
@@ -266,9 +292,12 @@ class StreamBackend(abc.ABC):
         :meth:`park_intent` followed by :meth:`remove_park_intent` can delete
         that successor's live park.
 
-        Returns:
-            ``True`` when the matching intent was removed and ``False`` when
-            the key was absent or held a different Run or park generation.
+        All three outcomes must be reported distinctly. Collapsing
+        :attr:`ParkIntentRemoval.ABSENT` into
+        :attr:`ParkIntentRemoval.MISMATCH` tells the consumer that someone
+        else's park is in the way when in fact the key is clear -- which is what
+        a retry after a lost reply sees, the reply to a delete this provider
+        already performed.
         """
 
     @abc.abstractmethod

@@ -22,6 +22,7 @@ from datetime import timedelta
 from temporalio.contrib.external_workflow_streams._backend import (
     AppendConflictError,
     ParkIntent,
+    ParkIntentRemoval,
     StreamBackend,
     StreamKey,
 )
@@ -494,28 +495,52 @@ async def check_an_intent_is_removable_and_removal_is_idempotent(
 async def check_conditional_removal_never_deletes_a_replacement(
     backend: StreamBackend, key: StreamKey
 ) -> None:
-    """A predecessor's delayed cleanup must not remove a successor's park."""
+    """A predecessor's delayed cleanup must not remove a successor's park.
+
+    And it must say which of the two "nothing was removed" cases it met. A key
+    that is clear is not a key someone else's park is holding: the consumer
+    treats the first as cleanup that happened -- possibly its own, on a call
+    whose reply was lost -- and the second as a park it must leave alone.
+    """
     successor = ParkIntent(1, BEGINNING, park_generation=2, run_id="run-b")
     await backend.install_park_intent(key, successor)
 
-    assert not await backend.remove_park_intent_if_matches(
-        key, 1, run_id="run-a", park_generation=2
+    assert (
+        await backend.remove_park_intent_if_matches(
+            key, 1, run_id="run-a", park_generation=2
+        )
+        is ParkIntentRemoval.MISMATCH
     )
     assert await backend.park_intent(key, 1) == successor
 
-    assert not await backend.remove_park_intent_if_matches(
-        key, 1, run_id="run-b", park_generation=1
+    assert (
+        await backend.remove_park_intent_if_matches(
+            key, 1, run_id="run-b", park_generation=1
+        )
+        is ParkIntentRemoval.MISMATCH
     )
     assert await backend.park_intent(key, 1) == successor
 
-    assert await backend.remove_park_intent_if_matches(
-        key, 1, run_id="run-b", park_generation=2
+    assert (
+        await backend.remove_park_intent_if_matches(
+            key, 1, run_id="run-b", park_generation=2
+        )
+        is ParkIntentRemoval.REMOVED
     )
     assert await backend.park_intent(key, 1) is None
 
-    assert not await backend.remove_park_intent_if_matches(
-        key, 1, run_id="run-b", park_generation=2
-    )
+    assert (
+        await backend.remove_park_intent_if_matches(
+            key, 1, run_id="run-b", park_generation=2
+        )
+        is ParkIntentRemoval.ABSENT
+    ), "a repeat of a removal that succeeded is an absent key, not a mismatch"
+    assert (
+        await backend.remove_park_intent_if_matches(
+            key, 1, run_id="run-c", park_generation=9
+        )
+        is ParkIntentRemoval.ABSENT
+    ), "an absent key is absent whoever asks about it"
 
 
 async def check_a_new_runs_intent_replaces_its_predecessors(
