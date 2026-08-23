@@ -179,6 +179,10 @@ class _StubBackend:
 
 class _StubSubscription:
     def __init__(self, wake_counter: int = 1) -> None:
+        #: The manager keys its owed-removal ledger by Run, and the sender asks
+        #: it what generation this wake must name, so a target without one is
+        #: not a target the real sender can compose from.
+        self.run_id = "run-1"
         self.stream_key = StreamKey("ns", "wf-1", "first-run-1", "tokens")
         self.wait_id = 1
         #: The sender's sequence number for this wake, which is what the

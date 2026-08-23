@@ -1202,6 +1202,11 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         The manager's live watcher path is the other caller, and it must guard
         this call itself: an exception escaping ``_report_ready`` ends the
         watcher task for good.
+
+        ``subscription`` is whatever the manager composes a wake from, which is
+        not always a subscription: a stale park intent retired after its wait was
+        closed or its Run evicted still owes the wake it silenced, and the
+        manager carries that obligation on an object of its own.
         """
         from temporalio.contrib.external_workflow_streams._wake import (
             WakeRequest,
@@ -1219,14 +1224,16 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             )
 
         key = subscription.stream_key
-        # Read rather than remembered: the park this wake must name is whatever
-        # is installed *now*, and a generation cached when the watcher started
-        # would name a park that has since been abandoned and resolved.
+        # Asked of the manager rather than read straight from the backend. The
+        # park this wake must name is whatever is installed *now* -- a generation
+        # cached when the watcher started would name a park since abandoned and
+        # resolved -- but "installed" is not "live", and only the manager's
+        # owed-removal ledger can tell an intent Core is still parked on from one
+        # this Worker has already decided to remove. Naming the latter sends a
+        # Signal Core discards while reporting success, which is how the shutdown
+        # sweep came to count an obsolete generation as a handoff it had made.
         generation = (
-            await subscription.backend.current_park_generation(
-                key, subscription.wait_id
-            )
-            or 0
+            await self._stream_manager().wake_park_generation(subscription) or 0
         )
         try:
             await send_wake_signal(

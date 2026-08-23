@@ -10,6 +10,7 @@ buffered in a process about to exit.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import timedelta
 
 import pytest
@@ -874,6 +875,178 @@ async def test_a_wake_that_never_lands_is_retried_then_counted(
         "the wake was never acknowledged and shutdown reported nothing"
     )
     assert harness.manager.shutdown_wake_failures == 1
+
+
+class _RecordedSignals(list):  # type: ignore[type-arg]
+    """The wake requests each Signal would carry, and what a send costs.
+
+    The request ID alone is not enough for these tests: what is under test is
+    *which park* the wake names, and an obsolete generation reaches the service
+    exactly as happily as a current one.
+
+    ``delay`` is what makes a send a round trip rather than a function call. A
+    shutdown step that merely *schedules* a Signal passes every assertion a
+    zero-cost send can make, because the task it left behind runs on the way out
+    of the next await either way.
+    """
+
+    delay: float = 0.0
+
+
+@pytest.fixture
+def recorded_signals(monkeypatch) -> _RecordedSignals:  # type: ignore[no-untyped-def]
+    import temporalio.contrib.external_workflow_streams._wake as wake_module
+
+    requests = _RecordedSignals()
+
+    async def fake_send(client, wake_request, *, producer_session_id: str = "") -> str:
+        if requests.delay:
+            await asyncio.sleep(requests.delay)
+        requests.append(wake_request)
+        return wake_request_id(wake_request)
+
+    monkeypatch.setattr(wake_module, "send_wake_signal", fake_send)
+    return requests
+
+
+def _removals_failing_until(harness: Harness, resume: Callable[[], bool]) -> None:
+    """Fails every park-intent removal until ``resume`` says the backend recovered."""
+    original = harness.backend.remove_park_intent_if_matches
+
+    async def flaky_remove(
+        removed_key: StreamKey,
+        wait_id: int,
+        *,
+        run_id: str,
+        park_generation: int,
+    ) -> ParkIntentRemoval:
+        if not resume():
+            raise ConnectionError("backend unavailable")
+        return await original(
+            removed_key,
+            wait_id,
+            run_id=run_id,
+            park_generation=park_generation,
+        )
+
+    harness.backend.remove_park_intent_if_matches = (  # type: ignore[method-assign]
+        flaky_remove
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_does_not_wake_on_an_intent_it_has_decided_to_remove(
+    backend: MemoryStreamBackend, recorded_signals: _RecordedSignals
+) -> None:
+    """A Signal the service accepts is not the same as a wake Core accepts.
+
+    The sweep composed its wake from whatever ``current_park_generation``
+    answered, and a stale intent is precisely a generation Core has already
+    discarded. So the send succeeded, the subscription was resolved as a handoff
+    made, and ``shutdown_wake_failures`` reported a clean exit for a Worker whose
+    only wake was ignored on arrival. The manager holds the ledger that says the
+    intent is stale, so it is the only thing that can tell the two apart -- and
+    the honest composition for an intent already decided against is the unparked
+    wake, which carries no generation to be discarded.
+    """
+    harness = Harness(backend, RunStatus.NO_OPEN_WORKFLOW_TASK)
+    key = harness.register()
+    harness.manager._send_wake = _worker_wake_callback(harness.manager)
+    # Never recovers, so the intent is still installed when the sweep runs and
+    # the only Signal of this shutdown is the sweep's own.
+    _removals_failing_until(harness, lambda: False)
+    await harness.manager.prepare_park(RUN_ID, 4, {1: BEGINNING})
+    await harness.manager.resolve_park(RUN_ID)
+    assert await harness.backend.current_park_generation(key, 1) == 4, (
+        "the failed removal must leave the stale intent installed"
+    )
+
+    await harness.manager.shutdown(grace=timedelta(seconds=1))
+
+    assert [request.park_generation for request in recorded_signals] == [0], (
+        "the sweep named the generation behind an intent it had already decided "
+        "to remove, so Core discards the wake while the send reports success"
+    )
+    assert harness.manager.shutdown_wake_failures == 0
+    assert harness.metric == []
+
+
+@pytest.mark.asyncio
+async def test_a_removal_the_final_pass_confirms_carries_its_own_handoff(
+    backend: MemoryStreamBackend, recorded_signals: _RecordedSignals
+) -> None:
+    """The last removal of a Worker's life ends a suppression window too.
+
+    An evicted Run has no subscription for the sweep to wake and none for the
+    cleanup to announce through, which is the whole reason the ledger is not
+    kept on the Subscription. When the backend recovers only after the retry
+    loops are cancelled -- the case :meth:`_final_owed_removal_pass` exists for
+    -- that pass is what ends the suppression, and it has to carry the handoff
+    itself: nothing runs after it, and a wake merely *scheduled* as the process
+    exits is a wake never sent.
+
+    Which is what the send delay pins. The cleanup handoff is posted as a task,
+    because every drain reaches it holding the Run's park lock under a budget
+    meant for one backend call rather than for a Signal with retries behind it --
+    so with a send that costs nothing, a shutdown that never waits for that task
+    still looks like one that did.
+    """
+    harness = Harness(backend, RunStatus.NO_OPEN_WORKFLOW_TASK)
+    key = harness.register()
+    harness.manager._send_wake = _worker_wake_callback(harness.manager)
+    recorded_signals.delay = 0.05
+    # Recovers exactly when the autonomous retries have been cancelled, so the
+    # final pass is the attempt that succeeds rather than the loop.
+    _removals_failing_until(
+        harness, lambda: harness.manager._stopping_owed_removal_retries
+    )
+    await harness.manager.prepare_park(RUN_ID, 4, {1: BEGINNING})
+    await harness.manager.resolve_park(RUN_ID)
+    await harness.manager.evict_run(RUN_ID)
+    assert harness.manager.subscription(RUN_ID, 1) is None, (
+        "eviction must drop the Subscription -- that is the premise"
+    )
+    assert await harness.backend.current_park_generation(key, 1) == 4
+
+    await harness.manager.shutdown(grace=timedelta(seconds=1))
+
+    assert await harness.backend.current_park_generation(key, 1) is None, (
+        "the final pass did not retire the intent, so this proves nothing"
+    )
+    assert [request.park_generation for request in recorded_signals] == [0], (
+        "shutdown reported itself clean while the record the retired intent had "
+        "silenced was announced to nobody"
+    )
+    assert harness.manager.shutdown_wake_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_the_sweeps_wake_is_not_sent_twice_by_the_final_pass(
+    backend: MemoryStreamBackend, recorded_signals: _RecordedSignals
+) -> None:
+    """One obligation, not two.
+
+    The sweep already composed this wait's wake as unparked *because* the ledger
+    said its intent was stale, which makes it the same generation-0 handoff the
+    removal owes once it finally goes through. Sending it again asks the server
+    for a second, empty Workflow Task.
+    """
+    harness = Harness(backend, RunStatus.NO_OPEN_WORKFLOW_TASK)
+    key = harness.register()
+    harness.manager._send_wake = _worker_wake_callback(harness.manager)
+    _removals_failing_until(
+        harness, lambda: harness.manager._stopping_owed_removal_retries
+    )
+    await harness.manager.prepare_park(RUN_ID, 4, {1: BEGINNING})
+    await harness.manager.resolve_park(RUN_ID)
+
+    await harness.manager.shutdown(grace=timedelta(seconds=1))
+
+    assert await harness.backend.current_park_generation(key, 1) is None
+    assert [request.park_generation for request in recorded_signals] == [0], (
+        "the sweep's wake and the cleanup's are one handoff; sending both costs "
+        "an empty Workflow Task"
+    )
 
 
 # --- the park intent's lifetime -----------------------------------------------

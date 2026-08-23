@@ -1939,6 +1939,85 @@ async def test_an_owed_removal_outlives_eviction_and_keeps_retrying(
 
 
 @pytest.mark.asyncio
+async def test_a_cleanup_after_eviction_still_announces_what_it_silenced(
+    stream_key: StreamKey,
+) -> None:
+    """The removal outlives the Subscription; the wake it owes has to as well.
+
+    Eviction is what makes the ledger worth having -- it drops the Subscription
+    and deliberately leaves the entry and its retry alive -- so by the time a
+    recovered backend lets the removal through, the object every announcement
+    path goes through is gone. Announcing only when the wait happens to still be
+    registered therefore kept the leak fixed and put the *record loss* straight
+    back: while the stale intent was installed a producer saw a non-empty parked
+    set and sent only generation 4, Core discarded it, and with no cached Run
+    there was no local watcher to send an unparked wake of its own.
+
+    The wake is unconditional on purpose. From out here the buffer is gone and a
+    remote producer's append was never visible at all, so "a record arrived" and
+    "none did" are the same observation -- and only one of them is silent if the
+    guess goes the wrong way. The cost is one empty Workflow Task.
+    """
+    backend = FailingRemovals(failures=99)
+    sent: list[tuple[int, int]] = []
+
+    async def send_wake(target: object) -> None:
+        # What the Worker's real sender composes: the manager decides which park
+        # a wake names, because only it can tell an intent Core is still parked
+        # on from one already decided against.
+        sent.append(
+            (
+                target.wait_id,  # type: ignore[attr-defined]
+                await manager.wake_park_generation(target) or 0,  # type: ignore[arg-type]
+            )
+        )
+
+    manager = make_manager(backend, RecordingNotifier(), send_wake=send_wake)
+    try:
+        manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+        assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING})
+        await manager.resolve_park(RUN_ID)
+        assert await backend.current_park_generation(stream_key, 1) == 4, (
+            "the failed removal must leave the stale intent installed"
+        )
+
+        await manager.evict_run(RUN_ID)
+        assert manager.subscription(RUN_ID, 1) is None, (
+            "eviction must drop the Subscription -- that is the premise"
+        )
+        assert await backend.parked_wait_ids(stream_key) == [1], (
+            "and must leave the intent and its ledger entry behind"
+        )
+
+        # The record that gets lost. Appended by a producer this Worker cannot
+        # see, into a stream whose parked set is non-empty because of the stale
+        # intent -- so the only wake it sends names generation 4.
+        await append(backend, stream_key, b"1")
+
+        backend.failures = 0
+        await until(
+            lambda: _nothing_parked(backend, stream_key),
+            "the autonomous retry must retire the stale intent once the backend "
+            "recovers",
+        )
+        await until(
+            lambda: sent,
+            "the removal ended the suppression and announced nothing, so the "
+            "record stays undelivered until some unrelated event happens to "
+            "create a Workflow Task",
+        )
+        assert sent == [(1, 0)], (
+            "the cleanup handoff must be the unparked wake Core accepts "
+            "unconditionally, since the generation it would otherwise name is "
+            "the one it just removed"
+        )
+    finally:
+        await manager.shutdown(grace=timedelta(milliseconds=200))
+
+
+@pytest.mark.asyncio
 async def test_a_drain_never_removes_the_intent_of_a_park_that_replaced_it(
     stream_key: StreamKey,
 ) -> None:

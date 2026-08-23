@@ -49,7 +49,7 @@ import logging
 import threading
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import Any
 
@@ -268,7 +268,11 @@ ReadinessNotifier = Callable[[str, int, int], Awaitable[Any]]
 #: What the manager calls when local readiness could not be delivered. Filled in
 #: by the producer wake-signal path (P14); until then a subscription simply
 #: records that a wake was owed.
-WakeSender = Callable[["Subscription"], Awaitable[None]]
+#:
+#: Takes a :data:`WakeTarget` rather than a `Subscription`, because the wake a
+#: retired stale intent owes outlives the subscription the record was buffered
+#: on -- see :class:`_CleanupWake`.
+WakeSender = Callable[["WakeTarget"], Awaitable[None]]
 
 #: The read-only Run-status probe (C4), returning one of the four run statuses.
 RunStatusProbe = Callable[[str], Awaitable[Any]]
@@ -616,6 +620,61 @@ class _OwedRemoval:
     park_generation: int
     run_id: str
 
+    #: Whether a generation-0 handoff has already been made for this entry. Set
+    #: by the shutdown sweep, which wakes the subscriptions of a Run it is about
+    #: to tear down and composes those wakes as unparked precisely because this
+    #: entry says the installed intent is stale. The wake the cleanup would owe
+    #: afterwards is then the same wake, and sending it again would ask the
+    #: server for a second, empty Workflow Task.
+    #:
+    #: Out of the comparison on purpose: it is a note about a handoff, not part
+    #: of the identity of the removal, and `_owe_removal` treats an entry that
+    #: compares equal as debt it has already recorded.
+    announced: bool = field(default=False, compare=False)
+
+
+@dataclass
+class _CleanupWake:
+    """The wake a retired stale intent owes, with no Subscription left to owe it.
+
+    A stale intent does not only leak, it *silences*: every wake sent while it
+    was installed named the generation behind it, and Core discards a non-zero
+    generation that is not the park it holds. Retiring the intent ends the
+    suppression and announces nothing, so the removal carries a wake obligation
+    with it -- and :meth:`StreamSubscriptionManager._reannounce_after_cleanup`
+    can only discharge that obligation through local readiness, which needs a
+    registered `Subscription` and a buffer to read.
+
+    Eviction and close deliberately take that Subscription away while leaving
+    the ledger and its retry alive, which is the whole point of the ledger. So
+    the obligation is carried here instead: enough to compose the one wake that
+    is always correct after a confirmed removal -- the unparked one, which
+    carries no generation for Core to discard. It costs one empty Workflow Task
+    when no record arrived during the suppression window, and that is the
+    cheaper side of the trade: from out here, with no buffer left to consult,
+    "a record arrived" and "none did" look identical, and only one of them is
+    silent if guessed wrong.
+
+    Shaped like the part of a `Subscription` a wake is composed from, because
+    the sender takes one target and does not care which of the two it is.
+    """
+
+    run_id: str
+    wait_id: int
+    stream_key: StreamKey
+    backend: StreamBackend
+
+    #: Counted and drawn by `_count_owed_wake`, exactly as a subscription's is:
+    #: the request ID derives from it, so re-drawing between attempts would ask
+    #: for a second Workflow Task rather than re-send this one.
+    wakes_owed: int = 0
+    wake_counter: int = 0
+
+
+#: What one owed wake is composed from: a `Subscription` while the wait is still
+#: registered on this Worker, and a `_CleanupWake` once it is not.
+WakeTarget = Subscription | _CleanupWake
+
 
 class StreamSubscriptionManager:
     """Every subscription on one Worker, keyed by Run.
@@ -711,6 +770,14 @@ class StreamSubscriptionManager:
         #: entry's maximum backoff, and an empty loop should stop promptly.
         self._owed_removal_wakeups: dict[str, asyncio.Event] = {}
         self._stopping_owed_removal_retries = False
+        #: In-flight cleanup wakes, and what each one is for. Strong references,
+        #: because the loop keeps only a weak one to a running task and this
+        #: one's whole job is a Signal; and a mapping rather than a set, because
+        #: a flush that runs out of grace has to be able to say *which* handoff
+        #: it abandoned. Deliberately not among the tasks
+        #: `_stop_background_tasks` cancels: these are not retries that can be
+        #: resumed later, they are the wakes themselves.
+        self._cleanup_wakes: dict[asyncio.Task[None], _CleanupWake] = {}
 
     # --- registration -------------------------------------------------------
 
@@ -1158,6 +1225,124 @@ class StreamSubscriptionManager:
                 # the same reason `_remove_park_intent` does it in that order.
                 subscription.installed_park_generation = None
                 self._reannounce_after_cleanup(subscription, outcome)
+            else:
+                # No subscription to announce through, which is the *ordinary*
+                # case for this ledger rather than a corner of it: eviction and
+                # close both drop the Subscription and deliberately leave the
+                # entry and its retry alive, so by the time a recovered backend
+                # lets the removal through there is frequently nothing left
+                # holding the record the intent silenced. Announcing only when
+                # the wait happens to still be registered put the record-loss
+                # half of the suppression straight back.
+                self._wake_after_cleanup(record, stream_key, wait_id, outcome)
+
+    def _wake_after_cleanup(
+        self,
+        record: _OwedRemoval,
+        stream_key: StreamKey,
+        wait_id: int,
+        outcome: ParkIntentRemoval,
+    ) -> None:
+        """Hands off a record a retired intent may have silenced, with no wait left.
+
+        The Subscription-bound half of this is
+        :meth:`_reannounce_after_cleanup`, and it is the better one where it
+        applies: local readiness is free, and it fires only for a wait that is
+        actually holding records. Neither is knowable from here. The buffer went
+        with the Subscription, and whether a *remote* producer appended during
+        the suppression window was never visible from this Worker at all -- so
+        the choice is one unparked wake or silence, and silence is the failure
+        this whole path exists to prevent.
+
+        ``MISMATCH`` is the one outcome that stays silent, for the reason
+        :meth:`_reannounce_after_cleanup` gives: an intent is still installed at
+        that key, so the suppression has not ended and it belongs to a park this
+        entry knows nothing about.
+
+        Posted as a task rather than awaited, because every caller reaches the
+        drain holding this Run's park lock -- and one bounded by
+        `PARK_REMOVAL_CALL_TIMEOUT`, which is a budget for a single-key backend
+        call and not for a Signal with retries behind it. `shutdown` awaits what
+        is still in flight; see :meth:`_flush_cleanup_wakes`.
+        """
+        if outcome is ParkIntentRemoval.MISMATCH:
+            return
+        if record.announced:
+            # The shutdown sweep already made this exact handoff -- an unparked
+            # wake for this wait, composed that way *because* this entry said the
+            # installed intent was stale. A second one is a second empty
+            # Workflow Task, not a second chance.
+            return
+        if self._send_wake is None:
+            return
+        target = _CleanupWake(
+            run_id=record.run_id,
+            wait_id=wait_id,
+            stream_key=stream_key,
+            backend=record.backend,
+        )
+        task = self._loop.create_task(self._send_cleanup_wake(target))
+        self._cleanup_wakes[task] = target
+        task.add_done_callback(self._cleanup_wakes.pop)
+
+    async def _send_cleanup_wake(self, target: _CleanupWake) -> None:
+        """Sends one cleanup handoff. Never raises except on cancellation.
+
+        Counted through `_count_owed_wake` like any other owed wake, so the
+        retries inside `_send_owed_wake` are the same wake rather than three
+        separate asks.
+
+        A wake that never lands is reported, and while shutting down it is also
+        *counted*: the sweep's promise is that a handoff this Worker did not make
+        cannot be silent, and a removal confirmed during the final pass is as
+        much a part of that shutdown as a wake the sweep sent itself. On the live
+        path there is no counter with that meaning -- the metric is the shutdown
+        sweep's -- so the warning is what is left, and it says plainly that
+        nothing retries this.
+        """
+        self._count_owed_wake(target)
+        if await self._send_owed_wake(target):
+            return
+        logger.warning(
+            "The wake owed for the record a retired park intent silenced was "
+            "not acknowledged for %s wait %s; nothing else announces it",
+            target.stream_key,
+            target.wait_id,
+        )
+        if self._shutting_down:
+            self._record_shutdown_wake_failure(target)
+
+    async def _flush_cleanup_wakes(self, budget: timedelta) -> None:
+        """Waits out the cleanup handoffs still in flight as the Worker exits.
+
+        The last one of these is created by :meth:`_final_owed_removal_pass`,
+        which runs after everything else shutdown does, so without this the
+        process leaves with the Signal task merely scheduled -- which is the same
+        as not having sent it, and worse, because the failure counter would say a
+        clean shutdown.
+
+        Bounded by what is left of the grace period, for the reason every other
+        step of shutdown is: cleanup may not hold the exit open. What the bound
+        cuts off is counted rather than dropped, because the wake it abandons is
+        silent by nature.
+        """
+        pending = set(self._cleanup_wakes)
+        if not pending:
+            return
+        if budget.total_seconds() > 0:
+            _, pending = await asyncio.wait(pending, timeout=budget.total_seconds())
+        for task in pending:
+            target = self._cleanup_wakes.get(task)
+            task.cancel()
+            if target is None:
+                continue
+            logger.warning(
+                "External stream shutdown abandoned the wake owed for a retired "
+                "park intent on %s wait %s",
+                target.stream_key,
+                target.wait_id,
+            )
+            self._record_shutdown_wake_failure(target)
 
     def _reannounce_after_cleanup(
         self, subscription: Subscription, outcome: ParkIntentRemoval
@@ -1191,6 +1376,11 @@ class StreamSubscriptionManager:
         from that point and accounts for each one. Posted rather than awaited,
         because callers hold the Run's park lock and `_report_ready` goes out to
         Core.
+
+        Every one of those narrowings reads the Subscription, which is why this
+        is only half the cleanup. Once the wait is closed or its Run evicted
+        there is no buffer to consult and no readiness channel to use, and the
+        obligation is discharged by :meth:`_wake_after_cleanup` instead.
         """
         if outcome is ParkIntentRemoval.MISMATCH:
             return
@@ -2089,7 +2279,9 @@ class StreamSubscriptionManager:
         loop, so backend recovery is sufficient even if this Run never returns
         to the Worker. Installed intents are deliberately untouched -- an
         eviction is not the end of a park, and the intents of a park that really
-        is outstanding must survive it.
+        is outstanding must survive it. What the removal *silenced* outlives this
+        too, and is handed off by :meth:`_wake_after_cleanup`: the subscriptions
+        dropped below are exactly what the Subscription-bound announcement needs.
 
         The eager attempt is skipped while shutting down, and that is not the
         same as skipping cleanup. A retry loop stuck in a backend call holds this
@@ -2227,6 +2419,14 @@ class StreamSubscriptionManager:
         remaining = timedelta(seconds=max(0.0, deadline - self._loop.time()))
         await self._stop_background_tasks(remaining)
         await self._final_owed_removal_pass(
+            timedelta(seconds=max(0.0, deadline - self._loop.time()))
+        )
+        # Last, because the pass above is what creates the final cleanup
+        # handoffs: a removal confirmed there ends a suppression window nothing
+        # else will ever announce, and its wake is posted as a task rather than
+        # awaited under the park lock. Leaving without waiting for those tasks is
+        # indistinguishable from never having sent them.
+        await self._flush_cleanup_wakes(
             timedelta(seconds=max(0.0, deadline - self._loop.time()))
         )
 
@@ -2386,10 +2586,30 @@ class StreamSubscriptionManager:
         """
         self._count_owed_wake(subscription)
         if await self._send_owed_wake(subscription):
+            self._note_swept_handoff(subscription)
             self._resolve_unaccounted([subscription])
         else:
             self._record_shutdown_wake_failure(subscription)
             self._resolve_unaccounted([subscription])
+
+    def _note_swept_handoff(self, subscription: Subscription) -> None:
+        """Records that the sweep's wake also discharged an owed removal's handoff.
+
+        Only where there is one. A stale intent on this wait means the wake just
+        sent was composed as unparked -- `wake_park_generation` saw the ledger
+        entry -- so it is the very generation-0 handoff the removal would owe
+        once it finally goes through, and `_final_owed_removal_pass` runs after
+        this. Without the note the two are one obligation sent twice, which
+        costs an empty Workflow Task; marked only on success, so a wake the
+        sweep could not get acknowledged leaves the handoff still owed.
+        """
+        owed = self._owed_removals.get(subscription.run_id)
+        if not owed:
+            return
+        key = (subscription.stream_key, subscription.wait_id)
+        record = owed.get(key)
+        if record is not None and not record.announced:
+            owed[key] = replace(record, announced=True)
 
     def _resolve_unaccounted(self, subscriptions: Sequence[Subscription]) -> None:
         """Marks these subscriptions as decided, however they were decided.
@@ -2437,7 +2657,39 @@ class StreamSubscriptionManager:
             )
             self._record_shutdown_wake_failure(subscription)
 
-    def _count_owed_wake(self, subscription: Subscription) -> None:
+    async def wake_park_generation(self, target: WakeTarget) -> int | None:
+        """Which park one owed wake must name, or ``None`` for the unparked one.
+
+        The Worker's sender asks this rather than reading
+        ``current_park_generation`` itself, because "installed" is not the same
+        as "live" and only the manager can tell the two apart. Two things make
+        the raw read wrong:
+
+        - a `_CleanupWake` exists *because* the intent it names was just
+          retired. There is nothing left at that key that Core would accept, and
+          a generation another Worker has since installed belongs to a park this
+          handoff knows nothing about.
+        - a `Subscription` whose intent is in this Run's owed-removal ledger is
+          holding a generation this manager has **already decided to remove**.
+          Core discards a non-zero generation that is not the park it holds, so
+          naming it composes a wake that is ignored while the send reports
+          success -- which is exactly how the shutdown sweep came to count an
+          obsolete-generation Signal as a handoff it had made.
+
+        Still a read and not a remembered value in the ordinary case: the park a
+        wake must name is whatever is installed *now*, and a generation cached
+        when the watcher started would name a park since abandoned and resolved.
+        """
+        if isinstance(target, _CleanupWake):
+            return None
+        key = (target.stream_key, target.wait_id)
+        if key in self._owed_removals.get(target.run_id, {}):
+            return None
+        return await target.backend.current_park_generation(
+            target.stream_key, target.wait_id
+        )
+
+    def _count_owed_wake(self, target: WakeTarget) -> None:
         """Counts one owed wake and draws the sequence number it is sent under.
 
         Both halves happen here, exactly once per wake, because
@@ -2446,11 +2698,11 @@ class StreamSubscriptionManager:
         a second Workflow Task rather than re-sending the one that may already
         have arrived.
         """
-        subscription.wakes_owed += 1
+        target.wakes_owed += 1
         self._wake_sequence += 1
-        subscription.wake_counter = self._wake_sequence
+        target.wake_counter = self._wake_sequence
 
-    async def _send_owed_wake(self, subscription: Subscription) -> bool:
+    async def _send_owed_wake(self, subscription: WakeTarget) -> bool:
         """Sends the one wake ``wakes_owed`` already counts. Returns whether it landed.
 
         **The count belongs to the caller, and it is made exactly once, before
@@ -2494,7 +2746,7 @@ class StreamSubscriptionManager:
                     await asyncio.sleep(SHUTDOWN_WAKE_RETRY_DELAY.total_seconds())
         return False
 
-    def _record_shutdown_wake_failure(self, subscription: Subscription) -> None:
+    def _record_shutdown_wake_failure(self, subscription: WakeTarget) -> None:
         """Surfaces the wake that could not be acknowledged.
 
         Counted rather than only logged: a dropped wake is silent by nature --
