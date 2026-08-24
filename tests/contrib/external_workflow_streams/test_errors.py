@@ -47,7 +47,7 @@ class RecordingCounter(temporalio.common.MetricCounter):
 
     def with_additional_attributes(
         self, additional_attributes: temporalio.common.MetricAttributes
-    ) -> temporalio.common.MetricCounter:
+    ) -> RecordingCounter:
         return self
 
 

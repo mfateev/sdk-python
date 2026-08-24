@@ -84,6 +84,7 @@ class ReplayPlan:
 
     @property
     def total_records(self) -> int:
+        """The number of records prepared across all replay segments."""
         return sum(len(s.deliveries) for s in self.segments)
 
     @property

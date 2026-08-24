@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import pytest
 
@@ -56,7 +57,7 @@ async def test_a_custom_type_round_trips_as_that_type() -> None:
 
 @pytest.mark.asyncio
 async def test_without_a_declared_type_the_converter_infers() -> None:
-    untyped = StreamPayloadCodec(DEFAULT, None)
+    untyped: StreamPayloadCodec[Any] = StreamPayloadCodec(DEFAULT, None)
 
     decoded = await untyped.decode(await untyped.encode(Token("hi", 3)))
 

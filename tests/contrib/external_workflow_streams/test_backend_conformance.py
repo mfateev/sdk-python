@@ -9,7 +9,9 @@ ever passes is not evidence of anything.
 from __future__ import annotations
 
 import uuid
+from collections.abc import AsyncGenerator
 from datetime import timedelta
+from typing import cast
 
 import pytest
 
@@ -267,8 +269,11 @@ async def test_watch_iterates_across_batches(
         await backend.append(stream_key, StreamRecord(RecordKind.DATA, payload, "s", i))
 
     seen = []
-    watcher = backend.watch(
-        stream_key, Cursor(), max_records=1, block=timedelta(milliseconds=10)
+    watcher = cast(
+        AsyncGenerator[StreamRecord, None],
+        backend.watch(
+            stream_key, Cursor(), max_records=1, block=timedelta(milliseconds=10)
+        ),
     )
     async for record in watcher:
         seen.append(record.payload)

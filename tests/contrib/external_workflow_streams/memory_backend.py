@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import timedelta
+from typing import ClassVar
 
 from temporalio.contrib.external_workflow_streams._backend import (
     DEFAULT_WATCH_BLOCK,
@@ -38,7 +39,7 @@ def parse(offset: Offset) -> tuple[int, int]:
 class MemoryStreamBackend(StreamBackend):
     """A correct reference implementation."""
 
-    guarantees_immutability = True
+    guarantees_immutability: ClassVar[bool | None] = True
     provider_id = "memory"
     provider_format_version = 1
 
@@ -66,7 +67,11 @@ class MemoryStreamBackend(StreamBackend):
             raise AppendConflictError(record.idempotency_key)
 
         stream = self._records.setdefault(key, [])
-        seq = sum(1 for r in stream if parse(r.offset).__getitem__(0) == self.now_ms)  # type: ignore[arg-type]
+        seq = sum(
+            1
+            for record in stream
+            if record.offset is not None and parse(record.offset)[0] == self.now_ms
+        )
         placed = record.placed_at(Offset(f"{self.now_ms}-{seq}"))
         stream.append(placed)
         self._by_key[(key, record.idempotency_key)] = placed

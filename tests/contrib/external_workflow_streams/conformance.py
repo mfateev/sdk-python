@@ -383,7 +383,8 @@ async def check_records_round_trip_unchanged(
 
 
 async def check_immutability_is_declared(
-    backend: StreamBackend, key: StreamKey
+    backend: StreamBackend,
+    key: StreamKey,  # pyright: ignore[reportUnusedParameter]
 ) -> None:
     """Declared, not merely true. Undeclared is a registration failure.
 

@@ -94,7 +94,9 @@ class FakeRuntime:
         self.consumed.append((wait_id, record))
 
     def codec_for(
-        self, value_type: type | None, wait_id: int
+        self,
+        value_type: type | None,
+        wait_id: int,  # pyright: ignore[reportUnusedParameter]
     ) -> StreamPayloadCodec[Any]:
         if self.codec is not None:
             return self.codec
@@ -165,7 +167,9 @@ def test_a_non_positive_idle_timeout_is_rejected(bad: timedelta) -> None:
         external_stream.with_options(idle_timeout=bad)
 
 
-def test_topics_inherit_their_options(runtime: FakeRuntime) -> None:
+def test_topics_inherit_their_options(
+    runtime: FakeRuntime,  # pyright: ignore[reportUnusedParameter]
+) -> None:
     configured = external_stream.with_options(idle_timeout=timedelta(seconds=3))
 
     subscription = configured.topic("tokens", backend="tokens-redis").subscribe()
@@ -193,7 +197,9 @@ def test_a_workflow_names_a_backend_it_never_imports(runtime: FakeRuntime) -> No
     assert isinstance(topic.backend_name, str)
 
 
-def test_naming_an_unregistered_backend_fails(runtime: FakeRuntime) -> None:
+def test_naming_an_unregistered_backend_fails(
+    runtime: FakeRuntime,  # pyright: ignore[reportUnusedParameter]
+) -> None:
     with pytest.raises(KeyError, match="no external stream backend"):
         external_stream.topic("tokens", backend="not-registered").subscribe()
 
@@ -210,7 +216,7 @@ def test_a_topic_needs_both_a_name_and_a_backend(
 
 
 def test_subscribing_without_a_configured_worker_says_so(
-    workflow_instance: FakeInstance,
+    workflow_instance: FakeInstance,  # pyright: ignore[reportUnusedParameter]
 ) -> None:
     with pytest.raises(RuntimeError, match="external_stream_backends"):
         external_stream.topic("tokens", backend="tokens-redis").subscribe()
@@ -338,7 +344,7 @@ async def test_control_records_are_never_yielded(runtime: FakeRuntime) -> None:
 
 @pytest.mark.asyncio
 async def test_an_empty_buffer_blocks_on_a_readiness_future(
-    runtime: FakeRuntime,
+    runtime: FakeRuntime,  # pyright: ignore[reportUnusedParameter]
 ) -> None:
     """Iteration never polls the backend; only Core can say when to look again."""
     subscription = external_stream.topic(
@@ -605,7 +611,7 @@ class FailingCodec:
     """
 
     def __init__(self, value_type: type | None = str) -> None:
-        self._inner = StreamPayloadCodec(
+        self._inner: StreamPayloadCodec[Any] = StreamPayloadCodec(
             temporalio.converter.DataConverter.default, value_type
         )
         self.calls = 0
@@ -613,7 +619,10 @@ class FailingCodec:
     def parse_unprepared(self, payload: bytes) -> Any:
         return self._inner.parse_unprepared(payload)
 
-    def convert(self, prepared: Any) -> Any:
+    def convert(
+        self,
+        prepared: Any,  # pyright: ignore[reportUnusedParameter]
+    ) -> Any:
         self.calls += 1
         raise RuntimeError("this converter cannot read this payload")
 

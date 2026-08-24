@@ -38,7 +38,11 @@ DEADLOCK_TIMEOUT_SECONDS = 2
 """What `_WorkflowWorker` gives an activation before declaring a deadlock."""
 
 
-async def _notify(run_id: str, wait_id: int, generation: int) -> str:
+async def _notify(
+    run_id: str,  # pyright: ignore[reportUnusedParameter]
+    wait_id: int,  # pyright: ignore[reportUnusedParameter]
+    generation: int,  # pyright: ignore[reportUnusedParameter]
+) -> str:
     return ReadinessResult.ACCEPTED
 
 
@@ -334,7 +338,7 @@ async def test_the_delivering_activation_reads_nothing_itself() -> None:
         await manager.prepare_replay(RUN_ID, annotation_for(key, placed))
 
         # From here on the provider is hostile. Delivery still has to work.
-        manager._backends["tokens"] = HostileBackend()
+        manager._backends = {**manager._backends, "tokens": HostileBackend()}
 
         plan = manager.take_replay_plan(RUN_ID)
 

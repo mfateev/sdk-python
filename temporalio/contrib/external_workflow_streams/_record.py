@@ -7,8 +7,9 @@ other piece of the feature is expressed in.
 from __future__ import annotations
 
 import enum
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Final, Mapping, Protocol
+from typing import Final, Protocol
 
 __all__ = [
     "AFTER",
@@ -43,6 +44,7 @@ class RecordKind(enum.IntEnum):
 
     @property
     def is_control(self) -> bool:
+        """Whether this record advances the cursor without yielding a value."""
         return self is not RecordKind.DATA
 
 
@@ -60,17 +62,21 @@ class Offset:
     token: str
 
     def __post_init__(self) -> None:
+        """Reject an empty provider position token."""
         if not self.token:
             raise ValueError("an offset token may not be empty")
 
     def __str__(self) -> str:
+        """Return the provider position token."""
         return self.token
 
     def serialize(self) -> str:
+        """Encode this offset as its opaque provider token."""
         return self.token
 
     @classmethod
     def deserialize(cls, token: str) -> Offset:
+        """Decode an offset from its opaque provider token."""
         return cls(token)
 
 
@@ -81,7 +87,9 @@ class OffsetComparator(Protocol):
     three-way comparison.
     """
 
-    def __call__(self, left: Offset, right: Offset, /) -> int: ...
+    def __call__(self, left: Offset, right: Offset, /) -> int:
+        """Compare two offsets using the provider's total order."""
+        ...
 
 
 @dataclass(frozen=True, order=False)
@@ -103,9 +111,11 @@ class Cursor:
 
     @property
     def is_beginning(self) -> bool:
+        """Whether this cursor is the beginning-of-stream boundary."""
         return self.offset is None
 
     def __str__(self) -> str:
+        """Return the cursor in the documented boundary grammar."""
         return "BEGINNING" if self.is_beginning else f"AFTER({self.offset})"
 
     def serialize(self) -> str:
@@ -122,6 +132,7 @@ class Cursor:
 
     @classmethod
     def deserialize(cls, encoded: str) -> Cursor:
+        """Decode the beginning or exclusive-after cursor form."""
         if encoded == "B":
             return BEGINNING
         if encoded.startswith("A"):
@@ -170,12 +181,14 @@ class IdempotencyKey:
     sequence: int
 
     def __post_init__(self) -> None:
+        """Require a non-empty session and non-negative sequence."""
         if not self.session_id:
             raise ValueError("a producer session id may not be empty")
         if self.sequence < 0:
             raise ValueError(f"sequence must be non-negative, got {self.sequence}")
 
     def __str__(self) -> str:
+        """Return the session and sequence as a diagnostic key."""
         return f"{self.session_id}/{self.sequence}"
 
 
@@ -208,6 +221,7 @@ class StreamRecord:
     offset: Offset | None = field(default=None)
 
     def __post_init__(self) -> None:
+        """Validate control payloads and producer sequence numbers."""
         if self.kind.is_control and self.payload:
             raise ValueError(f"a {self.kind.name} record carries no payload")
         if self.sequence < 0:
@@ -220,6 +234,7 @@ class StreamRecord:
 
     @property
     def idempotency_key(self) -> IdempotencyKey:
+        """The producer identity under which this record is appended."""
         return IdempotencyKey(self.producer_session_id, self.sequence)
 
     def placed_at(self, offset: Offset) -> StreamRecord:

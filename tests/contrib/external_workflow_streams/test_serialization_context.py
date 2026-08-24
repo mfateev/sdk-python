@@ -24,6 +24,7 @@ PYTEST_DONT_REWRITE: sandboxed fixture Workflows re-import this module, so pytes
 injected imports would make sandbox validation depend on pytest's import locks.
 """
 
+# pyright: reportUnusedImport=false
 from __future__ import annotations
 
 import asyncio
@@ -463,7 +464,11 @@ async def test_a_replayed_record_is_prepared_with_the_recorded_streams_context(
     )
     assert placed.offset is not None
 
-    async def notify(run_id: str, wait_id: int, generation: int) -> str:
+    async def notify(
+        run_id: str,  # pyright: ignore[reportUnusedParameter]
+        wait_id: int,  # pyright: ignore[reportUnusedParameter]
+        generation: int,  # pyright: ignore[reportUnusedParameter]
+    ) -> str:
         return ReadinessResult.ACCEPTED
 
     manager = StreamSubscriptionManager(

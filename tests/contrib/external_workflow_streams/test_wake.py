@@ -9,6 +9,7 @@ PYTEST_DONT_REWRITE: sandboxed fixture Workflows re-import this module, so pytes
 injected imports would make sandbox validation depend on pytest's import locks.
 """
 
+# pyright: reportUnusedImport=false, reportMissingParameterType=false
 from __future__ import annotations
 
 import asyncio
@@ -208,7 +209,11 @@ def _worker_sending_wakes(client_identity: str):  # type: ignore[no-untyped-def]
     )
     from temporalio.worker._workflow import _WorkflowWorker
 
-    async def notify_ready(run_id: str, wait_id: int, generation: int) -> str:
+    async def notify_ready(
+        run_id: str,  # pyright: ignore[reportUnusedParameter]
+        wait_id: int,  # pyright: ignore[reportUnusedParameter]
+        generation: int,  # pyright: ignore[reportUnusedParameter]
+    ) -> str:
         raise AssertionError("readiness is not part of this path")
 
     worker = object.__new__(_WorkflowWorker)
@@ -228,7 +233,12 @@ def sent_request_ids(monkeypatch):  # type: ignore[no-untyped-def]
 
     recorded: list[str] = []
 
-    async def fake_send(client, wake_request, *, producer_session_id: str = "") -> str:
+    async def fake_send(
+        client,  # pyright: ignore[reportUnusedParameter]
+        wake_request,
+        *,
+        producer_session_id: str = "",  # pyright: ignore[reportUnusedParameter]
+    ) -> str:
         request_id = wake_request_id(wake_request)
         recorded.append(request_id)
         return request_id
@@ -294,7 +304,12 @@ async def test_one_worker_retries_an_unacknowledged_wake_with_the_same_request_i
 
     recorded: list[str] = []
 
-    async def fail_once(client, wake_request, *, producer_session_id: str = "") -> str:
+    async def fail_once(
+        client,  # pyright: ignore[reportUnusedParameter]
+        wake_request,
+        *,
+        producer_session_id: str = "",  # pyright: ignore[reportUnusedParameter]
+    ) -> str:
         request_id = wake_request_id(wake_request)
         recorded.append(request_id)
         if len(recorded) == 1:
@@ -622,9 +637,23 @@ class FlakyCoordinationBackend(MemoryStreamBackend):
         self._maybe_fail("current_park_generation")
         return await super().current_park_generation(key, wait_id)
 
-    async def claim_park_generation(self, key, wait_id, generation, **kwargs):  # type: ignore[no-untyped-def]
+    async def claim_park_generation(
+        self,
+        key: StreamKey,
+        wait_id: int,
+        park_generation: int,
+        *,
+        claimant: str,
+        lease: timedelta,
+    ) -> bool:
         self._maybe_fail("claim_park_generation")
-        return await super().claim_park_generation(key, wait_id, generation, **kwargs)
+        return await super().claim_park_generation(
+            key,
+            wait_id,
+            park_generation,
+            claimant=claimant,
+            lease=lease,
+        )
 
 
 @pytest.mark.parametrize(
@@ -664,7 +693,7 @@ async def test_a_coordination_failure_after_the_append_is_still_unacknowledged(
         "looks like success"
     )
     assert not caught.value.pending
-    with pytest.raises(ValueError, match="call wake\(\) again"):
+    with pytest.raises(ValueError, match=r"call wake\(\) again"):
         await topic.retry_wake(caught.value.pending)
 
     # Recovering the wake alone leaves exactly one record in the stream.

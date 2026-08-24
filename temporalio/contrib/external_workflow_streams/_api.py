@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import Any, Generic, Protocol
 
@@ -147,6 +147,10 @@ class ExternalStreamRuntime(Protocol):
         """
         ...
 
+    def record_consumption(self, wait_id: int, record: StreamRecord) -> None:
+        """Notes one delivered record leaving the subscription's ready list."""
+        ...
+
     def note_blocked(self, wait_id: int, blocked: bool) -> None:
         """Records whether Workflow code is currently waiting on this wait."""
         ...
@@ -180,11 +184,7 @@ class _RunState:
     runtime: ExternalStreamRuntime | None = None
     next_wait_id: int = 1
     #: `wait_id -> Future`, resolved by the readiness activation handler.
-    pending: dict[int, Any] = None  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        if self.pending is None:
-            self.pending = {}
+    pending: dict[int, Any] = field(default_factory=dict)
 
 
 def _run_state() -> _RunState:
@@ -196,7 +196,9 @@ def _run_state() -> _RunState:
     return state
 
 
-def _install_runtime(instance: Any, runtime: ExternalStreamRuntime) -> None:
+def _install_runtime(  # pyright: ignore[reportUnusedFunction]
+    instance: Any, runtime: ExternalStreamRuntime
+) -> None:
     """Gives a Workflow instance its handle to the Worker's manager.
 
     Called by the Worker when it creates the instance.
@@ -567,6 +569,7 @@ class ExternalStreamSubscription(Generic[AnyType]):
         stream_key: StreamKey,
         state: _RunState,
     ) -> None:
+        """Bind one wait ID and stream key to its per-Run state."""
         self._topic = topic
         self._wait_id = wait_id
         self._stream_key = stream_key
@@ -582,14 +585,17 @@ class ExternalStreamSubscription(Generic[AnyType]):
 
     @property
     def wait_id(self) -> int:
+        """The Run-local identity Core uses for this subscription."""
         return self._wait_id
 
     @property
     def stream_key(self) -> StreamKey:
+        """The durable stream identity this subscription reads."""
         return self._stream_key
 
     @property
     def idle_timeout(self) -> timedelta:
+        """This subscription's configured contribution to the wait-set timeout."""
         return self._topic.options.idle_timeout
 
     def __aiter__(self) -> AsyncIterator[AnyType]:

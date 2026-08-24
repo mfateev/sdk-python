@@ -110,6 +110,7 @@ class ExternalStreamCapacityError(temporalio.exceptions.ApplicationError):
     """
 
     def __init__(self, message: str) -> None:
+        """Create a deterministic, non-retryable capacity failure."""
         super().__init__(
             message, type="ExternalStreamCapacityError", non_retryable=True
         )
@@ -141,6 +142,7 @@ class ConcurrentStreamConsumerError(temporalio.exceptions.ApplicationError):
     """
 
     def __init__(self, message: str) -> None:
+        """Create a deterministic, non-retryable consumer failure."""
         super().__init__(
             message, type="ConcurrentStreamConsumerError", non_retryable=True
         )

@@ -5,6 +5,7 @@ P15, P10b); these are the ones that fall between deliverables, which is exactly
 why a milestone gate is a separate list rather than a sum of "done when"s.
 """
 
+# pyright: reportMissingParameterType=false
 from __future__ import annotations
 
 import asyncio
@@ -37,7 +38,11 @@ from tests.contrib.external_workflow_streams.memory_backend import MemoryStreamB
 RUN_ID = "run-1"
 
 
-async def _notify(run_id: str, wait_id: int, generation: int) -> str:
+async def _notify(
+    run_id: str,  # pyright: ignore[reportUnusedParameter]
+    wait_id: int,  # pyright: ignore[reportUnusedParameter]
+    generation: int,  # pyright: ignore[reportUnusedParameter]
+) -> str:
     return ReadinessResult.ACCEPTED
 
 

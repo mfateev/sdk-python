@@ -10,6 +10,7 @@ PYTEST_DONT_REWRITE: sandboxed fixture Workflows re-import this module, so pytes
 injected imports would make sandbox validation depend on pytest's import locks.
 """
 
+# pyright: reportMissingParameterType=false, reportUnusedFunction=false
 from __future__ import annotations
 
 import asyncio
@@ -61,7 +62,11 @@ with workflow.unsafe.imports_passed_through():
     from temporalio.contrib.external_workflow_streams._api import external_stream
 
 
-async def _notify(run_id: str, wait_id: int, generation: int) -> str:
+async def _notify(
+    run_id: str,  # pyright: ignore[reportUnusedParameter]
+    wait_id: int,  # pyright: ignore[reportUnusedParameter]
+    generation: int,  # pyright: ignore[reportUnusedParameter]
+) -> str:
     return ReadinessResult.ACCEPTED
 
 

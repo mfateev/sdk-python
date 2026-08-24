@@ -7,6 +7,7 @@ must fail a different one of the four -- which is what makes the set complete
 rather than merely plausible.
 """
 
+# pyright: reportUnusedImport=false
 from __future__ import annotations
 
 import asyncio
@@ -55,6 +56,7 @@ from temporalio.contrib.external_workflow_streams._record import (
     StreamRecord,
 )
 from temporalio.contrib.external_workflow_streams._replay import (
+    ReplayPlan,
     validate_run,
 )
 from tests.contrib.external_workflow_streams.memory_backend import MemoryStreamBackend
@@ -63,7 +65,11 @@ from tests.contrib.external_workflow_streams.test_replay_end_to_end import publi
 RUN_ID = "run-1"
 
 
-async def _notify(run_id: str, wait_id: int, generation: int) -> str:
+async def _notify(
+    run_id: str,  # pyright: ignore[reportUnusedParameter]
+    wait_id: int,  # pyright: ignore[reportUnusedParameter]
+    generation: int,  # pyright: ignore[reportUnusedParameter]
+) -> str:
     return ReadinessResult.ACCEPTED
 
 
@@ -104,6 +110,12 @@ async def append_five(
             )
         )
     return placed
+
+
+def placed_offset(record: StreamRecord) -> Offset:
+    """Return the provider-assigned offset of a record already appended here."""
+    assert record.offset is not None
+    return record.offset
 
 
 def binding(
@@ -607,7 +619,7 @@ class DriverStub:
 
     def __init__(self, runtime) -> None:  # type: ignore[no-untyped-def]
         self._external_stream_runtime = runtime
-        self._pending_replay_finish = None
+        self._pending_replay_finish: ReplayPlan | None = None
         self.drains: list[int] = []
 
     def _finish_replay_external_streams(self) -> None:
@@ -721,15 +733,15 @@ async def test_the_driver_drains_once_per_recorded_segment(
             header=AnnotationHeader({1: binding(key)}),
             segments=(
                 Segment(
-                    (Run(1, placed[0].offset, placed[1].offset, 2),),
+                    (Run(1, placed_offset(placed[0]), placed_offset(placed[1]), 2),),
                     SegmentEndReason.BATCH_LIMIT,
                 ),  # type: ignore[arg-type]
                 Segment(
-                    (Run(1, placed[2].offset, placed[2].offset, 1),),
+                    (Run(1, placed_offset(placed[2]), placed_offset(placed[2]), 1),),
                     SegmentEndReason.BATCH_LIMIT,
                 ),  # type: ignore[arg-type]
                 Segment(
-                    (Run(1, placed[3].offset, placed[4].offset, 2),),
+                    (Run(1, placed_offset(placed[3]), placed_offset(placed[4]), 2),),
                     SegmentEndReason.NO_DATA_AVAILABLE,
                 ),  # type: ignore[arg-type]
             ),
@@ -765,11 +777,11 @@ async def test_a_drain_sees_only_its_own_segments_records(
             header=AnnotationHeader({1: binding(key)}),
             segments=(
                 Segment(
-                    (Run(1, placed[0].offset, placed[1].offset, 2),),
+                    (Run(1, placed_offset(placed[0]), placed_offset(placed[1]), 2),),
                     SegmentEndReason.BATCH_LIMIT,
                 ),  # type: ignore[arg-type]
                 Segment(
-                    (Run(1, placed[2].offset, placed[4].offset, 3),),
+                    (Run(1, placed_offset(placed[2]), placed_offset(placed[4]), 3),),
                     SegmentEndReason.NO_DATA_AVAILABLE,
                 ),  # type: ignore[arg-type]
             ),
@@ -858,8 +870,8 @@ async def test_a_replayed_drain_never_reaches_the_live_buffer(
     # watcher re-reads from the boundary the marker committed. Withheld either
     # way -- what changed is that the retraction is now certain by the time the
     # replay returns rather than posted onto the manager's loop and raced.
-    assert subscription.committed_cursor == AFTER(placed[1].offset)
-    assert subscription.prefetch_cursor == AFTER(placed[1].offset), (
+    assert subscription.committed_cursor == AFTER(placed_offset(placed[1]))
+    assert subscription.prefetch_cursor == AFTER(placed_offset(placed[1])), (
         "the watcher must resume reading at the marker's boundary, which is "
         "what re-reads the records this retraction dropped"
     )
@@ -1082,7 +1094,7 @@ async def test_live_delivery_after_a_replay_resumes_past_the_marker(
         "the live buffer still holds records the replayed marker already "
         "delivered, so the Workflow receives them twice"
     )
-    assert subscription.committed_cursor == AFTER(placed[1].offset), (
+    assert subscription.committed_cursor == AFTER(placed_offset(placed[1])), (
         "the marker's boundary was never committed, so a later reset would "
         "send the subscription back to the start cursor"
     )
@@ -1126,7 +1138,7 @@ async def test_the_first_live_drain_after_a_replay_needs_no_loop_turn(
 
     # No yield here on purpose. Everything below runs in the same synchronous
     # stretch of Workflow-thread work that the replay just finished in.
-    assert subscription.committed_cursor == AFTER(placed[1].offset), (
+    assert subscription.committed_cursor == AFTER(placed_offset(placed[1])), (
         "the marker's boundary must be committed by the time the replay returns, "
         "not once some later loop turn gets round to it"
     )
@@ -1134,7 +1146,7 @@ async def test_the_first_live_drain_after_a_replay_needs_no_loop_turn(
         "the drain immediately after a replay still saw the marker-covered "
         "records in the live buffer, so the Workflow receives them twice"
     )
-    assert subscription.prefetch_cursor == AFTER(placed[1].offset), (
+    assert subscription.prefetch_cursor == AFTER(placed_offset(placed[1])), (
         "the watcher must have been moved to re-read from the marker's boundary"
     )
 
@@ -1326,8 +1338,8 @@ async def test_a_read_in_flight_across_a_reposition_cannot_be_appended(
     assert subscription.buffered == 0, "the watcher got past its append already"
 
     # The Workflow thread's half, while that read is still in flight.
-    manager.reposition_to_committed(RUN_ID, {1: AFTER(placed[1].offset)})
-    assert subscription.committed_cursor == AFTER(placed[1].offset)
+    manager.reposition_to_committed(RUN_ID, {1: AFTER(placed_offset(placed[1]))})
+    assert subscription.committed_cursor == AFTER(placed_offset(placed[1]))
 
     release_prepare.set()
     # Give the watcher every chance to append what it read from the old position.
@@ -1626,7 +1638,7 @@ async def test_a_wait_rebound_to_another_backend_is_nondeterminism(
     """
     key = StreamKey("ns", "wf", uuid.uuid4().hex, "tokens")
     recorded = await _one_record(backend, key)
-    manager._backends["other"] = MemoryStreamBackend()
+    manager._backends = {**manager._backends, "other": MemoryStreamBackend()}
 
     await manager.prepare_replay(
         RUN_ID,

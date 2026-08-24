@@ -114,9 +114,11 @@ class WakeRequest:
 
     @property
     def is_unparked(self) -> bool:
+        """Whether this wake requests a task outside a confirmed park."""
         return self.park_generation == UNPARKED_WAKE_GENERATION
 
     def __post_init__(self) -> None:
+        """Validate the identity required for server-side deduplication."""
         if self.is_unparked and not self.sender_identity:
             raise ValueError(
                 "an unparked wake needs a sender identity. Generation 0 carries "

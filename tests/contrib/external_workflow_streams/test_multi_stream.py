@@ -9,6 +9,7 @@ PYTEST_DONT_REWRITE: sandboxed fixture Workflows re-import this module, so pytes
 injected imports would make sandbox validation depend on pytest's import locks.
 """
 
+# pyright: reportMissingParameterType=false, reportUnusedVariable=false
 from __future__ import annotations
 
 import asyncio
@@ -50,7 +51,11 @@ with workflow.unsafe.imports_passed_through():
 RUN_ID = "run-1"
 
 
-async def _notify(run_id: str, wait_id: int, generation: int) -> str:
+async def _notify(
+    run_id: str,  # pyright: ignore[reportUnusedParameter]
+    wait_id: int,  # pyright: ignore[reportUnusedParameter]
+    generation: int,  # pyright: ignore[reportUnusedParameter]
+) -> str:
     return ReadinessResult.ACCEPTED
 
 
@@ -476,7 +481,7 @@ class FakeRuntime:
         wait_id: int,
         stream_key: StreamKey,
         backend_name: str,
-        idle_timeout: timedelta,
+        idle_timeout: timedelta,  # pyright: ignore[reportUnusedParameter]
     ):
         self.registrations.append((wait_id, stream_key, backend_name))
 
@@ -494,7 +499,11 @@ class FakeRuntime:
     def delivery_budget_remaining(self) -> int:
         return self.budget
 
-    def codec_for(self, value_type: type | None, wait_id: int):
+    def codec_for(
+        self,
+        value_type: type | None,
+        wait_id: int,  # pyright: ignore[reportUnusedParameter]
+    ):
         return StreamPayloadCodec(
             temporalio.converter.DataConverter.default, value_type
         )
@@ -635,7 +644,7 @@ async def test_merge_resumes_when_any_one_wait_is_resolved(
 
 @pytest.mark.asyncio
 async def test_merging_a_subscription_with_itself_is_refused(
-    fake_runtime: FakeRuntime,
+    fake_runtime: FakeRuntime,  # pyright: ignore[reportUnusedParameter]
 ) -> None:
     """It would deliver every record to that wait twice."""
     only = external_stream.topic("a", backend="tokens-redis", type=str).subscribe()
@@ -645,7 +654,9 @@ async def test_merging_a_subscription_with_itself_is_refused(
 
 
 @pytest.mark.asyncio
-async def test_merging_nothing_is_refused(fake_runtime: FakeRuntime) -> None:
+async def test_merging_nothing_is_refused(
+    fake_runtime: FakeRuntime,  # pyright: ignore[reportUnusedParameter]
+) -> None:
     with pytest.raises(ValueError, match="at least one"):
         await merge().__anext__()
 
@@ -890,7 +901,7 @@ async def test_closing_a_subscription_ends_its_wait_and_its_iteration(
 
 @pytest.mark.asyncio
 async def test_closing_a_subscription_tells_the_worker_to_stop_serving_it(
-    public_api_runtime: WorkflowStreamRuntime,
+    public_api_runtime: WorkflowStreamRuntime,  # pyright: ignore[reportUnusedParameter]
     manager: StubManager,
 ) -> None:
     """Ending the wait is what the Workflow sees; the Worker has to be told too.

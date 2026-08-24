@@ -185,6 +185,7 @@ class Continuation:
 
 
 def encode_continuation(continuation: Continuation) -> bytes:
+    """Encode continuation state deterministically at its selected schema version."""
     version = continuation.schema_version
     _validate_continuation_schema_version(version)
     out = bytearray()
@@ -212,6 +213,7 @@ def encode_continuation(continuation: Continuation) -> bytes:
 
 
 def decode_continuation(raw: bytes) -> Continuation:
+    """Decode and validate a supported continuation schema."""
     reader = _Reader(raw)
     version = reader.uvarint()
     if version not in _DECODABLE_SCHEMA_VERSIONS:
@@ -249,6 +251,7 @@ def decode_continuation(raw: bytes) -> Continuation:
 def write_continuation_header(
     continuation: Continuation,
 ) -> temporalio.api.common.v1.Payload:
+    """Wrap encoded continuation state in its reserved Payload envelope."""
     return temporalio.api.common.v1.Payload(
         metadata={"encoding": CONTINUATION_ENCODING},
         data=encode_continuation(continuation),

@@ -142,7 +142,8 @@ class RedisStreamBackend(StreamBackend):
         client: Any | None = None,
         key_prefix: str = DEFAULT_KEY_PREFIX,
     ) -> None:
-        """
+        """Create a Redis-backed external workflow stream provider.
+
         Args:
             url: Connection URL, used when ``client`` is not supplied.
             client: An existing ``redis.asyncio.Redis``. It **must** have been
@@ -193,6 +194,7 @@ class RedisStreamBackend(StreamBackend):
     # --- required operations ------------------------------------------------
 
     async def append(self, key: StreamKey, record: StreamRecord) -> StreamRecord:
+        """Append a record idempotently and return it with its Redis offset."""
         fields = record.to_fields()
         args: list[Any] = [
             str(record.idempotency_key).encode(),
@@ -213,7 +215,10 @@ class RedisStreamBackend(StreamBackend):
     async def read_range(
         self, key: StreamKey, first: Offset, last: Offset
     ) -> list[StreamRecord]:
-        entries = await self._client.xrange(
+        """Read the inclusive offset range used during replay."""
+        # redis-py's overload permits response modes that this client
+        # configuration cannot produce, so retain the runtime response shape.
+        entries: Any = await self._client.xrange(
             self.stream_key(key), first.serialize(), last.serialize()
         )
         return [_to_record(entry_id, fields) for entry_id, fields in entries]
@@ -226,6 +231,7 @@ class RedisStreamBackend(StreamBackend):
         max_records: int,
         block: timedelta | None = DEFAULT_WATCH_BLOCK,
     ) -> list[StreamRecord]:
+        """Read up to ``max_records`` strictly after a live cursor."""
         start = (
             _BEGINNING_SENTINEL if after.is_beginning else after.offset.serialize()  # type: ignore[union-attr]
         )
@@ -235,7 +241,7 @@ class RedisStreamBackend(StreamBackend):
             # zero timeout asks for, so a non-blocking read must omit BLOCK.
             block_ms = None
 
-        streams = await self._client.xread(
+        streams: Any = await self._client.xread(
             {self.stream_key(key): start}, count=max_records, block=block_ms
         )
         if not streams:
@@ -244,12 +250,14 @@ class RedisStreamBackend(StreamBackend):
         return [_to_record(entry_id, fields) for entry_id, fields in entries]
 
     def compare_offsets(self, left: Offset, right: Offset) -> int:
+        """Compare Redis stream IDs numerically rather than lexically."""
         a, b = _parse(left), _parse(right)
         return (a > b) - (a < b)
 
     # --- parking (P3b) ------------------------------------------------------
 
     async def install_park_intent(self, key: StreamKey, intent: ParkIntent) -> None:
+        """Persist the intent for one Workflow wait to remain parked."""
         await self._client.hset(
             self._intent_key(key, intent.wait_id),
             mapping={
@@ -260,6 +268,7 @@ class RedisStreamBackend(StreamBackend):
         )
 
     async def remove_park_intent(self, key: StreamKey, wait_id: int) -> None:
+        """Remove a wait's park intent and any associated producer claim."""
         await self._client.delete(
             self._intent_key(key, wait_id), self._claim_key(key, wait_id)
         )
@@ -272,6 +281,7 @@ class RedisStreamBackend(StreamBackend):
         run_id: str,
         park_generation: int,
     ) -> ParkIntentRemoval:
+        """Remove a park intent only when its Run and generation still match."""
         outcome = await self._remove_park_intent_if_matches_script(
             keys=[self._intent_key(key, wait_id), self._claim_key(key, wait_id)],
             args=[run_id, str(park_generation)],
@@ -279,6 +289,7 @@ class RedisStreamBackend(StreamBackend):
         return _REMOVAL_OUTCOMES[int(outcome)]
 
     async def park_intent(self, key: StreamKey, wait_id: int) -> ParkIntent | None:
+        """Return the currently installed park intent for one wait, if any."""
         stored = await self._client.hgetall(self._intent_key(key, wait_id))
         if not stored:
             return None
@@ -291,6 +302,7 @@ class RedisStreamBackend(StreamBackend):
         )
 
     async def recheck(self, key: StreamKey, wait_id: int) -> bool:
+        """Return whether a parked wait now has at least one available record."""
         intent = await self.park_intent(key, wait_id)
         if intent is None:
             return False
@@ -306,6 +318,7 @@ class RedisStreamBackend(StreamBackend):
         claimant: str,
         lease: timedelta,
     ) -> bool:
+        """Acquire or renew the leased producer claim for one park generation."""
         claim_key = self._claim_key(key, wait_id)
         value = f"{park_generation}|{claimant}".encode()
         lease_ms = max(1, int(lease.total_seconds() * 1000))
@@ -332,6 +345,7 @@ class RedisStreamBackend(StreamBackend):
         return False
 
     async def parked_wait_ids(self, key: StreamKey) -> list[int]:
+        """Return all wait IDs with installed park intents for a stream."""
         prefix = f"{self.stream_key(key)}:park:"
         found = []
         # SCAN rather than KEYS: this runs on the producer's hot path after every
@@ -349,12 +363,14 @@ class RedisStreamBackend(StreamBackend):
         return sorted(found)
 
     async def current_park_generation(self, key: StreamKey, wait_id: int) -> int | None:
+        """Return the currently parked generation for one wait, if any."""
         intent = await self.park_intent(key, wait_id)
         return None if intent is None else intent.park_generation
 
     # --- lifecycle ----------------------------------------------------------
 
     async def aclose(self) -> None:
+        """Close the underlying Redis client."""
         await self._client.aclose()
 
     async def delete_for_test(self, key: StreamKey, offset: Offset) -> None:

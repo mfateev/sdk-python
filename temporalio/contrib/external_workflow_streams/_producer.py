@@ -102,6 +102,7 @@ class WakeNotAcknowledgedError(Exception):
         restart: bool = False,
         cancelled: bool = False,
     ) -> None:
+        """Capture the wakes still owed after a durable append."""
         super().__init__(message)
         self.pending = pending
         """The wakes still owed, ready to be retried verbatim."""
@@ -189,6 +190,7 @@ class AppendNotAcknowledgedError(Exception):
         lease: timedelta,
         cancelled: bool = False,
     ) -> None:
+        """Capture an append whose durable outcome must be resolved."""
         super().__init__(message)
         self.stream_key = stream_key
         """The stream the append was for. Where it must be settled.
@@ -247,6 +249,7 @@ class PrecedingWriteFailedError(Exception):
     """
 
     def __init__(self, message: str, *, stream_key: StreamKey, sequence: int) -> None:
+        """Identify the earlier failed write that makes a fence unsafe."""
         super().__init__(message)
         self.stream_key = stream_key
         """The stream whose fence was refused."""
@@ -357,6 +360,7 @@ class WorkflowChainKey:
     first_execution_run_id: str
 
     def __post_init__(self) -> None:
+        """Require every component of the Workflow chain identity."""
         for field_name in ("namespace", "workflow_id", "first_execution_run_id"):
             if not getattr(self, field_name):
                 raise ValueError(
@@ -366,6 +370,7 @@ class WorkflowChainKey:
                 )
 
     def stream_key(self, stream_name: str) -> StreamKey:
+        """Return the durable key for one stream in this Workflow chain."""
         return StreamKey(
             namespace=self.namespace,
             workflow_id=self.workflow_id,
@@ -414,6 +419,7 @@ class ExternalStreamProducer:
         session_id: str,
         client: temporalio.client.Client | None = None,
     ) -> None:
+        """Bind a backend, converter, and producer session to one chain."""
         self._backend = backend
         self._workflow = workflow
         #: Bound to the Workflow these records are for, which is the same
@@ -514,10 +520,12 @@ class ExternalStreamProducer:
 
     @property
     def session_id(self) -> str:
+        """The idempotency session shared by this producer's appends."""
         return self._session_id
 
     @property
     def workflow(self) -> WorkflowChainKey:
+        """The Workflow chain receiving this producer's records."""
         return self._workflow
 
     def topic(
@@ -573,12 +581,14 @@ class ExternalStreamProducerTopic(Generic[AnyType]):
         stream_key: StreamKey,
         codec: StreamPayloadCodec[AnyType],
     ) -> None:
+        """Bind a typed codec and stream key to a producer."""
         self._producer = producer
         self._stream_key = stream_key
         self._codec = codec
 
     @property
     def stream_key(self) -> StreamKey:
+        """The durable identity of this producer topic."""
         return self._stream_key
 
     def _refuse_while_unresolved(self) -> None:

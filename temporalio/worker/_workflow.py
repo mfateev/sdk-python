@@ -909,7 +909,7 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
     async def _handle_external_stream_jobs(
         self,
         act: temporalio.bridge.proto.workflow_activation.WorkflowActivation,
-        workflow: _RunningWorkflow,
+        _workflow: _RunningWorkflow,
     ) -> (
         temporalio.bridge.proto.workflow_completion.WorkflowActivationCompletion | None
     ):

@@ -8,6 +8,7 @@ PYTEST_DONT_REWRITE: sandboxed fixture Workflows re-import this module, so pytes
 injected imports would make sandbox validation depend on pytest's import locks.
 """
 
+# pyright: reportMissingParameterType=false
 from __future__ import annotations
 
 import asyncio

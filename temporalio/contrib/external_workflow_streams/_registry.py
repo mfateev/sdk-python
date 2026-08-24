@@ -28,11 +28,13 @@ class ExternalStreamBackendRegistry(Mapping[str, StreamBackend]):
     """Named provider instances, validated at construction."""
 
     def __init__(self, backends: Mapping[str, StreamBackend]) -> None:
+        """Validate and copy the Worker's named backend mapping."""
         for name, backend in backends.items():
             _validate(name, backend)
         self._backends = dict(backends)
 
     def __getitem__(self, name: str) -> StreamBackend:
+        """Return a backend by Workflow-visible name."""
         try:
             return self._backends[name]
         except KeyError:
@@ -43,16 +45,19 @@ class ExternalStreamBackendRegistry(Mapping[str, StreamBackend]):
             ) from None
 
     def __iter__(self) -> Iterator[str]:
+        """Iterate registered backend names."""
         return iter(self._backends)
 
     def __len__(self) -> int:
+        """Return the number of registered backends."""
         return len(self._backends)
 
     def __repr__(self) -> str:
+        """Return a diagnostic representation containing backend names only."""
         return f"ExternalStreamBackendRegistry({sorted(self._backends)!r})"
 
 
-def _validate(name: str, backend: StreamBackend) -> None:
+def _validate(name: str, backend: object) -> None:
     if not name:
         raise ValueError("an external stream backend needs a non-empty name")
     if not isinstance(backend, StreamBackend):

@@ -361,12 +361,14 @@ class Subscription:
     """
 
     def __post_init__(self) -> None:
+        """Mark a new subscription as ready to accept buffered records."""
         self._has_room.set()
 
     # --- the Workflow thread's half (synchronous, never blocks) -------------
 
     @property
     def buffered(self) -> int:
+        """Return the number of records currently buffered for delivery."""
         with self._lock:
             return len(self._buffer)
 
@@ -561,19 +563,21 @@ class PreparedRecord(StreamRecord):
         is deliberately not part of the comparison for the same reason.
         """
         if isinstance(other, StreamRecord):
-            return self._fields() == PreparedRecord._fields(other)
+            return self._fields(self) == self._fields(other)
         return NotImplemented
 
     def __hash__(self) -> int:
-        return hash(self._fields())
+        """Hash the underlying record fields, excluding preparation state."""
+        return hash(self._fields(self))
 
-    def _fields(self) -> tuple[Any, ...]:
+    @staticmethod
+    def _fields(record: StreamRecord) -> tuple[Any, ...]:
         return (
-            self.kind,
-            self.payload,
-            self.producer_session_id,
-            self.sequence,
-            self.offset,
+            record.kind,
+            record.payload,
+            record.producer_session_id,
+            record.sequence,
+            record.offset,
         )
 
     @classmethod
@@ -583,6 +587,7 @@ class PreparedRecord(StreamRecord):
         prepared: Any,
         error: BaseException | None,
     ) -> PreparedRecord:
+        """Create a prepared view of ``record`` with its decode outcome."""
         out = cls(
             kind=record.kind,
             payload=record.payload,
@@ -707,6 +712,7 @@ class StreamSubscriptionManager:
         buffer_size: int = DEFAULT_BUFFER_SIZE,
         watch_block: timedelta = DEFAULT_WATCH_BLOCK,
     ) -> None:
+        """Create a manager for the external stream providers on one Worker."""
         self._backends = backends
         #: The Worker's own converter, used for the **asynchronous half** of
         #: decoding only -- retrieval and codec, never the payload converter,
@@ -1431,12 +1437,15 @@ class StreamSubscriptionManager:
         return lock
 
     def subscription(self, run_id: str, wait_id: int) -> Subscription | None:
+        """Return one registered subscription, if present."""
         return self._runs.get(run_id, {}).get(wait_id)
 
     def subscriptions(self, run_id: str) -> list[Subscription]:
+        """Return all subscriptions currently registered for a Run."""
         return list(self._runs.get(run_id, {}).values())
 
     def runs_with_subscriptions(self) -> list[str]:
+        """Return the Run IDs that currently own at least one subscription."""
         return [run_id for run_id, subs in self._runs.items() if subs]
 
     # --- the Workflow thread's entry points ---------------------------------

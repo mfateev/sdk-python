@@ -7,6 +7,7 @@ all -- and that is exactly the Run that most needs one, since its records are
 buffered in a process about to exit.
 """
 
+# pyright: reportMissingParameterType=false
 from __future__ import annotations
 
 import asyncio
@@ -21,13 +22,13 @@ from temporalio.contrib.external_workflow_streams._backend import (
     StreamKey,
 )
 from temporalio.contrib.external_workflow_streams._manager import (
-    BEGINNING,
     SHUTDOWN_WAKE_ATTEMPTS,
     ReadinessResult,
     RunStatus,
     StreamSubscriptionManager,
 )
 from temporalio.contrib.external_workflow_streams._record import (
+    BEGINNING,
     RecordKind,
     StreamRecord,
 )
@@ -67,7 +68,12 @@ class Harness:
             watch_block=timedelta(milliseconds=10),
         )
 
-    async def _notify(self, run_id: str, wait_id: int, generation: int) -> str:
+    async def _notify(
+        self,
+        run_id: str,  # pyright: ignore[reportUnusedParameter]
+        wait_id: int,  # pyright: ignore[reportUnusedParameter]
+        generation: int,  # pyright: ignore[reportUnusedParameter]
+    ) -> str:
         return self.readiness
 
     async def _probe(self, run_id: str) -> str:
@@ -312,7 +318,9 @@ async def test_a_probe_failure_does_not_stop_the_shutdown(
 ) -> None:
     """Shutdown is never blocked by a server that has stopped answering."""
 
-    async def failing_probe(run_id: str) -> str:
+    async def failing_probe(
+        run_id: str,  # pyright: ignore[reportUnusedParameter]
+    ) -> str:
         raise ConnectionError("service unavailable")
 
     manager = StreamSubscriptionManager(
@@ -346,7 +354,9 @@ async def test_shutdown_is_never_blocked_past_the_grace_period(
     process one.
     """
 
-    async def hanging_probe(run_id: str) -> str:
+    async def hanging_probe(
+        run_id: str,  # pyright: ignore[reportUnusedParameter]
+    ) -> str:
         await asyncio.sleep(60)
         return RunStatus.NO_OPEN_WORKFLOW_TASK
 
@@ -815,7 +825,10 @@ def failing_signals(monkeypatch):  # type: ignore[no-untyped-def]
         remaining = [failures]
 
         async def fake_send(
-            client, wake_request, *, producer_session_id: str = ""
+            client,  # pyright: ignore[reportUnusedParameter]
+            wake_request,
+            *,
+            producer_session_id: str = "",  # pyright: ignore[reportUnusedParameter]
         ) -> str:
             request_id = wake_request_id(wake_request)
             attempts.append(request_id)
@@ -899,7 +912,12 @@ def recorded_signals(monkeypatch) -> _RecordedSignals:  # type: ignore[no-untype
 
     requests = _RecordedSignals()
 
-    async def fake_send(client, wake_request, *, producer_session_id: str = "") -> str:
+    async def fake_send(
+        client,  # pyright: ignore[reportUnusedParameter]
+        wake_request,
+        *,
+        producer_session_id: str = "",  # pyright: ignore[reportUnusedParameter]
+    ) -> str:
         if requests.delay:
             await asyncio.sleep(requests.delay)
         requests.append(wake_request)
@@ -914,7 +932,7 @@ def _removals_failing_until(harness: Harness, resume: Callable[[], bool]) -> Non
     original = harness.backend.remove_park_intent_if_matches
 
     async def flaky_remove(
-        removed_key: StreamKey,
+        key: StreamKey,
         wait_id: int,
         *,
         run_id: str,
@@ -923,7 +941,7 @@ def _removals_failing_until(harness: Harness, resume: Callable[[], bool]) -> Non
         if not resume():
             raise ConnectionError("backend unavailable")
         return await original(
-            removed_key,
+            key,
             wait_id,
             run_id=run_id,
             park_generation=park_generation,

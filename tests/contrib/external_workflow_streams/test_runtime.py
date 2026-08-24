@@ -48,7 +48,11 @@ from tests.contrib.external_workflow_streams.memory_backend import MemoryStreamB
 RUN_ID = "run-1"
 
 
-async def _notify(run_id: str, wait_id: int, generation: int) -> str:
+async def _notify(
+    run_id: str,  # pyright: ignore[reportUnusedParameter]
+    wait_id: int,  # pyright: ignore[reportUnusedParameter]
+    generation: int,  # pyright: ignore[reportUnusedParameter]
+) -> str:
     return ReadinessResult.ACCEPTED
 
 
@@ -647,7 +651,11 @@ async def test_readiness_after_a_re_block_names_the_current_generation(
     reported: list[int] = []
     notified = asyncio.Event()
 
-    async def notify(run_id: str, wait_id: int, generation: int) -> str:
+    async def notify(
+        run_id: str,  # pyright: ignore[reportUnusedParameter]
+        wait_id: int,  # pyright: ignore[reportUnusedParameter]
+        generation: int,
+    ) -> str:
         reported.append(generation)
         notified.set()
         return ReadinessResult.ACCEPTED

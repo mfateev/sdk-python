@@ -22,7 +22,7 @@ import time
 import uuid
 from collections import Counter
 from datetime import timedelta
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -129,7 +129,10 @@ class NeverEmptyManager:
         pass
 
     def drain(
-        self, run_id: str, wait_id: int, max_records: int | None = None
+        self,
+        run_id: str,  # pyright: ignore[reportUnusedParameter]
+        wait_id: int,
+        max_records: int | None = None,
     ) -> list[StreamRecord]:
         self.max_records_seen.append(max_records)
         self.drained_waits.append(wait_id)
@@ -519,7 +522,10 @@ class OneBusyOneQuietManager:
         pass
 
     def drain(
-        self, run_id: str, wait_id: int, max_records: int | None = None
+        self,
+        run_id: str,  # pyright: ignore[reportUnusedParameter]
+        wait_id: int,
+        max_records: int | None = None,
     ) -> list[StreamRecord]:
         if max_records is not None and max_records <= 0:
             return []
@@ -925,8 +931,8 @@ async def test_a_record_arriving_after_the_last_drain_is_re_announced() -> None:
         assert subscription.current_wait_generation() == 2
 
         before = len(notifier.calls)
-        _WorkflowInstanceImpl._emit_external_stream_commands(  # type: ignore[arg-type]
-            _CompletionStub(runtime)
+        _WorkflowInstanceImpl._emit_external_stream_commands(
+            cast(Any, _CompletionStub(runtime))
         )
         await asyncio.sleep(0.2)
 
@@ -1099,7 +1105,10 @@ def test_a_wait_the_budget_stopped_is_not_immediately_parkable(
         def cancel_from_workflow_thread(self, run_id, wait_id):  # type: ignore[no-untyped-def]
             pass
 
-        def register(self, **kwargs: Any) -> None:
+        def register(
+            self,
+            **kwargs: Any,  # pyright: ignore[reportUnusedParameter]
+        ) -> None:
             pass
 
         def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]
@@ -1142,14 +1151,20 @@ class LateArrivalManager:
         self.record: StreamRecord | None = record
         self.calls = 0
 
-    def register(self, **kwargs: Any) -> None:
+    def register(
+        self,
+        **kwargs: Any,  # pyright: ignore[reportUnusedParameter]
+    ) -> None:
         pass
 
     def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]
         pass
 
     def drain(
-        self, run_id: str, wait_id: int, max_records: int | None = None
+        self,
+        run_id: str,  # pyright: ignore[reportUnusedParameter]
+        wait_id: int,  # pyright: ignore[reportUnusedParameter]
+        max_records: int | None = None,  # pyright: ignore[reportUnusedParameter]
     ) -> list[StreamRecord]:
         self.calls += 1
         if self.calls == 1 or self.record is None:
@@ -1209,7 +1224,10 @@ async def test_a_replay_segment_larger_than_the_budget_is_delivered_in_full(
         def cancel_from_workflow_thread(self, run_id, wait_id):  # type: ignore[no-untyped-def]
             pass
 
-        def register(self, **kwargs: Any) -> None:
+        def register(
+            self,
+            **kwargs: Any,  # pyright: ignore[reportUnusedParameter]
+        ) -> None:
             pass
 
         def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]
@@ -1274,7 +1292,10 @@ async def test_replay_delivers_in_full_even_when_the_live_budget_is_spent(
         def cancel_from_workflow_thread(self, run_id, wait_id):  # type: ignore[no-untyped-def]
             pass
 
-        def register(self, **kwargs: Any) -> None:
+        def register(
+            self,
+            **kwargs: Any,  # pyright: ignore[reportUnusedParameter]
+        ) -> None:
             pass
 
         def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]
@@ -1343,7 +1364,10 @@ def test_a_budget_stop_records_batch_limit(backend: MemoryStreamBackend) -> None
         def cancel_from_workflow_thread(self, run_id, wait_id):  # type: ignore[no-untyped-def]
             pass
 
-        def register(self, **kwargs: Any) -> None:
+        def register(
+            self,
+            **kwargs: Any,  # pyright: ignore[reportUnusedParameter]
+        ) -> None:
             pass
 
         def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]
@@ -1373,7 +1397,10 @@ def test_an_activation_that_ran_out_of_records_still_records_no_data(
         def cancel_from_workflow_thread(self, run_id, wait_id):  # type: ignore[no-untyped-def]
             pass
 
-        def register(self, **kwargs: Any) -> None:
+        def register(
+            self,
+            **kwargs: Any,  # pyright: ignore[reportUnusedParameter]
+        ) -> None:
             pass
 
         def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]

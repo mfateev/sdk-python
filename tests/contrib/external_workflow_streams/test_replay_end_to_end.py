@@ -10,6 +10,7 @@ PYTEST_DONT_REWRITE: sandboxed fixture Workflows re-import this module, so pytes
 injected imports would make sandbox validation depend on pytest's import locks.
 """
 
+# pyright: reportMissingParameterType=false
 from __future__ import annotations
 
 import asyncio
@@ -693,7 +694,7 @@ async def test_an_empty_stream_parked_and_evicted_replays_from_the_recorded_curs
     client: Client,
     backend: MemoryStreamBackend,
     monkeypatch: pytest.MonkeyPatch,
-    trace_readiness: None,
+    trace_readiness: None,  # pyright: ignore[reportUnusedParameter]
 ) -> None:
     """The empty boundary, carried across a park, an eviction, and two replays.
 

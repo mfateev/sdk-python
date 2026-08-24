@@ -26,10 +26,10 @@ Two rules here are easy to get subtly wrong:
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Mapping
+from typing import Any
 
 import temporalio.converter
 import temporalio.workflow
@@ -216,6 +216,7 @@ class WorkflowStreamRuntime:
         continuation: Continuation | None = None,
         continuation_schema_version: int = _DEFAULT_CONTINUATION_WRITE_SCHEMA_VERSION,
     ) -> None:
+        """Create the per-Run runtime and restore any continuation state."""
         _validate_continuation_schema_version(continuation_schema_version)
         if continuation is not None:
             _validate_continuation_schema_version(continuation.schema_version)
@@ -621,6 +622,7 @@ class WorkflowStreamRuntime:
     # --- the ExternalStreamRuntime protocol ---------------------------------
 
     def stream_key(self, stream_name: str) -> StreamKey:
+        """Build one stream's durable key in this Workflow chain."""
         return StreamKey(
             namespace=self._namespace,
             workflow_id=self._workflow_id,
@@ -984,6 +986,7 @@ class WorkflowStreamRuntime:
     def codec_for(
         self, value_type: type | None, wait_id: int
     ) -> StreamPayloadCodec[Any]:
+        """Return the wait's typed codec under its recorded serialization context."""
         # The recorded context wins wherever one was installed, so that both
         # halves of a replayed record's decoding see the same Workflow identity.
         # Everything else -- every live record, and every wait no marker bound --
@@ -997,9 +1000,11 @@ class WorkflowStreamRuntime:
         return asyncio.get_event_loop().create_future()
 
     def register_pending(self, wait_id: int, future: asyncio.Future[None]) -> None:
+        """Register the future readiness will resolve for one blocked wait."""
         self._pending[wait_id] = future
 
     def discard_pending(self, wait_id: int) -> None:
+        """Forget a wait that is no longer awaiting readiness."""
         self._pending.pop(wait_id, None)
 
     def resolve_all_pending(self) -> int:
@@ -1653,9 +1658,11 @@ class WorkflowStreamRuntime:
     # --- teardown -------------------------------------------------------------
 
     def subscriptions(self) -> list[int]:
+        """Return the registered wait IDs in deterministic order."""
         return sorted(self._subscriptions)
 
     def blocked_snapshot(self) -> dict[int, Cursor]:
+        """Return each registered wait's latest delivery boundary."""
         return {
             wait_id: state.delivery_cursor
             for wait_id, state in sorted(self._subscriptions.items())

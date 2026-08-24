@@ -247,6 +247,12 @@ async def close_worker(worker: Worker, task: asyncio.Task[Any]) -> None:
     await asyncio.gather(task, return_exceptions=True)
 
 
+def workflow_worker(worker: Worker) -> Any:
+    """The private workflow worker these white-box integration tests require."""
+    assert worker._workflow_worker is not None
+    return worker._workflow_worker
+
+
 # --- case 29: shutdown in the NoOpenWorkflowTask window -----------------------
 
 
@@ -319,7 +325,7 @@ async def test_shutdown_with_no_open_task_hands_the_run_to_another_worker(
             "leaves the Run in the no-open-task window never happened",
         )
 
-        manager = worker_a._workflow_worker._external_stream_manager
+        manager = workflow_worker(worker_a)._external_stream_manager
         assert manager is not None, "the manager should exist by now"
         real_probe, real_ready = manager._run_status, manager._notify_ready
         await wait_until(
@@ -454,7 +460,7 @@ class _InTheWindow:
         self.task = task
         self.handle = handle
         self.key = key
-        self.manager = worker._workflow_worker._external_stream_manager
+        self.manager = workflow_worker(worker)._external_stream_manager
         self.run_id = next(iter(self.manager._runs))
 
     async def close(self) -> None:
@@ -509,7 +515,7 @@ async def _leave_a_run_in_the_window(
         "the Run in the no-open-task window never happened",
     )
 
-    manager = worker._workflow_worker._external_stream_manager
+    manager = workflow_worker(worker)._external_stream_manager
     assert manager is not None, "the manager should exist by now"
     await wait_until(
         lambda: _run_is_registered(manager),
@@ -717,8 +723,8 @@ async def test_a_finalization_that_cannot_be_answered_writes_no_marker(
         # the snapshot the terminal would be built from. Once it has moved past
         # what the previous marker committed, the open task and its unwritten
         # annotation are both facts.
-        workflow_worker = worker_a._workflow_worker
-        manager = workflow_worker._external_stream_manager
+        workflow_worker_impl = workflow_worker(worker_a)
+        manager = workflow_worker_impl._external_stream_manager
         assert manager is not None, "the manager should exist by now"
         await wait_until(
             lambda: _run_is_registered(manager),
@@ -727,15 +733,15 @@ async def test_a_finalization_that_cannot_be_answered_writes_no_marker(
             "state for a finalization to be answered from",
         )
         run_id = next(iter(manager._runs))
-        assert _delivery_boundary(workflow_worker, run_id) is not None, (
+        assert _delivery_boundary(workflow_worker_impl, run_id) is not None, (
             "the manager registered a Run the Worker holds no stream runtime "
             "for, so the sabotage below would remove nothing"
         )
         for value in values[1:3]:
-            delivered = _delivery_boundary(workflow_worker, run_id)
+            delivered = _delivery_boundary(workflow_worker_impl, run_id)
             await publish(backend, key, [value], session=session)
             await wait_until(
-                lambda: _delivery_moved(workflow_worker, run_id, delivered),
+                lambda: _delivery_moved(workflow_worker_impl, run_id, delivered),
                 60,
                 f"{value!r} never reached the Workflow, so no Workflow Task is "
                 "open here with an unwritten annotation in it and the "
@@ -756,7 +762,7 @@ async def test_a_finalization_that_cannot_be_answered_writes_no_marker(
         )
 
         # The Run's entry disappears underneath the finalization, exactly once.
-        original = workflow_worker._handle_external_stream_jobs
+        original = workflow_worker_impl._handle_external_stream_jobs
         sabotaged: list[str] = []
 
         async def losing_the_run(act: Any, running: Any) -> Any:
@@ -764,11 +770,11 @@ async def test_a_finalization_that_cannot_be_answered_writes_no_marker(
                 j.HasField("finalize_external_streams") for j in act.jobs
             ):
                 sabotaged.append(act.run_id)
-                workflow_worker._external_stream_runtimes.pop(act.run_id, None)
+                workflow_worker_impl._external_stream_runtimes.pop(act.run_id, None)
                 await manager.evict_run(act.run_id)
             return await original(act, running)
 
-        workflow_worker._handle_external_stream_jobs = losing_the_run
+        workflow_worker_impl._handle_external_stream_jobs = losing_the_run
 
         # Shutdown is what makes Core ask for the terminal while the task is
         # still open. Not awaited: this Worker is deliberately being left unable
@@ -859,7 +865,11 @@ def _manager_for(backend: MemoryStreamBackend) -> StreamSubscriptionManager:
     the *backend* and outlives both.
     """
 
-    async def accepted(run_id: str, wait_id: int, generation: int) -> str:
+    async def accepted(
+        run_id: str,  # pyright: ignore[reportUnusedParameter]
+        wait_id: int,  # pyright: ignore[reportUnusedParameter]
+        generation: int,  # pyright: ignore[reportUnusedParameter]
+    ) -> str:
         return ReadinessResult.ACCEPTED
 
     return StreamSubscriptionManager(

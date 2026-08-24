@@ -88,7 +88,9 @@ async def test_status_for_an_unknown_run_returns_rather_than_raising(
         assert status is ExternalStreamRunStatus.RUN_NOT_FOUND
 
 
-async def test_both_calls_surface_their_full_result_enums(client: Client) -> None:
+async def test_both_calls_surface_their_full_result_enums(
+    client: Client,  # pyright: ignore[reportUnusedParameter]
+) -> None:
     """The five and four values reach Python as values, not strings.
 
     A watcher branches on all five, and a stringly-typed result would let a

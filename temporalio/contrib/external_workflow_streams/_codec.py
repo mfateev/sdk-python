@@ -188,7 +188,9 @@ class StreamPayloadCodec(Generic[AnyType]):
         what every ordinary activation payload's conversion already does on this
         same thread.
         """
-        type_hints = None if self.value_type is None else [self.value_type]
+        type_hints: list[type] | None = (
+            None if self.value_type is None else [self.value_type]
+        )
         values = self.data_converter.payload_converter.from_payloads(
             [prepared], type_hints
         )

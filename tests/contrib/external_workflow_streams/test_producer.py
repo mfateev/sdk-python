@@ -27,7 +27,12 @@ from temporalio.contrib.external_workflow_streams._producer import (
     WorkflowChainKey,
     _default_session_id,
 )
-from temporalio.contrib.external_workflow_streams._record import BEGINNING, RecordKind
+from temporalio.contrib.external_workflow_streams._record import (
+    BEGINNING,
+    Offset,
+    RecordKind,
+    StreamRecord,
+)
 from temporalio.testing import ActivityEnvironment
 from temporalio.worker import Worker
 from tests.contrib.external_workflow_streams.memory_backend import MemoryStreamBackend
@@ -238,6 +243,14 @@ def _offline_producer(backend: MemoryStreamBackend, session: str = "s"):  # type
     )
 
 
+def _placed_offsets(records: list[StreamRecord]) -> list[Offset]:
+    offsets: list[Offset] = []
+    for record in records:
+        assert record.offset is not None
+        offsets.append(record.offset)
+    return offsets
+
+
 async def test_records_are_appended_in_order(backend: MemoryStreamBackend) -> None:
     tokens = _offline_producer(backend).topic("tokens", type=str)
 
@@ -246,7 +259,7 @@ async def test_records_are_appended_in_order(backend: MemoryStreamBackend) -> No
 
     records = backend.all_records(StreamKey("ns", "wf", "run-1", "tokens"))
     assert [r.sequence for r in records] == [0, 1, 2]
-    assert backend.strictly_increasing([r.offset for r in records])  # type: ignore[arg-type]
+    assert backend.strictly_increasing(_placed_offsets(records))
 
 
 async def test_a_fence_takes_its_place_in_the_sequence(
@@ -534,7 +547,7 @@ async def test_a_fence_waits_for_a_publish_still_inside_its_codec(
         (0, RecordKind.DATA),
         (1, RecordKind.WRITE_FENCE),
     ], "backend order and invocation order disagree"
-    assert backend.strictly_increasing([r.offset for r in records])  # type: ignore[arg-type]
+    assert backend.strictly_increasing(_placed_offsets(records))
 
 
 async def test_two_handles_for_one_topic_share_the_fence_order(

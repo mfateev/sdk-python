@@ -251,6 +251,7 @@ class Run:
     """
 
     def __post_init__(self) -> None:
+        """Validate the run length and sparse control positions."""
         if self.count < 1:
             raise ValueError(f"a run covers at least one record, got {self.count}")
         if any(not 0 <= p < self.count for p in self.control_positions):
@@ -626,6 +627,7 @@ class AnnotationAccumulator:
         max_bytes: int = MAX_ANNOTATION_BYTES,
         high_water: float = ROLLOVER_HIGH_WATER,
     ) -> None:
+        """Start an accumulator with its immutable header and byte limits."""
         self._max_bytes = max_bytes
         self._high_water_bytes = int(max_bytes * high_water)
         self._emitted: list[bytes] = []
@@ -697,6 +699,7 @@ class AnnotationAccumulator:
 
     @property
     def terminated(self) -> bool:
+        """Whether a terminal frame has already been emitted."""
         return self._terminated
 
     def accumulated(self) -> bytes:

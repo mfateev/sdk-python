@@ -68,6 +68,7 @@ class ParkIntent:
     replaces its predecessor's for the same key rather than accumulating."""
 
     def __post_init__(self) -> None:
+        """Reject the generation reserved for unparked wakes."""
         if self.park_generation < 1:
             # 0 is the reserved unparked-wake sentinel, so a real park
             # generation can never take it.
@@ -92,6 +93,7 @@ class StreamKey:
     stream_name: str
 
     def __post_init__(self) -> None:
+        """Require every component of the durable stream identity."""
         for field_name in (
             "namespace",
             "workflow_id",
@@ -102,6 +104,7 @@ class StreamKey:
                 raise ValueError(f"a stream key needs a non-empty {field_name}")
 
     def __str__(self) -> str:
+        """Return a slash-delimited diagnostic representation."""
         return (
             f"{self.namespace}/{self.workflow_id}/"
             f"{self.first_execution_run_id}/{self.stream_name}"
@@ -118,6 +121,7 @@ class AppendConflictError(Exception):
     """
 
     def __init__(self, key: IdempotencyKey) -> None:
+        """Create a conflict for the key reused with different content."""
         super().__init__(
             f"idempotency key {key} was already used with different content; "
             "an append is idempotent on identity, not on the key alone"
@@ -388,6 +392,7 @@ class StreamBackend(abc.ABC):
                 cursor = AFTER(last)
 
     def is_before(self, left: Offset, right: Offset) -> bool:
+        """Whether ``left`` precedes ``right`` in this provider's order."""
         return self.compare_offsets(left, right) < 0
 
     def strictly_increasing(self, offsets: list[Offset]) -> bool:
