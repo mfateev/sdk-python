@@ -722,6 +722,14 @@ class StreamSubscriptionManager:
         #: sender distinct request IDs. Never reset: a repeat of any value this
         #: sender has already used is a wake the server deduplicates away.
         self._wake_sequence = 0
+        #: Runs for which a wake is in flight or acknowledged, mapped to the
+        #: latest activation sequence when its send began. Only a later
+        #: activation can have been caused by that wake, so completion of a task
+        #: already in flight cannot prematurely release the gate. Failed tasks
+        #: are evicted and replayed before a successful completion, so keeping
+        #: this across eviction coalesces reconstructed readiness too.
+        self._pending_wake_runs: dict[str, tuple[int, int]] = {}
+        self._activation_sequences: dict[str, int] = {}
         #: Wakes the shutdown sweep could not get acknowledged. Reported through
         #: `external_stream_shutdown_wake_failed`; kept here so a test can tell
         #: "no wake was needed" from "a wake was needed and lost".
@@ -1388,6 +1396,12 @@ class StreamSubscriptionManager:
             return
         if self._shutting_down:
             return
+        pending = self._pending_wake_runs.get(subscription.run_id)
+        if pending is not None and pending[1] == subscription.wait_id:
+            # The pending wake for this wait named the intent just retired, so
+            # Core discarded it. It cannot gate the unparked reannouncement
+            # whose purpose is to replace that silenced wake.
+            del self._pending_wake_runs[subscription.run_id]
         self._loop.create_task(self._report_ready(subscription))
 
     def _park_lock(self, run_id: str) -> asyncio.Lock:
@@ -1468,6 +1482,40 @@ class StreamSubscriptionManager:
             if subscription._cancelled or not subscription.buffered:
                 continue
             self._loop.create_task(self._report_ready(subscription))
+
+    def note_workflow_task_started(self, run_id: str) -> None:
+        """Records an activation boundary used to correlate an outstanding wake."""
+        self._activation_sequences[run_id] = (
+            self._activation_sequences.get(run_id, 0) + 1
+        )
+
+    def note_workflow_task_completed(self, run_id: str, *, terminal: bool) -> None:
+        """Releases a coalesced wake after Core accepts a successful completion.
+
+        Signal acknowledgement only says the wake entered History. The task it
+        creates can still fail or have its completion rejected; both paths are
+        replayed, and readiness reconstructed during that replay belongs behind
+        the same outstanding wake. The Worker's successful completion callback
+        is the first evidence that cycle is over.
+
+        A non-terminal task may leave another generation buffered. Re-report it
+        after releasing the gate because a report queued by
+        :meth:`rearm_ready` while completion was in flight was deliberately
+        coalesced. A terminal task has no next activation and must not re-arm.
+        """
+        pending = self._pending_wake_runs.get(run_id)
+        if pending is None:
+            return
+        wake_started_at, _ = pending
+        # A completion for an activation already running when the send began is
+        # not evidence that the wake was processed. This exact interleaving is
+        # common in the closing window: readiness sends while the old task is
+        # reporting, then that old completion wins the race to Core.
+        if self._activation_sequences.get(run_id, 0) <= wake_started_at:
+            return
+        del self._pending_wake_runs[run_id]
+        if not terminal:
+            self._rearm_ready(run_id)
 
     def reposition_to_committed(
         self, run_id: str, cursors: Mapping[int, Cursor]
@@ -1726,8 +1774,18 @@ class StreamSubscriptionManager:
             if result == ReadinessResult.ACCEPTED:
                 return
 
-        # Everything left means local readiness could not be delivered, so a
-        # Signal is owed. They differ in what happens to the watcher afterwards.
+        # Everything left means local readiness could not be delivered. One
+        # Signal is owed for the Run, but only one until Core accepts the
+        # successful Workflow Task completion it caused. A second wait or a
+        # replayed copy of this one can report during the closing/failing window;
+        # sending each report creates another Workflow Task that can collide
+        # with the same completion and sustain the replay loop.
+        if subscription.run_id in self._pending_wake_runs:
+            return
+        self._pending_wake_runs[subscription.run_id] = (
+            self._activation_sequences.get(subscription.run_id, 0),
+            subscription.wait_id,
+        )
         #
         # Counted once, and then retried inside `_send_owed_wake`, because a
         # single attempt here has nothing behind it. The watcher has already
@@ -1739,6 +1797,7 @@ class StreamSubscriptionManager:
         # attempt was a lost record.
         self._count_owed_wake(subscription)
         if not await self._send_owed_wake(subscription):
+            self._pending_wake_runs.pop(subscription.run_id, None)
             logger.warning(
                 "External stream wake for %s wait %s was not acknowledged; it "
                 "stays owed and the shutdown sweep is the only backstop left",

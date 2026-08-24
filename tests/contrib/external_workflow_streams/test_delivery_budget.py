@@ -1066,6 +1066,25 @@ def test_the_completion_rearms_even_when_it_emits_nothing_else() -> None:
     assert runtime.rearms == 1
 
 
+def test_a_terminal_completion_does_not_rearm_buffered_readiness() -> None:
+    """A Workflow that is ending needs no wake for records it leaves behind.
+
+    Re-arming after the terminal command has already been produced reports the
+    remaining buffer after Core closes the Workflow Task. ``NoOpenWorkflowTask``
+    then sends a fresh Signal into the execution's closing window, where it can
+    contend with the terminal report and force another replay of the same
+    completion. Complete, fail, cancel, and Continue-As-New all end this Run;
+    none can consume a later activation, so none has a liveness reason to wake.
+    """
+    runtime = _RecordingRuntime(exhausted=False)
+    stub = _CompletionStub(runtime)
+    stub._add_command().complete_workflow_execution.SetInParent()
+
+    _WorkflowInstanceImpl._emit_external_stream_commands(stub)  # type: ignore[arg-type]
+
+    assert runtime.rearms == 0
+
+
 def test_a_wait_the_budget_stopped_is_not_immediately_parkable(
     backend: MemoryStreamBackend,
 ) -> None:

@@ -86,6 +86,18 @@ logger = logging.getLogger(__name__)
 LOG_IGNORE_DURING_DELETE = False
 
 
+def _is_workflow_terminal_command(
+    command: temporalio.bridge.proto.workflow_commands.workflow_commands_pb2.WorkflowCommand,
+) -> bool:
+    """Whether a command ends the current Workflow Run."""
+    return (
+        command.HasField("complete_workflow_execution")
+        or command.HasField("continue_as_new_workflow_execution")
+        or command.HasField("fail_workflow_execution")
+        or command.HasField("cancel_workflow_execution")
+    )
+
+
 async def _shield_await(fut: asyncio.Future[Any]) -> Any:
     """Await a future without cancelling it if the awaiting task is cancelled.
 
@@ -648,17 +660,12 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
                 )
                 self._current_completion.failed.failure.application_failure_info.SetInParent()
 
-        def is_completion(
-            command: temporalio.bridge.proto.workflow_commands.workflow_commands_pb2.WorkflowCommand,
-        ):
-            return (
-                command.HasField("complete_workflow_execution")
-                or command.HasField("continue_as_new_workflow_execution")
-                or command.HasField("fail_workflow_execution")
-                or command.HasField("cancel_workflow_execution")
+        if any(
+            map(
+                _is_workflow_terminal_command,
+                self._current_completion.successful.commands,
             )
-
-        if any(map(is_completion, self._current_completion.successful.commands)):
+        ):
             self._warn_if_unfinished_handlers()
 
         return self._current_completion
@@ -2514,7 +2521,14 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         # here.
         self._refresh_external_stream_continuations()
 
-        # Records still buffered when an activation ends have no readiness
+        # Read before anything is added below, so "what the Workflow itself
+        # produced this activation" stays answerable. A terminal command also
+        # determines whether buffered readiness can ever be useful again.
+        commands = self._current_completion.successful.commands
+        produced_commands = len(commands) > 0
+        terminal = any(map(_is_workflow_terminal_command, commands))
+
+        # Records still buffered when a non-terminal activation ends have no readiness
         # notification coming: the watcher moved its prefetch cursor past them
         # when it buffered them, and it only reports again after a *new* non-empty
         # read. Re-reporting is what brings the next activation in, and it is the
@@ -2539,17 +2553,19 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         # answered `Accepted` or `Stale` and retried against the current
         # generation.
         #
+        # A terminal completion is the exception. This Run cannot consume a
+        # later activation, and re-arming after its terminal command reports the
+        # buffer into the Workflow's closing window. Core answers
+        # `NoOpenWorkflowTask`, which turns that report into a follow-up Signal
+        # that can race the terminal report and make the same task replay.
+        #
         # Before every early return below: the waits involved are marked blocked,
         # so they are in the quiescent snapshot, and a snapshot is what lets Core
         # start the idle timer and eventually park. Parking a Workflow Task whose
         # records are already in the local buffer would be wrong, and this is what
         # makes Core resolve instead of park.
-        runtime.rearm_readiness()
-
-        # Read before anything is added below, so "what the Workflow itself
-        # produced this activation" stays answerable.
-        commands = self._current_completion.successful.commands
-        produced_commands = len(commands) > 0
+        if not terminal:
+            runtime.rearm_readiness()
 
         # The snapshot goes out whether or not this completion retains the task.
         # A completion carrying a timer, activity, child workflow, or signal must

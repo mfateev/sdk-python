@@ -49,6 +49,7 @@ from ._workflow_instance import (
     WorkflowRunner,
     _WorkflowExternFunctions,
     _WorkflowLogicFlag,
+    _is_workflow_terminal_command,
 )
 
 logger = logging.getLogger(__name__)
@@ -422,6 +423,9 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             await self._handle_cache_eviction(act, cache_remove_job)
             return
 
+        if self._external_stream_manager is not None:
+            self._external_stream_manager.note_workflow_task_started(act.run_id)
+
         # Build default success completion (e.g. remove-job-only activations)
         completion = (
             temporalio.bridge.proto.workflow_completion.WorkflowActivationCompletion()
@@ -656,6 +660,24 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             logger.exception(
                 "Failed completing activation on workflow with run ID %s", act.run_id
             )
+        else:
+            # A wake accepted by the service stays outstanding until the task it
+            # caused completes successfully. Failed/rejected tasks replay, and
+            # readiness rebuilt during that replay must remain coalesced behind
+            # the original wake. Only Core accepting this completion proves the
+            # cycle ended and permits another buffered generation to wake.
+            if self._external_stream_manager is not None and completion.HasField(
+                "successful"
+            ):
+                self._external_stream_manager.note_workflow_task_completed(
+                    act.run_id,
+                    terminal=any(
+                        map(
+                            _is_workflow_terminal_command,
+                            completion.successful.commands,
+                        )
+                    ),
+                )
 
     async def _handle_cache_eviction(
         self,
@@ -1250,13 +1272,9 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
                     # give their unparked wakes the same request ID for the
                     # server to deduplicate -- losing the second Worker's wake.
                     sender_identity=self._stream_manager().wake_sender_identity,
-                    # Each owed wake is a separate ask, not a retry of the last
-                    # one: two records arriving in two different windows both
-                    # need a Workflow Task, and a shared request ID would let
-                    # the server deduplicate the second away. Drawn from the
-                    # manager's own sequence rather than from this
-                    # subscription's owed count, which restarts at zero every
-                    # time an evicted Run comes back.
+                    # Each wake cycle is a separate ask, not a retry of the last
+                    # completed one. The manager coalesces reports until Core
+                    # accepts that cycle's successful task completion.
                     wake_counter=subscription.wake_counter,
                 ),
             )

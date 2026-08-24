@@ -9,32 +9,34 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 import uuid
 from collections.abc import Sequence
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
 import temporalio.api.common.v1
 import temporalio.api.enums.v1
 import temporalio.converter
-
 from temporalio import workflow
 from temporalio.client import Client
 from temporalio.contrib.external_workflow_streams._backend import StreamKey
-from temporalio.contrib.external_workflow_streams._record import (
-    RecordKind,
-    StreamRecord,
-)
 from temporalio.contrib.external_workflow_streams._errors import (
     METRIC_DECODE,
     METRIC_INTEGRITY,
     METRIC_STORAGE,
 )
-from temporalio.contrib.external_workflow_streams._record import Offset
+from temporalio.contrib.external_workflow_streams._record import (
+    Offset,
+    RecordKind,
+    StreamRecord,
+)
 from temporalio.contrib.external_workflow_streams._wake import (
     WakeRequest,
     send_wake_signal,
+    wake_request_id,
 )
 from temporalio.runtime import MetricBuffer, Runtime, TelemetryConfig
 from temporalio.service import RPCError, RPCStatusCode
@@ -598,6 +600,262 @@ async def _wait_for_markers(
     raise AssertionError(message)
 
 
+class ReplayFailureTrace:
+    """Correlates the manager events that distinguish issues 2 and 7."""
+
+    def __init__(self) -> None:
+        self._started = time.monotonic()
+        self.events: list[dict[str, object]] = []
+        self.managers: list[object] = []
+
+    def record(self, event: str, **details: object) -> None:
+        entry: dict[str, object] = {
+            "at_seconds": round(time.monotonic() - self._started, 6),
+            "event": event,
+        }
+        entry.update(details)
+        self.events.append(entry)
+
+    def record_explicit_wake(self, request: WakeRequest) -> None:
+        self.record(
+            "explicit_wake",
+            request_id=wake_request_id(request),
+            workflow_id=request.workflow_id,
+            run_id=request.first_execution_run_id,
+            stream_name=request.stream_name,
+            wait_id=request.wait_id,
+            park_generation=request.park_generation,
+            sender_identity=request.sender_identity,
+            wake_counter=request.wake_counter,
+        )
+
+    def record_explicit_wake_acknowledged(self, request: WakeRequest) -> None:
+        self.record("explicit_wake_acknowledged", request_id=wake_request_id(request))
+
+    def manager_wake_bursts_after_explicit_ack(self) -> list[int]:
+        """Counts wakes between each Core-accepted task completion."""
+        acknowledged = next(
+            (
+                index
+                for index, event in enumerate(self.events)
+                if event["event"] == "explicit_wake_acknowledged"
+            ),
+            None,
+        )
+        if acknowledged is None:
+            raise AssertionError("the explicit wake was never acknowledged")
+        bursts: list[int] = []
+        current: set[object] = set()
+        for event in self.events[acknowledged + 1 :]:
+            if event["event"] == "manager_wake_started":
+                current.add(event["request_id"])
+            elif event["event"] == "workflow_task_completion_accepted":
+                bursts.append(len(current))
+                current = set()
+        bursts.append(len(current))
+        return bursts
+
+
+@pytest.fixture
+def replay_failure_trace(monkeypatch: pytest.MonkeyPatch) -> ReplayFailureTrace:
+    """Captures diagnostics without changing readiness or wake behavior."""
+    import temporalio.contrib.external_workflow_streams._wake as wake_module
+    from temporalio.contrib.external_workflow_streams._manager import (
+        StreamSubscriptionManager,
+    )
+
+    trace = ReplayFailureTrace()
+    original_init = StreamSubscriptionManager.__init__
+    original_notify = StreamSubscriptionManager._notify_ready_with_retries
+    original_evict = StreamSubscriptionManager.evict_run
+    original_started = StreamSubscriptionManager.note_workflow_task_started
+    original_completed = StreamSubscriptionManager.note_workflow_task_completed
+    original_send_wake = wake_module.send_wake_signal
+
+    def traced_init(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        original_init(self, *args, **kwargs)
+        trace.managers.append(self)
+        trace.record("manager_created", sender_identity=self.wake_sender_identity)
+
+    async def traced_notify(self, subscription):  # type: ignore[no-untyped-def]
+        generation = subscription.current_wait_generation()
+        result = await original_notify(self, subscription)
+        trace.record(
+            "readiness",
+            run_id=subscription.run_id,
+            wait_id=subscription.wait_id,
+            generation=generation,
+            result=result,
+            buffered=subscription.buffered,
+            wakes_owed=subscription.wakes_owed,
+        )
+        return result
+
+    async def traced_evict(self, run_id: str) -> None:  # type: ignore[no-untyped-def]
+        trace.record("evict_started", run_id=run_id)
+        await original_evict(self, run_id)
+        trace.record("evict_finished", run_id=run_id)
+
+    def traced_completed(self, run_id: str, *, terminal: bool) -> None:  # type: ignore[no-untyped-def]
+        trace.record(
+            "workflow_task_completion_accepted",
+            run_id=run_id,
+            terminal=terminal,
+        )
+        original_completed(self, run_id, terminal=terminal)
+
+    def traced_started(self, run_id: str) -> None:  # type: ignore[no-untyped-def]
+        trace.record("workflow_task_started", run_id=run_id)
+        original_started(self, run_id)
+
+    async def traced_send_wake(
+        client: Client,
+        request: WakeRequest,
+        *,
+        producer_session_id: str = "",
+    ) -> str:
+        request_id = wake_request_id(request)
+        trace.record(
+            "manager_wake_started",
+            request_id=request_id,
+            workflow_id=request.workflow_id,
+            run_id=request.first_execution_run_id,
+            stream_name=request.stream_name,
+            wait_id=request.wait_id,
+            park_generation=request.park_generation,
+            sender_identity=request.sender_identity,
+            wake_counter=request.wake_counter,
+        )
+        try:
+            result = await original_send_wake(
+                client, request, producer_session_id=producer_session_id
+            )
+        except BaseException as err:
+            trace.record(
+                "manager_wake_failed",
+                request_id=request_id,
+                error=repr(err),
+            )
+            raise
+        trace.record("manager_wake_acknowledged", request_id=request_id)
+        return result
+
+    monkeypatch.setattr(StreamSubscriptionManager, "__init__", traced_init)
+    monkeypatch.setattr(
+        StreamSubscriptionManager, "_notify_ready_with_retries", traced_notify
+    )
+    monkeypatch.setattr(StreamSubscriptionManager, "evict_run", traced_evict)
+    monkeypatch.setattr(
+        StreamSubscriptionManager,
+        "note_workflow_task_started",
+        traced_started,
+    )
+    monkeypatch.setattr(
+        StreamSubscriptionManager,
+        "note_workflow_task_completed",
+        traced_completed,
+    )
+    monkeypatch.setattr(wake_module, "send_wake_signal", traced_send_wake)
+    return trace
+
+
+async def _replay_failure_diagnosis(
+    handle,  # type: ignore[no-untyped-def]
+    backend: MemoryStreamBackend,
+    key: StreamKey,
+    trace: ReplayFailureTrace,
+    artifact_dir: Path,
+    phase: str,
+) -> str:
+    """Preserves the evidence a timeout cleanup used to destroy."""
+    lines = [f"diagnostic phase: {phase}"]
+    try:
+        history = await handle.fetch_history()
+        artifact = artifact_dir / f"{handle.id}-{phase}-history.json"
+        artifact.write_text(history.to_json())
+        lines.append(f"complete History: {artifact}")
+        workflow_task_timeline = []
+        for event in history.events:
+            attributes = event.WhichOneof("attributes") or "?"
+            if attributes.startswith("workflow_task_"):
+                item: dict[str, object] = {
+                    "event_id": event.event_id,
+                    "attributes": attributes,
+                }
+                if event.HasField("workflow_task_failed_event_attributes"):
+                    failed = event.workflow_task_failed_event_attributes
+                    item["cause"] = failed.cause
+                    item["message"] = failed.failure.message[:300]
+                workflow_task_timeline.append(item)
+        lines.append(f"Workflow Task timeline: {workflow_task_timeline}")
+    except Exception as err:  # noqa: BLE001 -- diagnostics must not mask timeout
+        lines.append(f"History unavailable: {err!r}")
+    try:
+        description = await handle.describe()
+        lines.append(f"workflow status: {description.status}")
+    except Exception as err:  # noqa: BLE001
+        lines.append(f"describe unavailable: {err!r}")
+    try:
+        lines.append(
+            "stream state: "
+            f"records={backend.all_records(key)} "
+            f"parked_wait_ids={await backend.parked_wait_ids(key)}"
+        )
+    except Exception as err:  # noqa: BLE001
+        lines.append(f"stream state unavailable: {err!r}")
+    for manager in trace.managers:
+        subscriptions = getattr(manager, "_runs", {})
+        for run_id, waits in subscriptions.items():
+            for wait_id, subscription in waits.items():
+                lines.append(
+                    f"subscription {run_id}/{wait_id}: "
+                    f"buffered={subscription.buffered} "
+                    f"committed={subscription.committed_cursor} "
+                    f"delivery={subscription.delivery_cursor} "
+                    f"prefetch={subscription.prefetch_cursor} "
+                    f"generation={subscription.current_wait_generation()} "
+                    f"wakes_owed={subscription.wakes_owed} "
+                    f"cancelled={subscription._cancelled} "
+                    f"watcher_done="
+                    f"{None if subscription._watcher is None else subscription._watcher.done()}"
+                )
+    lines.append(f"correlated manager trace: {trace.events}")
+    return "\n".join(lines)
+
+
+async def _await_replayed_result(
+    handle,  # type: ignore[no-untyped-def]
+    expected: list[str],
+    backend: MemoryStreamBackend,
+    key: StreamKey,
+    trace: ReplayFailureTrace,
+    artifact_dir: Path,
+) -> None:
+    """Waits for the result and retains both timeout and late-observation state."""
+    try:
+        result = await asyncio.wait_for(handle.result(), 30)
+    except asyncio.TimeoutError:
+        at_timeout = await _replay_failure_diagnosis(
+            handle, backend, key, trace, artifact_dir, "at-timeout"
+        )
+        try:
+            late_result = await asyncio.wait_for(handle.result(), 10)
+        except asyncio.TimeoutError:
+            after_observation = await _replay_failure_diagnosis(
+                handle, backend, key, trace, artifact_dir, "after-observation"
+            )
+            raise AssertionError(
+                "the replayed Run did not complete within 30 seconds and remained "
+                "non-terminal for the 10-second observation window\n\n"
+                f"{at_timeout}\n\n{after_observation}"
+            ) from None
+        raise AssertionError(
+            "the replayed Run missed the 30-second bound but completed during "
+            f"the observation window with {late_result!r}\n\n{at_timeout}"
+        ) from None
+    assert result == expected
+
+
 @workflow.defn
 class ParkedAcrossEvictionWorkflow:
     """Consumes records with nothing else to do, so every task ends in a park.
@@ -630,7 +888,10 @@ class FillerWorkflow:
 
 
 async def test_a_replayed_run_re_registers_its_wait_set(
-    client: Client, backend: MemoryStreamBackend
+    client: Client,
+    backend: MemoryStreamBackend,
+    replay_failure_trace: ReplayFailureTrace,
+    tmp_path: Path,
 ) -> None:
     """A Run that comes back through replay has to end replay registered.
 
@@ -650,11 +911,6 @@ async def test_a_replayed_run_re_registers_its_wait_set(
     Workflow Task with no activation in it, and the record sits in the stream
     while the Workflow waits.
     """
-    from temporalio.contrib.external_workflow_streams._wake import (
-        WakeRequest,
-        send_wake_signal,
-    )
-
     task_queue = f"tq-{uuid.uuid4()}"
     async with Worker(
         client,
@@ -704,22 +960,34 @@ async def test_a_replayed_run_re_registers_its_wait_set(
         # so if the replayed Run does not know its own subscription, the
         # Workflow Task it creates has nothing in it.
         await publish(backend, key, ["beta"])
-        await send_wake_signal(
-            client,
-            WakeRequest(
-                namespace=client.namespace,
-                workflow_id=handle.id,
-                first_execution_run_id=first_run_id,
-                stream_name="tokens",
-                wait_id=1,
-                park_generation=0,
-                sender_identity=f"test-{uuid.uuid4()}",
-                wake_counter=1,
-            ),
+        request = WakeRequest(
+            namespace=client.namespace,
+            workflow_id=handle.id,
+            first_execution_run_id=first_run_id,
+            stream_name="tokens",
+            wait_id=1,
+            park_generation=0,
+            sender_identity=f"test-{uuid.uuid4()}",
+            wake_counter=1,
         )
+        replay_failure_trace.record_explicit_wake(request)
+        await send_wake_signal(client, request)
+        replay_failure_trace.record_explicit_wake_acknowledged(request)
 
         try:
-            assert await asyncio.wait_for(handle.result(), 30) == ["alpha", "beta"]
+            await _await_replayed_result(
+                handle,
+                ["alpha", "beta"],
+                backend,
+                key,
+                replay_failure_trace,
+                tmp_path,
+            )
+            bursts = replay_failure_trace.manager_wake_bursts_after_explicit_ack()
+            assert max(bursts, default=0) <= 1, (
+                "readiness produced multiple wakes before Core accepted the "
+                f"task completion that one wake caused: {replay_failure_trace.events}"
+            )
         finally:
             try:
                 await handle.terminate()
@@ -1032,6 +1300,8 @@ async def test_a_slow_codec_decodes_off_the_workflow_thread(
 
 async def test_a_replayed_record_is_prepared_off_the_workflow_thread(
     env: WorkflowEnvironment,
+    replay_failure_trace: ReplayFailureTrace,
+    tmp_path: Path,
 ) -> None:
     """Replay delivers down the same drain, so it prepares the same way.
 
@@ -1091,24 +1361,33 @@ async def test_a_replayed_record_is_prepared_off_the_workflow_thread(
                 FillerWorkflow.run, id=f"filler-{uuid.uuid4()}", task_queue=task_queue
             )
             await publish(backend, key, ["beta"], session=f"producer-{uuid.uuid4()}")
-            await send_wake_signal(
-                client,
-                WakeRequest(
-                    namespace=client.namespace,
-                    workflow_id=handle.id,
-                    first_execution_run_id=first_run_id,
-                    stream_name="tokens",
-                    wait_id=1,
-                    park_generation=0,
-                    sender_identity=f"test-{uuid.uuid4()}",
-                    wake_counter=1,
-                ),
+            request = WakeRequest(
+                namespace=client.namespace,
+                workflow_id=handle.id,
+                first_execution_run_id=first_run_id,
+                stream_name="tokens",
+                wait_id=1,
+                park_generation=0,
+                sender_identity=f"test-{uuid.uuid4()}",
+                wake_counter=1,
             )
+            replay_failure_trace.record_explicit_wake(request)
+            await send_wake_signal(client, request)
+            replay_failure_trace.record_explicit_wake_acknowledged(request)
 
-            assert await asyncio.wait_for(handle.result(), 30) == [
-                _STREAM_SENTINEL.decode(),
-                "beta",
-            ]
+            await _await_replayed_result(
+                handle,
+                [_STREAM_SENTINEL.decode(), "beta"],
+                backend,
+                key,
+                replay_failure_trace,
+                tmp_path,
+            )
+            bursts = replay_failure_trace.manager_wake_bursts_after_explicit_ack()
+            assert max(bursts, default=0) <= 1, (
+                "replayed readiness produced multiple wakes before Core accepted "
+                f"the task completion one wake caused: {replay_failure_trace.events}"
+            )
         finally:
             if handle is not None:
                 try:

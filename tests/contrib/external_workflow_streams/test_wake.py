@@ -275,10 +275,39 @@ async def test_one_workers_retry_of_an_unparked_wake_keeps_its_request_id(
     await worker._send_external_stream_wake(subscription)
     await worker._send_external_stream_wake(subscription)
 
+    assert len(sent_request_ids) == 2
     assert sent_request_ids[0] == sent_request_ids[1], (
         "the retry derived a fresh request ID, so it would wake the Workflow a "
         "second time rather than deduplicate against the first attempt"
     )
+
+
+@pytest.mark.asyncio
+async def test_one_worker_retries_an_unacknowledged_wake_with_the_same_request_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed send remains retriable under the same request identity."""
+    import temporalio.contrib.external_workflow_streams._wake as wake_module
+
+    recorded: list[str] = []
+
+    async def fail_once(client, wake_request, *, producer_session_id: str = "") -> str:
+        request_id = wake_request_id(wake_request)
+        recorded.append(request_id)
+        if len(recorded) == 1:
+            raise ConnectionError("service unavailable")
+        return request_id
+
+    monkeypatch.setattr(wake_module, "send_wake_signal", fail_once)
+    worker = _worker_sending_wakes("one-shared-client")
+    subscription = _StubSubscription(wake_counter=1)
+
+    with pytest.raises(ConnectionError, match="service unavailable"):
+        await worker._send_external_stream_wake(subscription)
+    await worker._send_external_stream_wake(subscription)
+
+    assert len(recorded) == 2
+    assert recorded[0] == recorded[1]
 
 
 @pytest.mark.asyncio

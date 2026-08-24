@@ -2125,10 +2125,65 @@ async def test_a_failed_live_wake_is_retried_as_the_same_wake(
 
 
 @pytest.mark.asyncio
-async def test_a_run_that_comes_back_does_not_reuse_its_last_wake_counter(
+async def test_replayed_readiness_is_coalesced_until_the_task_completes(
     stream_key: StreamKey,
 ) -> None:
-    """An evicted Run's replacement subscription owes a *new* wake, not the old one.
+    """A failed Workflow Task must not recursively ask for another task.
+
+    Eviction discards the subscription and its speculative buffer. Replaying
+    the failed task rebuilds both, but the wake that caused it remains
+    outstanding because Core never accepted a successful completion. Once the
+    replayed task does complete, any buffer it leaves behind needs a fresh wake.
+    """
+    backend = MemoryStreamBackend()
+    notifier = RecordingNotifier(answer=ReadinessResult.NO_OPEN_WORKFLOW_TASK)
+    wake = CountingWake(failures=0)
+    manager = make_manager(backend, notifier, send_wake=wake)
+    try:
+        # The readiness races the completion of a task that was already open.
+        # That completion cannot have been caused by the wake and must not
+        # release its gate.
+        manager.note_workflow_task_started(RUN_ID)
+        manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+        await append(backend, stream_key, b"a")
+        await until(
+            lambda: len(wake.counters) >= 1,
+            "the original buffered readiness never owed a wake",
+        )
+        manager.note_workflow_task_completed(RUN_ID, terminal=False)
+
+        await manager.evict_run(RUN_ID)
+        manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+        await until(
+            lambda: len(notifier.calls) >= 2,
+            "replay never re-reported the reconstructed buffered readiness",
+        )
+
+        assert wake.counters == [1], (
+            "replay turned one outstanding wake into another, so each failed "
+            f"task can recursively create the next: {wake.counters}"
+        )
+
+        manager.note_workflow_task_started(RUN_ID)
+        manager.note_workflow_task_completed(RUN_ID, terminal=False)
+        await until(
+            lambda: len(wake.counters) >= 2,
+            "a buffer left after successful replay was never announced again",
+        )
+        assert wake.counters == [1, 2]
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_new_buffered_range_after_eviction_gets_a_new_wake_counter(
+    stream_key: StreamKey,
+) -> None:
+    """A later range is a new ask even when the Run was evicted between them.
 
     The unparked request ID is derived from the sender's identity and its
     counter, and the identity is fixed for the Worker's lifetime -- so the
@@ -2145,22 +2200,32 @@ async def test_a_run_that_comes_back_does_not_reuse_its_last_wake_counter(
     wake = CountingWake(failures=0)
     manager = make_manager(backend, notifier, send_wake=wake)
     try:
+        first = await backend.append(
+            stream_key, StreamRecord(RecordKind.DATA, b"a", "sa", 0)
+        )
         manager.register(
             run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
         )
-        await append(backend, stream_key, b"a")
         await until(
             lambda: len(wake.counters) >= 1,
             "the first incarnation never owed its wake, so there is nothing for "
             "the second one to collide with",
         )
+        manager.drain(RUN_ID, 1)
+        manager.note_workflow_task_started(RUN_ID)
+        manager.note_workflow_task_completed(RUN_ID, terminal=False)
 
-        # The Run is evicted and comes back: same Worker, same wait, a brand new
-        # `Subscription` -- and a record already waiting for it, exactly as after
-        # the replay this guards.
+        # The Run is evicted and comes back after the first range's boundary.
+        # This is not replay of the first readiness: the committed start cursor
+        # and the range waiting behind it are both new.
         await manager.evict_run(RUN_ID)
+        assert first.offset is not None
         manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+            run_id=RUN_ID,
+            wait_id=1,
+            stream_key=stream_key,
+            backend_name="tokens",
+            start_cursor=AFTER(first.offset),
         )
         await append(backend, stream_key, b"b")
         await until(
