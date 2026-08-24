@@ -676,6 +676,16 @@ class _CleanupWake:
 WakeTarget = Subscription | _CleanupWake
 
 
+@dataclass
+class _PendingWake:
+    """One Run-wide wake cycle, correlated to its current send attempt."""
+
+    wait_id: int
+    attempt_started_at: int
+    acknowledged: bool = False
+    completed_terminal: bool | None = None
+
+
 class StreamSubscriptionManager:
     """Every subscription on one Worker, keyed by Run.
 
@@ -728,7 +738,7 @@ class StreamSubscriptionManager:
         #: already in flight cannot prematurely release the gate. Failed tasks
         #: are evicted and replayed before a successful completion, so keeping
         #: this across eviction coalesces reconstructed readiness too.
-        self._pending_wake_runs: dict[str, tuple[int, int]] = {}
+        self._pending_wake_runs: dict[str, _PendingWake] = {}
         self._activation_sequences: dict[str, int] = {}
         #: Wakes the shutdown sweep could not get acknowledged. Reported through
         #: `external_stream_shutdown_wake_failed`; kept here so a test can tell
@@ -1397,7 +1407,7 @@ class StreamSubscriptionManager:
         if self._shutting_down:
             return
         pending = self._pending_wake_runs.get(subscription.run_id)
-        if pending is not None and pending[1] == subscription.wait_id:
+        if pending is not None and pending.wait_id == subscription.wait_id:
             # The pending wake for this wait named the intent just retired, so
             # Core discarded it. It cannot gate the unparked reannouncement
             # whose purpose is to replace that silenced wake.
@@ -1506,16 +1516,55 @@ class StreamSubscriptionManager:
         pending = self._pending_wake_runs.get(run_id)
         if pending is None:
             return
-        wake_started_at, _ = pending
         # A completion for an activation already running when the send began is
         # not evidence that the wake was processed. This exact interleaving is
         # common in the closing window: readiness sends while the old task is
         # reporting, then that old completion wins the race to Core.
-        if self._activation_sequences.get(run_id, 0) <= wake_started_at:
+        if self._activation_sequences.get(run_id, 0) <= pending.attempt_started_at:
+            return
+        if not pending.acknowledged:
+            # The service call is still in flight. Its response decides whether
+            # this completion can belong to the attempt: on failure the next
+            # retry resets both the activation boundary and this observation.
+            pending.completed_terminal = terminal
+            return
+        self._release_pending_wake(run_id, pending, terminal=terminal)
+
+    def _release_pending_wake(
+        self, run_id: str, pending: _PendingWake, *, terminal: bool
+    ) -> None:
+        """Ends ``pending`` if it is still this Run's current wake cycle."""
+        if self._pending_wake_runs.get(run_id) is not pending:
             return
         del self._pending_wake_runs[run_id]
         if not terminal:
             self._rearm_ready(run_id)
+
+    def _note_wake_attempt_started(self, target: WakeTarget) -> None:
+        """Moves a live wake's correlation boundary to this retry attempt."""
+        if not isinstance(target, Subscription):
+            return
+        pending = self._pending_wake_runs.get(target.run_id)
+        if pending is None or pending.wait_id != target.wait_id:
+            return
+        pending.attempt_started_at = self._activation_sequences.get(target.run_id, 0)
+        pending.acknowledged = False
+        pending.completed_terminal = None
+
+    def _note_wake_attempt_acknowledged(self, target: WakeTarget) -> None:
+        """Marks the current attempt delivered and applies any racing completion."""
+        if not isinstance(target, Subscription):
+            return
+        pending = self._pending_wake_runs.get(target.run_id)
+        if pending is None or pending.wait_id != target.wait_id:
+            return
+        pending.acknowledged = True
+        if pending.completed_terminal is not None:
+            self._release_pending_wake(
+                target.run_id,
+                pending,
+                terminal=pending.completed_terminal,
+            )
 
     def reposition_to_committed(
         self, run_id: str, cursors: Mapping[int, Cursor]
@@ -1782,9 +1831,9 @@ class StreamSubscriptionManager:
         # with the same completion and sustain the replay loop.
         if subscription.run_id in self._pending_wake_runs:
             return
-        self._pending_wake_runs[subscription.run_id] = (
-            self._activation_sequences.get(subscription.run_id, 0),
-            subscription.wait_id,
+        self._pending_wake_runs[subscription.run_id] = _PendingWake(
+            wait_id=subscription.wait_id,
+            attempt_started_at=self._activation_sequences.get(subscription.run_id, 0),
         )
         #
         # Counted once, and then retried inside `_send_owed_wake`, because a
@@ -2784,8 +2833,10 @@ class StreamSubscriptionManager:
         if self._send_wake is None:
             return False
         for attempt in range(SHUTDOWN_WAKE_ATTEMPTS):
+            self._note_wake_attempt_started(subscription)
             try:
                 await self._send_wake(subscription)
+                self._note_wake_attempt_acknowledged(subscription)
                 return True
             except asyncio.CancelledError:
                 raise

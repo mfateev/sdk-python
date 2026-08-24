@@ -2180,6 +2180,70 @@ async def test_replayed_readiness_is_coalesced_until_the_task_completes(
 
 
 @pytest.mark.asyncio
+async def test_a_failed_wake_attempt_cannot_claim_a_completion_for_its_retry(
+    stream_key: StreamKey,
+) -> None:
+    """Each retry correlates only with activations that begin during that attempt.
+
+    The first Signal attempt can lose a closing-window race while a different
+    Workflow Task completes. If the later successful retry inherited that
+    completion, the gate would open before the retry's Signal had produced its
+    own task and another buffered generation could send a competing wake.
+    """
+    backend = MemoryStreamBackend()
+    notifier = RecordingNotifier(answer=ReadinessResult.NO_OPEN_WORKFLOW_TASK)
+    started = [asyncio.Event() for _ in range(3)]
+    release = [asyncio.Event() for _ in range(3)]
+    finished = [asyncio.Event() for _ in range(3)]
+    counters: list[int] = []
+
+    async def raced_wake(subscription: Subscription) -> None:
+        attempt = len(counters)
+        counters.append(subscription.wake_counter)
+        started[attempt].set()
+        try:
+            await release[attempt].wait()
+            if attempt == 0:
+                raise ConnectionError("closing window")
+        finally:
+            finished[attempt].set()
+
+    manager = make_manager(backend, notifier, send_wake=raced_wake)
+    try:
+        manager.note_workflow_task_started(RUN_ID)
+        manager.register(
+            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
+        )
+        await append(backend, stream_key, b"a")
+        await asyncio.wait_for(started[0].wait(), 2)
+
+        # A different task starts and completes while attempt 1 is in flight.
+        manager.note_workflow_task_started(RUN_ID)
+        manager.note_workflow_task_completed(RUN_ID, terminal=False)
+        release[0].set()
+
+        await asyncio.wait_for(started[1].wait(), 2)
+        release[1].set()
+        await asyncio.wait_for(finished[1].wait(), 2)
+
+        # The successful retry has not caused an activation yet. Re-reporting
+        # the buffer must remain coalesced behind it.
+        manager.rearm_ready(RUN_ID)
+        await asyncio.sleep(0.05)
+        assert counters == [1, 1]
+
+        manager.note_workflow_task_started(RUN_ID)
+        manager.note_workflow_task_completed(RUN_ID, terminal=False)
+        await asyncio.wait_for(started[2].wait(), 2)
+        assert counters == [1, 1, 2]
+        release[2].set()
+    finally:
+        for event in release:
+            event.set()
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_a_new_buffered_range_after_eviction_gets_a_new_wake_counter(
     stream_key: StreamKey,
 ) -> None:
