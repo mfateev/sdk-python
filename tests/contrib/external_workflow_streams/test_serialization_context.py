@@ -19,6 +19,9 @@ sides being context-*free* is self-consistent and works; fixing only the
 consumer would break every deployment that works today, because the producer
 would encrypt with no context while the consumer decrypts with a
 Workflow-derived key. These tests therefore pin both sides to the same context.
+
+PYTEST_DONT_REWRITE: sandboxed fixture Workflows re-import this module, so pytest's
+injected imports would make sandbox validation depend on pytest's import locks.
 """
 
 from __future__ import annotations

@@ -1,4 +1,8 @@
-"""P6a/P6 — producer binding, and append plus write fence."""
+"""P6a/P6 — producer binding, and append plus write fence.
+
+PYTEST_DONT_REWRITE: sandboxed fixture Workflows re-import this module, so pytest's
+injected imports would make sandbox validation depend on pytest's import locks.
+"""
 
 from __future__ import annotations
 

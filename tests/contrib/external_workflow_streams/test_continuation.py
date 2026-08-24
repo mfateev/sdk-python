@@ -5,6 +5,9 @@ stopped. The position travels in a reserved internal header and is restored from
 History, because a cursor derived from mutable backend state would give replay
 whatever the stream holds *now* rather than what the Run started from -- and two
 replays of one history could then diverge (ADR-022).
+
+PYTEST_DONT_REWRITE: sandboxed fixture Workflows re-import this module, so pytest's
+injected imports would make sandbox validation depend on pytest's import locks.
 """
 
 from __future__ import annotations

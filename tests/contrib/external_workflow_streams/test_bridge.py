@@ -1,4 +1,8 @@
-"""P7 — the readiness call and the run-status probe, reachable from Python."""
+"""P7 — the readiness call and the run-status probe, reachable from Python.
+
+PYTEST_DONT_REWRITE: sandboxed fixture Workflows re-import this module, so pytest's
+injected imports would make sandbox validation depend on pytest's import locks.
+"""
 
 from __future__ import annotations
 

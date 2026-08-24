@@ -4,6 +4,9 @@ The idle timeout is a **Workflow-Task policy**, not a per-subscription one: it
 applies to the complete set the Workflow is blocked on, so one idle stream must
 not park the task while another is still delivering. Everything below is about
 that set behaving as a set.
+
+PYTEST_DONT_REWRITE: sandboxed fixture Workflows re-import this module, so pytest's
+injected imports would make sandbox validation depend on pytest's import locks.
 """
 
 from __future__ import annotations

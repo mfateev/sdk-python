@@ -5,6 +5,9 @@ not that a history a Worker actually produced can be fed back through it. These
 run a Workflow against a live server, fetch the history it wrote, and replay it
 with the real ``Replayer`` -- the same tool a user reaches for to check new code
 against old histories.
+
+PYTEST_DONT_REWRITE: sandboxed fixture Workflows re-import this module, so pytest's
+injected imports would make sandbox validation depend on pytest's import locks.
 """
 
 from __future__ import annotations

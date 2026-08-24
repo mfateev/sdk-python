@@ -3,6 +3,9 @@
 Everything below runs against a live server with a real Workflow Task loop. The
 unit tests elsewhere prove each piece in isolation; these prove the pieces are
 actually connected to each other, which is the only thing isolation cannot show.
+
+PYTEST_DONT_REWRITE: sandboxed fixture Workflows re-import this module, so pytest's
+injected imports would make sandbox validation depend on pytest's import locks.
 """
 
 from __future__ import annotations

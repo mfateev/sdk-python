@@ -16,6 +16,9 @@ Every test here stops short of the Workflow Task timeout on purpose. A retained
 task that reaches it is not merely a failed assertion: the server schedules a
 replacement, Core receives a Workflow Task for a run it still holds one for, and
 the resulting ``dbg_panic`` takes the whole workflow-processing thread with it.
+
+PYTEST_DONT_REWRITE: sandboxed fixture Workflows re-import this module, so pytest's
+injected imports would make sandbox validation depend on pytest's import locks.
 """
 
 from __future__ import annotations

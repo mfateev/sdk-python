@@ -4,6 +4,9 @@ The wakeup used whenever no open Workflow Task can accept local readiness. Two o
 its properties are the reason it does not reuse the public Signal API, and both
 are asserted here rather than assumed: the envelope bypasses the user's
 ``DataConverter``, and the request ID is a pure function of the wake's identity.
+
+PYTEST_DONT_REWRITE: sandboxed fixture Workflows re-import this module, so pytest's
+injected imports would make sandbox validation depend on pytest's import locks.
 """
 
 from __future__ import annotations
