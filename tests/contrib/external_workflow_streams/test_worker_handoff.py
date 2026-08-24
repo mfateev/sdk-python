@@ -66,7 +66,10 @@ retained past that does not park, it fails (`wft-lifecycle.md`).
 """
 
 
-@workflow.defn
+# These tests exercise cross-Worker handoff, not the sandbox. Keeping their
+# fixture Workflows unsandboxed avoids re-importing this pytest
+# assertion-rewritten module while each Worker validates its registrations.
+@workflow.defn(sandboxed=False)
 class TimerThenStreamWorkflow:
     """Consumes one record, takes a timer, then consumes the rest.
 
@@ -97,7 +100,7 @@ class TimerThenStreamWorkflow:
         return seen
 
 
-@workflow.defn
+@workflow.defn(sandboxed=False)
 class LeftWithNoOpenTaskWorkflow:
     """Blocks on the stream first, then starts a long timer. The order is the point.
 
