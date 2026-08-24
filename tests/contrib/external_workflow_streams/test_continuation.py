@@ -631,27 +631,29 @@ async def test_a_worker_without_backends_still_decodes_the_continuation(
     to turn an unsupported reserved header into an ordinary first execution just
     because this Worker has no backend mapping.
     """
-    worker = Worker(
+    async with Worker(
         client,
         task_queue=f"tq-{uuid.uuid4()}",
         workflows=[ChainedConsumerWorkflow],
-    )
-    assert worker._workflow_worker is not None
-    init = InitializeWorkflow(workflow_id="workflow", first_execution_run_id="first")
-    init.headers[CONTINUATION_HEADER].data = b"\x03"
-
-    with pytest.raises(AnnotationDecodeError, match="schema version 3"):
-        worker._workflow_worker._create_external_stream_runtime(
-            WorkflowActivation(run_id="run"), init
+    ) as worker:
+        assert worker._workflow_worker is not None
+        init = InitializeWorkflow(
+            workflow_id="workflow", first_execution_run_id="first"
         )
+        init.headers[CONTINUATION_HEADER].data = b"\x03"
 
-    init.headers[CONTINUATION_HEADER].CopyFrom(
-        write_continuation_header(Continuation({1: BEGINNING}, {1: "tokens"}))
-    )
-    with pytest.raises(RuntimeError, match="external_stream_backends"):
-        worker._workflow_worker._create_external_stream_runtime(
-            WorkflowActivation(run_id="run"), init
+        with pytest.raises(AnnotationDecodeError, match="schema version 3"):
+            worker._workflow_worker._create_external_stream_runtime(
+                WorkflowActivation(run_id="run"), init
+            )
+
+        init.headers[CONTINUATION_HEADER].CopyFrom(
+            write_continuation_header(Continuation({1: BEGINNING}, {1: "tokens"}))
         )
+        with pytest.raises(RuntimeError, match="external_stream_backends"):
+            worker._workflow_worker._create_external_stream_runtime(
+                WorkflowActivation(run_id="run"), init
+            )
 
 
 async def test_a_worker_that_selects_nothing_is_the_reader_stage(
@@ -669,21 +671,22 @@ async def test_a_worker_that_selects_nothing_is_the_reader_stage(
     stops deferring -- and it fails on the release that moves the stage, which
     is the release that must decide to.
     """
-    worker = Worker(
+    async with Worker(
         client,
         task_queue=f"tq-{uuid.uuid4()}",
         workflows=[ChainedConsumerWorkflow],
         external_stream_backends={"tokens-memory": backend},
-    )
+    ) as worker:
+        assert (
+            worker.config().get("external_stream_continuation_schema_version") is None
+        )
+        runtime = _runtime_from_a_real_worker(worker, monkeypatch)
 
-    assert worker.config().get("external_stream_continuation_schema_version") is None
-    runtime = _runtime_from_a_real_worker(worker, monkeypatch)
-
-    assert runtime.continuation().schema_version == 1
-    assert _DEFAULT_CONTINUATION_WRITE_SCHEMA_VERSION == 1, (
-        "moving the shipped stage is a deployment decision, so it must not ride "
-        "a release as a quiet constant edit"
-    )
+        assert runtime.continuation().schema_version == 1
+        assert _DEFAULT_CONTINUATION_WRITE_SCHEMA_VERSION == 1, (
+            "moving the shipped stage is a deployment decision, so it must not ride "
+            "a release as a quiet constant edit"
+        )
 
 
 @pytest.mark.parametrize("schema_version", (1, 2))
@@ -694,26 +697,25 @@ async def test_the_worker_threads_the_continuation_writer_version(
     schema_version: int,
 ) -> None:
     """A serialization-only switch would not make a live rollout possible."""
-    worker = Worker(
+    async with Worker(
         client,
         task_queue=f"tq-{uuid.uuid4()}",
         workflows=[ChainedConsumerWorkflow],
         external_stream_backends={"tokens-memory": backend},
         external_stream_continuation_schema_version=schema_version,
-    )
+    ) as worker:
+        assert (
+            worker.config().get("external_stream_continuation_schema_version")
+            == schema_version
+        )
+        assert worker._workflow_worker is not None
+        assert (
+            worker._workflow_worker._external_stream_continuation_schema_version
+            == schema_version
+        )
+        runtime = _runtime_from_a_real_worker(worker, monkeypatch)
 
-    assert (
-        worker.config().get("external_stream_continuation_schema_version")
-        == schema_version
-    )
-    assert worker._workflow_worker is not None
-    assert (
-        worker._workflow_worker._external_stream_continuation_schema_version
-        == schema_version
-    )
-    runtime = _runtime_from_a_real_worker(worker, monkeypatch)
-
-    assert runtime.continuation().schema_version == schema_version
+        assert runtime.continuation().schema_version == schema_version
 
 
 async def test_a_write_version_this_worker_cannot_read_fails_construction(

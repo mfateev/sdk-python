@@ -15,6 +15,7 @@ from datetime import timedelta
 
 import pytest
 
+import temporalio.api.enums.v1
 import temporalio.converter
 from temporalio import workflow
 from temporalio.client import Client
@@ -706,8 +707,8 @@ async def test_an_empty_stream_parked_and_evicted_replays_from_the_recorded_curs
        own cursor is the empty boundary, ``BEGINNING``.
     3. **Evict.** One cache slot, so the filler Workflow pushes the Run out; the
        manager's eviction of the Run is observed directly, and History is
-       checked for the Workflow Task failure that is the only other thing that
-       would rebuild the Run.
+       checked at that boundary before a later wake can legitimately race the
+       terminal command.
     4. **Replay.** The records are published while the Run is *gone*, so the
        cursor the resumed Run starts from cannot have come from anything still
        running on this Worker. It starts where the marker says -- ``BEGINNING``,
@@ -804,6 +805,19 @@ async def test_an_empty_stream_parked_and_evicted_replays_from_the_recorded_curs
             "the filler Workflow did not evict the Run: it is still cached, so "
             "what follows would be a live resume rather than a replay",
         )
+        history_at_eviction = await handle.fetch_history()
+        assert not [
+            event
+            for event in history_at_eviction.events
+            if event.HasField("workflow_task_failed_event_attributes")
+        ], (
+            "a Workflow Task failed before the explicit cache eviction completed, "
+            "so the next execution would not prove that eviction caused the replay"
+        )
+        assert STARTS.get(run_id) == [False], (
+            "the Workflow body restarted before the explicit cache eviction boundary; "
+            f"the next replay would be ambiguous: {STARTS.get(run_id)}"
+        )
 
         # --- 4: published while the Run is gone, then woken ----------------
         # Nothing on this Worker is watching for these: the Run is parked and
@@ -871,11 +885,17 @@ async def test_an_empty_stream_parked_and_evicted_replays_from_the_recorded_curs
         "the second execution of the Workflow body did not begin in replay, so "
         f"the Run came back some way other than by replaying its history: {starts}"
     )
-    assert not [
-        e for e in history.events if e.HasField("workflow_task_failed_event_attributes")
-    ], (
-        "a Workflow Task failed, which rebuilds the Run on its own -- the "
-        "second execution above is then not evidence of the eviction"
+    unexpected_wft_failures = [
+        event
+        for event in history.events
+        if event.HasField("workflow_task_failed_event_attributes")
+        and event.workflow_task_failed_event_attributes.cause
+        != temporalio.api.enums.v1.WorkflowTaskFailedCause.WORKFLOW_TASK_FAILED_CAUSE_UNHANDLED_COMMAND
+    ]
+    assert not unexpected_wft_failures, (
+        "the resumed Run had a Workflow Task failure other than the expected "
+        "external-wake/terminal-command race: "
+        f"{unexpected_wft_failures}"
     )
 
     # --- the recorded empty boundary -----------------------------------------
@@ -950,12 +970,13 @@ async def test_an_empty_stream_parked_and_evicted_replays_from_the_recorded_curs
     )
 
     runs = observations.executions(run_id)
-    assert len(runs) == 3, (
-        "expected the live Run and both replays to record what they observed, "
-        f"got {len(runs)}"
+    assert len(runs) >= 3, (
+        "expected at least the live Run and both explicit replays to record what "
+        f"they observed, got {len(runs)}"
     )
-    assert runs == [live, live, live], (
-        "a replay observed something other than the live Run did. Records were "
-        "appended after the Run finished and both replays could reach them "
+    assert all(run == live for run in runs), (
+        "a Workflow Task execution observed something other than the completed "
+        "Run did. An UnhandledCommand retry may add an execution, but records were "
+        "appended after the Run finished and every replay could reach them "
         f"through the same provider: {runs}"
     )

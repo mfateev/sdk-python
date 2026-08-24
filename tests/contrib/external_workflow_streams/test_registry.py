@@ -16,7 +16,10 @@ from temporalio.worker.workflow_sandbox._restrictions import SandboxRestrictions
 from tests.contrib.external_workflow_streams.memory_backend import MemoryStreamBackend
 
 
-@workflow.defn
+# These tests exercise Worker construction, not the sandbox. Keeping this
+# unsandboxed avoids re-importing this pytest assertion-rewritten module while
+# the constructor validates its registered workflows.
+@workflow.defn(sandboxed=False)
 class NoOpWorkflow:
     """Workers need at least one registered workflow to be constructible."""
 
@@ -112,15 +115,14 @@ def test_one_bad_backend_rejects_the_whole_registry() -> None:
 
 
 async def test_a_conforming_backend_registers_on_a_worker(client: Client) -> None:
-    worker = Worker(
+    async with Worker(
         client,
         task_queue=f"tq-{uuid.uuid4()}",
         workflows=[NoOpWorkflow],
         external_stream_backends={"tokens": MemoryStreamBackend()},
-    )
-
-    assert worker._external_stream_backends is not None
-    assert set(worker._external_stream_backends) == {"tokens"}
+    ) as worker:
+        assert worker._external_stream_backends is not None
+        assert set(worker._external_stream_backends) == {"tokens"}
 
 
 async def test_a_backend_without_the_guarantee_fails_worker_construction(
@@ -141,9 +143,10 @@ async def test_a_backend_without_the_guarantee_fails_worker_construction(
 
 
 async def test_no_backends_is_the_default(client: Client) -> None:
-    worker = Worker(client, task_queue=f"tq-{uuid.uuid4()}", workflows=[NoOpWorkflow])
-
-    assert worker._external_stream_backends is None
+    async with Worker(
+        client, task_queue=f"tq-{uuid.uuid4()}", workflows=[NoOpWorkflow]
+    ) as worker:
+        assert worker._external_stream_backends is None
 
 
 # --- the sandbox ------------------------------------------------------------
