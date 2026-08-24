@@ -27,13 +27,13 @@ from temporalio.contrib.external_workflow_streams._manager import (
     RunStatus,
     StreamSubscriptionManager,
 )
-from temporalio.contrib.external_workflow_streams._wake import (
-    WakeRequest,
-    wake_request_id,
-)
 from temporalio.contrib.external_workflow_streams._record import (
     RecordKind,
     StreamRecord,
+)
+from temporalio.contrib.external_workflow_streams._wake import (
+    WakeRequest,
+    wake_request_id,
 )
 from tests.contrib.external_workflow_streams.memory_backend import MemoryStreamBackend
 

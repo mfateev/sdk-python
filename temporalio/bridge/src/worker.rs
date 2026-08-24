@@ -698,11 +698,7 @@ impl WorkerRef {
         // async context, and `Handle::block_on` panics there.
         let handle = self.runtime.core.tokio_handle();
         let result = py.detach(move || {
-            handle.block_on(worker.notify_external_stream_ready(
-                &run_id,
-                wait_id,
-                wait_generation,
-            ))
+            handle.block_on(worker.notify_external_stream_ready(&run_id, wait_id, wait_generation))
         });
         Ok(match result {
             ExternalStreamReadyResult::Accepted => "Accepted",
@@ -720,15 +716,10 @@ impl WorkerRef {
     /// of a shutting-down worker.
     ///
     /// Returns one of `WftOpen`, `Parked`, `NoOpenWorkflowTask`, `RunNotFound`.
-    fn external_stream_run_status(
-        &self,
-        py: Python<'_>,
-        run_id: String,
-    ) -> PyResult<&'static str> {
+    fn external_stream_run_status(&self, py: Python<'_>, run_id: String) -> PyResult<&'static str> {
         let worker = self.worker.as_ref().unwrap().clone();
         let handle = self.runtime.core.tokio_handle();
-        let status =
-            py.detach(move || handle.block_on(worker.external_stream_run_status(&run_id)));
+        let status = py.detach(move || handle.block_on(worker.external_stream_run_status(&run_id)));
         Ok(match status {
             ExternalStreamRunStatus::WftOpen => "WftOpen",
             ExternalStreamRunStatus::Parked => "Parked",

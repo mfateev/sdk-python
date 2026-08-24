@@ -24,9 +24,8 @@ import temporalio.api.common.v1
 import temporalio.bridge
 import temporalio.converter
 from temporalio import workflow
-from temporalio.client import Client
-from temporalio.worker import Worker
 from temporalio.bridge.proto.external_stream.external_stream_pb2 import WakeSignal
+from temporalio.client import Client
 from temporalio.contrib.external_workflow_streams._backend import (
     AppendConflictError,
     ParkIntent,
@@ -46,15 +45,16 @@ from temporalio.contrib.external_workflow_streams._record import (
 )
 from temporalio.contrib.external_workflow_streams._wake import (
     UNPARKED_WAKE_GENERATION,
-    send_wake_signal,
     WAKE_SIGNAL_ENCODING,
     WAKE_SIGNAL_ENVELOPE_VERSION,
     WAKE_SIGNAL_MESSAGE_TYPE,
     WAKE_SIGNAL_NAME,
     WakeRequest,
     build_signal_request,
+    send_wake_signal,
     wake_request_id,
 )
+from temporalio.worker import Worker
 from tests.contrib.external_workflow_streams.memory_backend import MemoryStreamBackend
 
 CHAIN = WorkflowChainKey("ns", "wf-1", "first-run-1")

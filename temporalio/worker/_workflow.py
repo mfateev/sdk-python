@@ -47,9 +47,9 @@ from ._workflow_instance import (
     WorkflowInstance,
     WorkflowInstanceDetails,
     WorkflowRunner,
+    _is_workflow_terminal_command,
     _WorkflowExternFunctions,
     _WorkflowLogicFlag,
-    _is_workflow_terminal_command,
 )
 
 logger = logging.getLogger(__name__)

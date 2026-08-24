@@ -34,7 +34,6 @@ from temporalio.bridge.proto.external_stream.external_stream_pb2 import WakeSign
 
 if TYPE_CHECKING:
     import temporalio.client
-
     from temporalio.contrib.external_workflow_streams._producer import WorkflowChainKey
 
 __all__ = [
