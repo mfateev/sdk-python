@@ -240,6 +240,13 @@ async def wait_until(
     raise AssertionError(message)
 
 
+async def close_worker(worker: Worker, task: asyncio.Task[Any]) -> None:
+    """Request orderly shutdown and observe the Worker's terminal task state."""
+    if not task.done():
+        await asyncio.wait_for(worker.shutdown(), 60)
+    await asyncio.gather(task, return_exceptions=True)
+
+
 # --- case 29: shutdown in the NoOpenWorkflowTask window -----------------------
 
 
@@ -399,13 +406,12 @@ async def test_shutdown_with_no_open_task_hands_the_run_to_another_worker(
             "wake Signal, which is the one thing this case forbids"
         )
     finally:
-        if not worker_a_task.done():
-            worker_a_task.cancel()
         if handle is not None:
             try:
                 await handle.terminate()
             except Exception:
                 pass
+        await close_worker(worker_a, worker_a_task)
 
 
 async def _has_markers(handle: Any) -> bool:
@@ -452,12 +458,11 @@ class _InTheWindow:
         self.run_id = next(iter(self.manager._runs))
 
     async def close(self) -> None:
-        if not self.task.done():
-            self.task.cancel()
         try:
             await self.handle.terminate()
         except Exception:
             pass
+        await close_worker(self.worker, self.task)
 
 
 async def _leave_a_run_in_the_window(
@@ -835,9 +840,10 @@ async def test_a_finalization_that_cannot_be_answered_writes_no_marker(
             await asyncio.wait([shutdown_task], timeout=10)
             if not shutdown_task.done():
                 shutdown_task.cancel()
+            await asyncio.gather(shutdown_task, return_exceptions=True)
         if not worker_a_task.done():
             worker_a_task.cancel()
-        await asyncio.sleep(0)
+        await asyncio.gather(worker_a_task, return_exceptions=True)
 
 
 # --- the intent the Worker that installed it left behind -----------------------

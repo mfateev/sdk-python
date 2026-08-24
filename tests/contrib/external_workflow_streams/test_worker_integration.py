@@ -1138,6 +1138,7 @@ async def test_a_clean_shutdown_sweeps_and_tears_down_the_manager(
                 pass
         if not worker_task.done():
             worker_task.cancel()
+        await asyncio.gather(worker_task, return_exceptions=True)
 
 
 # --- P19 / ADR-011: decoding is Worker-side work, not Workflow-thread work ---
