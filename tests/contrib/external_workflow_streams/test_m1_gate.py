@@ -159,9 +159,9 @@ M1_COVERAGE: dict[int, str | tuple[str, ...]] = {
         "test_replay.py::test_a_failing_activation_reports_its_own_error_not_the_replays",
         "test_shutdown_sweep.py::test_a_wake_the_live_path_delivered_is_not_counted_as_abandoned",
     ),
-    # 70-71 are the two deterministic tests `empty-stream-replay-flake-handoff.md`
-    # asks for, written as far as the available harness allows; that document says
-    # which part of each is covered here and which stays end-to-end.
+    # 70-71 pin both halves of replay-to-live repositioning: a read already in
+    # flight cannot refill a retracted buffer, and replay delivers no record the
+    # marker omitted.
     70: "test_replay.py::test_a_read_in_flight_across_a_reposition_cannot_be_appended",
     71: "test_replay.py::test_a_replay_activation_never_delivers_a_record_the_marker_omits",
     # 72-76 are the fourth review's five findings. Four of them are the same shape

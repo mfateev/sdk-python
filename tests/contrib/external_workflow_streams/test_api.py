@@ -529,7 +529,7 @@ def test_the_handle_types_are_named_as_the_design_says() -> None:
 
 
 def test_the_package_still_exports_nothing() -> None:
-    """The public API lands with Milestone 1, not before (ADR-024)."""
+    """The public API is exported together with deterministic replay support."""
     import temporalio.contrib.external_workflow_streams as package
 
     assert package.__all__ == []
