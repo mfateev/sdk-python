@@ -46,6 +46,7 @@ from temporalio.contrib.external_workflow_streams._record import (
 __all__ = [
     "AppendConflictError",
     "ParkIntent",
+    "ParkIntentRemoval",
     "StreamBackend",
     "StreamKey",
 ]
@@ -400,7 +401,9 @@ class StreamBackend(abc.ABC):
         return all(self.compare_offsets(a, b) < 0 for a, b in zip(offsets, offsets[1:]))
 
 
-def _validate_backend(backend: object) -> StreamBackend:
+def _validate_backend(  # pyright: ignore[reportUnusedFunction]
+    backend: object,
+) -> StreamBackend:
     """Validate the backend before a Worker can consume through it."""
     if not isinstance(backend, StreamBackend):
         raise TypeError(

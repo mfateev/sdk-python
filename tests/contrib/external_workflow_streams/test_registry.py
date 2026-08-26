@@ -8,8 +8,20 @@ import pytest
 
 from temporalio import workflow
 from temporalio.client import Client
+from temporalio.contrib import external_workflow_streams
+from temporalio.contrib.external_workflow_streams import (
+    RedisStreamBackend,
+    StreamBackend,
+    external_stream,
+)
+from temporalio.contrib.external_workflow_streams._api import (
+    external_stream as private_external_stream,
+)
 from temporalio.contrib.external_workflow_streams._backend import (
     _validate_backend,
+)
+from temporalio.contrib.external_workflow_streams._redis import (
+    RedisStreamBackend as PrivateRedisStreamBackend,
 )
 from temporalio.worker import Worker
 from temporalio.worker.workflow_sandbox._restrictions import SandboxRestrictions
@@ -44,6 +56,51 @@ class AnonymousBackend(MemoryStreamBackend):
     """Conforming, but nameless in the annotation header."""
 
     provider_id = ""
+
+
+# --- public package ---------------------------------------------------------
+
+
+def test_supported_entry_points_are_public() -> None:
+    assert external_stream is private_external_stream
+    assert RedisStreamBackend is PrivateRedisStreamBackend
+    assert issubclass(RedisStreamBackend, StreamBackend)
+    assert set(external_workflow_streams.__all__) == {
+        "AFTER",
+        "BEGINNING",
+        "AppendConflictError",
+        "AppendNotAcknowledgedError",
+        "ChainKeyMismatchError",
+        "ConcurrentStreamConsumerError",
+        "Cursor",
+        "ExternalStreamCapacityError",
+        "ExternalStreamOptions",
+        "ExternalStreamProducer",
+        "ExternalStreamProducerTopic",
+        "ExternalStreamSubscription",
+        "ExternalStreamTopic",
+        "IdempotencyKey",
+        "Offset",
+        "OffsetComparator",
+        "ParkIntent",
+        "ParkIntentRemoval",
+        "PrecedingWriteFailedError",
+        "RecordKind",
+        "RedisStreamBackend",
+        "StreamBackend",
+        "StreamDecodeError",
+        "StreamError",
+        "StreamIntegrityError",
+        "StreamKey",
+        "StreamPayloadCodec",
+        "StreamRecord",
+        "StreamStorageError",
+        "WakeNotAcknowledgedError",
+        "WakeRequest",
+        "WorkflowChainKey",
+        "external_stream",
+        "merge",
+    }
 
 
 # --- backend validation -----------------------------------------------------

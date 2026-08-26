@@ -68,6 +68,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AppendNotAcknowledgedError",
+    "ChainKeyMismatchError",
     "ExternalStreamProducer",
     "ExternalStreamProducerTopic",
     "PrecedingWriteFailedError",
