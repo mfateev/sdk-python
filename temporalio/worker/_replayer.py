@@ -57,7 +57,7 @@ class Replayer:
         runtime: temporalio.runtime.Runtime | None = None,
         disable_safe_workflow_eviction: bool = False,
         header_codec_behavior: HeaderCodecBehavior = HeaderCodecBehavior.NO_CODEC,
-        external_stream_backends: Mapping[str, Any] | None = None,
+        external_stream_backend: Any | None = None,
     ) -> None:
         """Create a replayer to replay workflows from history.
 
@@ -72,7 +72,7 @@ class Replayer:
         Users are encouraged to provide their own if needing more control.
 
         A history containing external workflow stream markers can only be
-        replayed with the same backends registered, because replay re-reads the
+        replayed with the same backend configured, because replay re-reads the
         recorded ranges from the provider. Without them the replay fails the
         same way the original Workflow would have with no backends configured --
         which is correct, but is a configuration error rather than a finding
@@ -95,7 +95,7 @@ class Replayer:
             runtime=runtime,
             disable_safe_workflow_eviction=disable_safe_workflow_eviction,
             header_codec_behavior=header_codec_behavior,
-            external_stream_backends=external_stream_backends,
+            external_stream_backend=external_stream_backend,
         )
         self._initial_config = self._config.copy()
         self._default_workflow_logic_flags = set(_DEFAULT_ENABLED_WORKFLOW_LOGIC_FLAGS)
@@ -289,7 +289,7 @@ class Replayer:
                 ),
                 should_enforce_versioning_behavior=False,
                 assert_local_activity_valid=lambda a: None,
-                external_stream_backends=self._config.get("external_stream_backends"),
+                external_stream_backend=self._config.get("external_stream_backend"),
                 encode_headers=self._config.get(
                     "header_codec_behavior", HeaderCodecBehavior.NO_CODEC
                 )
@@ -444,7 +444,7 @@ class ReplayerConfig(TypedDict, total=False):
     runtime: temporalio.runtime.Runtime | None
     disable_safe_workflow_eviction: bool
     header_codec_behavior: HeaderCodecBehavior
-    external_stream_backends: Mapping[str, Any] | None
+    external_stream_backend: Any | None
 
 
 @dataclass(frozen=True)

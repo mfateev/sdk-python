@@ -96,7 +96,7 @@ class SteadyStreamWorkflow:
 
     @workflow.run
     async def run(self, expected: int) -> int:
-        tokens = external_stream.topic("tokens", backend="tokens-memory", type=str)
+        tokens = external_stream.topic("tokens", type=str)
         async for _ in tokens.subscribe():
             self._seen += 1
             if self._seen >= expected:
@@ -124,7 +124,7 @@ class SignalledStreamWorkflow:
 
     @workflow.run
     async def run(self) -> float:
-        tokens = external_stream.topic("tokens", backend="tokens-memory", type=str)
+        tokens = external_stream.topic("tokens", type=str)
         self._started = workflow.now().timestamp()
         subscription = tokens.subscribe()
 
@@ -161,7 +161,7 @@ class RolloverThenPauseWorkflow:
 
     @workflow.run
     async def run(self, before_pause: int) -> int:
-        tokens = external_stream.topic("tokens", backend="tokens-memory", type=str)
+        tokens = external_stream.topic("tokens", type=str)
         subscription = tokens.subscribe()
         iterator = subscription.__aiter__()
 
@@ -347,7 +347,7 @@ async def test_a_continuously_fed_stream_survives_a_rollover(
         client,
         task_queue=task_queue,
         workflows=[SteadyStreamWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         handle = await client.start_workflow(
             SteadyStreamWorkflow.run,
@@ -436,7 +436,7 @@ async def test_a_signal_into_a_retained_task_lands_by_the_rollover_deadline(
         client,
         task_queue=task_queue,
         workflows=[SignalledStreamWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         handle = await client.start_workflow(
             SignalledStreamWorkflow.run,
@@ -532,7 +532,7 @@ async def test_an_append_after_a_rollover_completion_wakes_the_subscription(
         client,
         task_queue=task_queue,
         workflows=[RolloverThenPauseWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         handle = await client.start_workflow(
             RolloverThenPauseWorkflow.run,

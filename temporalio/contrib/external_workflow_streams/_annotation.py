@@ -14,20 +14,15 @@ concatenation, so an annotation is a sequence of self-delimiting **frames**:
 
     header   := streams[]                    // wait_id -> binding
     bindings := streams[]                    // the same, for waits added later
-    binding  := (stream_key, start_cursor, backend_name
-               , provider_id, provider_format_version)
+    binding  := (stream_key, start_cursor, provider_id
+               , provider_format_version)
     segment  := run*, segment_end_reason
     run      := (wait_id, first_offset, last_offset, count, control_positions)
     terminal := blocked_snapshot[]           // wait_id -> BEGINNING | AFTER(offset)
 
-The provider identity is **per wait**, not per annotation. One topic per
-backend is what the API allows, so an annotation-wide provider label cannot say
-which of two registered backends owns a given wait -- and two instances of the
-same provider (two Redis clusters, two key prefixes) share a provider id, so the
-label does not even distinguish them. The binding therefore names the
-Worker-registered ``backend_name`` the Workflow itself chose, and carries the
-provider identity of that backend so replay can refuse to read through an
-implementation that is not the one that wrote the bytes.
+The provider identity is carried with each wait so every recorded cursor and
+range can be checked against the backend configured on the replaying Worker
+before that backend interprets it.
 
 A subscription may be created at **any** activation of a retained Workflow
 Task, which is later than the header frame that already went to Core. Core
@@ -88,25 +83,14 @@ __all__ = [
     "encoded_segment_size",
 ]
 
-SCHEMA_VERSION: Final = 2
+SCHEMA_VERSION: Final = 1
 """Leads the encoding, so a marker written by an older SDK stays readable.
 
 It is also the extension point that keeps ADR-003's accepted risk bounded: a
 per-record content-hash mode can be added later without a format break.
 
-Version 2 moved the provider identity from the header into each
-:class:`StreamBinding` and added the ``backend_name`` that selects the backend
-instance.
-
-The bindings frame added later is **not** a version bump, deliberately. It is
-purely additive: every annotation written before it decodes byte-identically,
-and the grammar is self-describing through its frame tags, so a decoder that
-does not know the tag fails loudly on it rather than misreading the bytes. A
-version exists to tell a reader what it is looking at, and here the tags already
-do -- nothing needs to assume that version 2 implies no bindings frame. No version-1 decoder is kept: the feature is private and unreleased,
-so no marker written by version 1 exists anywhere but in a test fixture. A
-version-1 annotation is rejected by :func:`decode_annotation` rather than
-silently read as though its single provider label applied to every wait.
+There are no legacy decoders. The feature is private and unreleased, so the
+format has one current schema and rejects everything else.
 """
 
 MAX_ANNOTATION_BYTES: Final = 64 * 1024
@@ -195,31 +179,16 @@ class StreamBinding:
     annotation with no segments at all -- a subscription to an empty stream --
     a complete replay instruction.
 
-    The last three fields are what let replay bind a wait to **one** backend.
-    They divide along who chose them, and that division is what decides how a
-    mismatch is reported:
-
-    - ``stream_key`` and ``backend_name`` are chosen by Workflow code, so a
-      mismatch is row four of the failure taxonomy -- nondeterminism, fixed by
-      versioning the Workflow.
-    - ``provider_id`` and ``provider_format_version`` are properties of whatever
-      the Worker registered under that name, so a mismatch is a deployment
-      problem: the Workflow is unchanged and the backend is undamaged.
+    ``stream_key`` is chosen by Workflow code, so a mismatch is nondeterminism.
+    ``provider_id`` and ``provider_format_version`` describe the backend
+    configured on the Worker, so a mismatch is a deployment problem: the
+    Workflow is unchanged and the store need not be damaged.
     """
 
     stream_key: StreamKey
     start_cursor: Cursor
-    backend_name: str
-    """The Worker-registered name the Workflow's ``topic(backend=...)`` named.
-
-    Recorded because a provider id cannot select an instance: two Redis
-    clusters, or two key prefixes on one cluster, are different stores that
-    declare the same provider. The name is part of the Workflow's own
-    definition, so it is stable across Workers of a deployment in the way a
-    Worker-local object identity never could be.
-    """
     provider_id: str
-    """The provider the named backend declared when this wait was recorded."""
+    """The configured backend's provider when this wait was recorded."""
     provider_format_version: int
     """That provider's on-the-wire format version when this wait was recorded.
 
@@ -411,13 +380,11 @@ class _Reader:
             wait_id = self.uvarint()
             stream_key = self.stream_key()
             start_cursor = self.cursor()
-            backend_name = self.string()
             provider_id = self.string()
             provider_format_version = self.uvarint()
             streams[wait_id] = StreamBinding(
                 stream_key,
                 start_cursor,
-                backend_name,
                 provider_id,
                 provider_format_version,
             )
@@ -434,7 +401,6 @@ def _put_bindings(out: bytearray, streams: Mapping[int, StreamBinding]) -> None:
         _put_uvarint(out, wait_id)
         _put_stream_key(out, binding.stream_key)
         _put_cursor(out, binding.start_cursor)
-        _put_str(out, binding.backend_name)
         _put_str(out, binding.provider_id)
         _put_uvarint(out, binding.provider_format_version)
 

@@ -1,4 +1,4 @@
-"""P17 — the Worker's named-backend registry and its one precondition."""
+"""P17 — validation of the Worker's stream backend."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ import pytest
 
 from temporalio import workflow
 from temporalio.client import Client
-from temporalio.contrib.external_workflow_streams._registry import (
-    ExternalStreamBackendRegistry,
+from temporalio.contrib.external_workflow_streams._backend import (
+    _validate_backend,
 )
 from temporalio.worker import Worker
 from temporalio.worker.workflow_sandbox._restrictions import SandboxRestrictions
@@ -46,20 +46,19 @@ class AnonymousBackend(MemoryStreamBackend):
     provider_id = ""
 
 
-# --- the registry itself ----------------------------------------------------
+# --- backend validation -----------------------------------------------------
 
 
-def test_a_conforming_backend_registers() -> None:
-    registry = ExternalStreamBackendRegistry({"tokens": MemoryStreamBackend()})
+def test_a_conforming_backend_is_accepted() -> None:
+    backend = MemoryStreamBackend()
 
-    assert set(registry) == {"tokens"}
-    assert isinstance(registry["tokens"], MemoryStreamBackend)
+    assert _validate_backend(backend) is backend
 
 
 @pytest.mark.parametrize(
     "backend_type", [UndeclaredBackend, DeniedBackend], ids=["undeclared", "denied"]
 )
-def test_a_backend_without_the_guarantee_is_rejected_by_name(
+def test_a_backend_without_the_guarantee_is_rejected(
     backend_type: type[MemoryStreamBackend],
 ) -> None:
     """One message for "forgot" and "cannot": both break the same thing.
@@ -69,46 +68,21 @@ def test_a_backend_without_the_guarantee_is_rejected_by_name(
     cannot promise it has not satisfied the contract, however it got there.
     """
     with pytest.raises(ValueError) as caught:
-        ExternalStreamBackendRegistry({"tokens": backend_type()})
+        _validate_backend(backend_type())
 
     message = str(caught.value)
     assert "guarantees_immutability" in message
     assert "cannot change" in message
-    assert "tokens" in message
 
 
 def test_a_backend_without_a_provider_id_is_rejected() -> None:
     with pytest.raises(ValueError, match="no provider_id"):
-        ExternalStreamBackendRegistry({"tokens": AnonymousBackend()})
+        _validate_backend(AnonymousBackend())
 
 
 def test_a_non_backend_is_rejected() -> None:
     with pytest.raises(TypeError, match="not a StreamBackend"):
-        ExternalStreamBackendRegistry({"tokens": object()})  # type: ignore[dict-item]
-
-
-def test_an_unnamed_backend_is_rejected() -> None:
-    with pytest.raises(ValueError, match="non-empty name"):
-        ExternalStreamBackendRegistry({"": MemoryStreamBackend()})
-
-
-def test_naming_an_unregistered_backend_lists_what_is_registered() -> None:
-    registry = ExternalStreamBackendRegistry(
-        {"tokens": MemoryStreamBackend(), "events": MemoryStreamBackend()}
-    )
-
-    with pytest.raises(KeyError) as caught:
-        registry["typo"]
-
-    assert "events, tokens" in str(caught.value)
-
-
-def test_one_bad_backend_rejects_the_whole_registry() -> None:
-    """Partial registration would leave a Worker in a state nobody asked for."""
-    with pytest.raises(ValueError):
-        ExternalStreamBackendRegistry(
-            {"good": MemoryStreamBackend(), "bad": DeniedBackend()}
-        )
+        _validate_backend(object())
 
 
 # --- through Worker construction --------------------------------------------
@@ -119,10 +93,9 @@ async def test_a_conforming_backend_registers_on_a_worker(client: Client) -> Non
         client,
         task_queue=f"tq-{uuid.uuid4()}",
         workflows=[NoOpWorkflow],
-        external_stream_backends={"tokens": MemoryStreamBackend()},
+        external_stream_backend=MemoryStreamBackend(),
     ) as worker:
-        assert worker._external_stream_backends is not None
-        assert set(worker._external_stream_backends) == {"tokens"}
+        assert isinstance(worker._external_stream_backend, MemoryStreamBackend)
 
 
 async def test_a_backend_without_the_guarantee_fails_worker_construction(
@@ -138,22 +111,22 @@ async def test_a_backend_without_the_guarantee_fails_worker_construction(
             client,
             task_queue=f"tq-{uuid.uuid4()}",
             workflows=[NoOpWorkflow],
-            external_stream_backends={"tokens": DeniedBackend()},
+            external_stream_backend=DeniedBackend(),
         )
 
 
-async def test_no_backends_is_the_default(client: Client) -> None:
+async def test_no_backend_is_the_default(client: Client) -> None:
     async with Worker(
         client, task_queue=f"tq-{uuid.uuid4()}", workflows=[NoOpWorkflow]
     ) as worker:
-        assert worker._external_stream_backends is None
+        assert worker._external_stream_backend is None
 
 
 # --- the sandbox ------------------------------------------------------------
 
 
 def test_the_sandbox_refuses_a_direct_provider_import() -> None:
-    """Workflow code names a backend; it never constructs one.
+    """Workflow code never constructs the configured backend.
 
     A provider reached from inside the sandbox would be a second, unregistered
     instance -- its own connection, no watcher owning it, and none of the
@@ -171,6 +144,6 @@ def test_the_sandbox_refuses_a_direct_provider_import() -> None:
     context = RestrictionContext()
     context.is_runtime = True
     assert streams.children["_redis"].match_access(context)
-    assert "name it from the Workflow instead" in (
+    assert "external_stream_backend=... instead" in (
         streams.children["_redis"].leaf_message or ""
     )

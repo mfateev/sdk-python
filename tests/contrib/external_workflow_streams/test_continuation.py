@@ -30,11 +30,9 @@ from temporalio.bridge.proto.workflow_activation import (
 from temporalio.client import Client, WorkflowHandle
 from temporalio.contrib.external_workflow_streams._annotation import (
     AnnotationDecodeError,
-    _Reader,
 )
 from temporalio.contrib.external_workflow_streams._backend import StreamKey
 from temporalio.contrib.external_workflow_streams._continuation import (
-    _DEFAULT_CONTINUATION_WRITE_SCHEMA_VERSION,
     CONTINUATION_HEADER,
     Continuation,
     decode_continuation,
@@ -70,16 +68,30 @@ async def _notify(
     return ReadinessResult.ACCEPTED
 
 
-def make_runtime(
-    manager,
-    backend,
-    continuation=None,
-    backends=None,
-    continuation_schema_version=1,
+def continuation(
+    cursors,
+    stream_names,
+    provider_ids=None,
+    provider_format_versions=None,
 ):  # type: ignore[no-untyped-def]
+    provider_ids = provider_ids or {
+        wait_id: MemoryStreamBackend.provider_id for wait_id in cursors
+    }
+    provider_format_versions = provider_format_versions or {
+        wait_id: MemoryStreamBackend.provider_format_version for wait_id in cursors
+    }
+    return Continuation(
+        cursors=cursors,
+        stream_names=stream_names,
+        provider_ids=provider_ids,
+        provider_format_versions=provider_format_versions,
+    )
+
+
+def make_runtime(manager, backend, continuation=None):  # type: ignore[no-untyped-def]
     return WorkflowStreamRuntime(
         manager=manager,
-        backends={"tokens": backend} if backends is None else backends,
+        backend=backend,
         run_id="run-2",
         namespace="ns",
         workflow_id="wf",
@@ -87,7 +99,6 @@ def make_runtime(
         data_converter=temporalio.converter.DataConverter.default,
         default_idle_timeout=timedelta(seconds=1),
         continuation=continuation,
-        continuation_schema_version=continuation_schema_version,
     )
 
 
@@ -128,7 +139,7 @@ class StubManager:
     def __init__(self) -> None:
         self.registered: list[tuple[int, object]] = []
 
-    def register(self, *, run_id, wait_id, stream_key, backend_name, start_cursor):  # type: ignore[no-untyped-def]
+    def register(self, *, run_id, wait_id, stream_key, start_cursor):  # type: ignore[no-untyped-def]
         self.registered.append((wait_id, start_cursor))
 
     def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]
@@ -145,10 +156,9 @@ def manager() -> StubManager:
 
 def test_a_continuation_round_trips() -> None:
     """Binding included: a cursor without one cannot be checked on restoration."""
-    original = Continuation(
+    original = continuation(
         cursors={1: AFTER(Offset("100-3")), 2: BEGINNING},
         stream_names={1: "tokens", 2: "tool-events"},
-        backend_names={1: "store-a", 2: "store-b"},
         provider_ids={1: "memory", 2: "redis"},
         provider_format_versions={1: 1, 2: 3},
     )
@@ -163,15 +173,15 @@ def test_the_encoding_is_stable_for_one_state() -> None:
     insertion order, say -- would hand the successor a different cursor on a
     Workflow Task the server retried.
     """
-    forwards = Continuation({1: BEGINNING, 2: BEGINNING}, {1: "a", 2: "b"})
-    backwards = Continuation({2: BEGINNING, 1: BEGINNING}, {2: "b", 1: "a"})
+    forwards = continuation({1: BEGINNING, 2: BEGINNING}, {1: "a", 2: "b"})
+    backwards = continuation({2: BEGINNING, 1: BEGINNING}, {2: "b", 1: "a"})
 
     assert encode_continuation(forwards) == encode_continuation(backwards)
 
 
 def test_a_newer_schema_version_is_reported_not_guessed_at() -> None:
     """Silently starting at BEGINNING would redeliver the whole stream."""
-    future = bytearray(encode_continuation(Continuation({1: BEGINNING}, {1: "a"})))
+    future = bytearray(encode_continuation(continuation({1: BEGINNING}, {1: "a"})))
     future[0] = 99
 
     with pytest.raises(AnnotationDecodeError, match="schema version 99"):
@@ -185,7 +195,7 @@ def test_the_header_bypasses_the_user_data_converter() -> None:
     would otherwise restart at an unreadable cursor -- silently, since an
     unreadable cursor looks exactly like no cursor at all.
     """
-    payload = write_continuation_header(Continuation({1: BEGINNING}, {1: "a"}))
+    payload = write_continuation_header(continuation({1: BEGINNING}, {1: "a"}))
 
     assert payload.metadata["encoding"] == b"binary/plain"
     assert decode_continuation(payload.data).cursors == {1: BEGINNING}
@@ -201,7 +211,7 @@ def test_no_header_is_a_first_execution_not_a_failure() -> None:
     assert read_continuation_header({}) is None
     assert (
         read_continuation_header(
-            {"other": write_continuation_header(Continuation({1: BEGINNING}, {1: "a"}))}
+            {"other": write_continuation_header(continuation({1: BEGINNING}, {1: "a"}))}
         )
         is None
     )
@@ -220,9 +230,7 @@ def test_a_first_execution_starts_at_the_beginning(
     """
     runtime = make_runtime(manager, backend)
 
-    runtime.register(
-        wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
-    )
+    runtime.register(wait_id=1, stream_key=runtime.stream_key("tokens"))
 
     assert runtime._subscriptions[1].start_cursor == BEGINNING
 
@@ -233,12 +241,10 @@ def test_a_successor_run_restores_its_predecessors_cursor(
     runtime = make_runtime(
         manager,
         backend,
-        Continuation({1: AFTER(Offset("100-3"))}, {1: "tokens"}),
+        continuation({1: AFTER(Offset("100-3"))}, {1: "tokens"}),
     )
 
-    runtime.register(
-        wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
-    )
+    runtime.register(wait_id=1, stream_key=runtime.stream_key("tokens"))
 
     assert runtime._subscriptions[1].start_cursor == AFTER(Offset("100-3"))
 
@@ -252,12 +258,10 @@ def test_restoration_reads_nothing_from_the_backend(
     replays of one history could restore different positions and diverge.
     """
     runtime = make_runtime(
-        manager, backend, Continuation({1: AFTER(Offset("100-3"))}, {1: "tokens"})
+        manager, backend, continuation({1: AFTER(Offset("100-3"))}, {1: "tokens"})
     )
 
-    runtime.register(
-        wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
-    )
+    runtime.register(wait_id=1, stream_key=runtime.stream_key("tokens"))
 
     assert backend.range_reads == [], "restoration must not read the stream"
 
@@ -274,15 +278,15 @@ def test_two_same_stream_subscriptions_restore_independently(
     runtime = make_runtime(
         manager,
         backend,
-        Continuation(
+        continuation(
             {1: AFTER(Offset("100-0")), 2: AFTER(Offset("500-0"))},
             {1: "tokens", 2: "tokens"},
         ),
     )
     key = runtime.stream_key("tokens")
 
-    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
-    runtime.register(wait_id=2, stream_key=key, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=key)
+    runtime.register(wait_id=2, stream_key=key)
 
     assert runtime._subscriptions[1].start_cursor == AFTER(Offset("100-0"))
     assert runtime._subscriptions[2].start_cursor == AFTER(Offset("500-0"))
@@ -293,12 +297,10 @@ def test_a_subscription_the_predecessor_lacked_starts_at_the_beginning(
 ) -> None:
     """Adding one on a path the chain has not reached yet is a supported change."""
     runtime = make_runtime(
-        manager, backend, Continuation({1: AFTER(Offset("100-0"))}, {1: "tokens"})
+        manager, backend, continuation({1: AFTER(Offset("100-0"))}, {1: "tokens"})
     )
 
-    runtime.register(
-        wait_id=2, stream_key=runtime.stream_key("later"), backend_name="tokens"
-    )
+    runtime.register(wait_id=2, stream_key=runtime.stream_key("later"))
 
     assert runtime._subscriptions[2].start_cursor == BEGINNING
 
@@ -314,48 +316,17 @@ def test_a_renumbered_subscription_is_caught_rather_than_resumed_wrong(
     predecessor committed, and it is the Workflow code that moved.
     """
     runtime = make_runtime(
-        manager, backend, Continuation({1: AFTER(Offset("100-0"))}, {1: "tokens"})
+        manager, backend, continuation({1: AFTER(Offset("100-0"))}, {1: "tokens"})
     )
 
     with pytest.raises(workflow.NondeterminismError, match="workflow.patched"):
         runtime.register(
             wait_id=1,
             stream_key=runtime.stream_key("tool-events"),
-            backend_name="tokens",
         )
 
 
-def test_a_changed_backend_is_caught_rather_than_resumed_wrong(
-    manager: StubManager, backend: MemoryStreamBackend
-) -> None:
-    """Two stores, one offset syntax: the new store accepts a foreign boundary.
-
-    The wait number and the stream name are both unchanged, so nothing before
-    this looks wrong -- and the records the new store holds below the restored
-    boundary would simply never be delivered. Nondeterminism rather than
-    integrity loss, for the same reason :meth:`_verify_binding` says so: the
-    backend a topic names is Workflow code.
-    """
-    other_store = MemoryStreamBackend()
-    runtime = make_runtime(
-        manager,
-        backend,
-        Continuation({1: AFTER(Offset("200-0"))}, {1: "tokens"}, {1: "old-store"}),
-        backends={"old-store": backend, "new-store": other_store},
-    )
-
-    with pytest.raises(workflow.NondeterminismError, match="workflow.patched"):
-        runtime.register(
-            wait_id=1,
-            stream_key=runtime.stream_key("tokens"),
-            backend_name="new-store",
-        )
-
-    assert manager.registered == [], "the cursor must not reach the manager"
-    assert other_store.range_reads == [], "the new store must not be read at all"
-
-
-def test_a_backend_name_pointing_at_another_provider_is_a_storage_failure(
+def test_a_different_configured_provider_is_a_storage_failure(
     manager: StubManager,
 ) -> None:
     """The Workflow is unchanged and neither store is damaged.
@@ -369,9 +340,8 @@ def test_a_backend_name_pointing_at_another_provider_is_a_storage_failure(
     runtime = make_runtime(
         manager,
         backend,
-        Continuation(
+        continuation(
             {1: AFTER(Offset("200-0"))},
-            {1: "tokens"},
             {1: "tokens"},
             {1: "memory"},
             {1: 1},
@@ -379,9 +349,7 @@ def test_a_backend_name_pointing_at_another_provider_is_a_storage_failure(
     )
 
     with pytest.raises(StreamStorageError, match="'other-memory'"):
-        runtime.register(
-            wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
-        )
+        runtime.register(wait_id=1, stream_key=runtime.stream_key("tokens"))
 
     assert manager.registered == []
     assert backend.range_reads == [], "raised before any backend read"
@@ -399,9 +367,8 @@ def test_a_newer_provider_format_version_is_a_storage_failure(
     runtime = make_runtime(
         manager,
         backend,
-        Continuation(
+        continuation(
             {1: AFTER(Offset("200-0"))},
-            {1: "tokens"},
             {1: "tokens"},
             {1: "memory"},
             {1: 1},
@@ -409,9 +376,7 @@ def test_a_newer_provider_format_version_is_a_storage_failure(
     )
 
     with pytest.raises(StreamStorageError, match="format version"):
-        runtime.register(
-            wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
-        )
+        runtime.register(wait_id=1, stream_key=runtime.stream_key("tokens"))
 
     assert manager.registered == []
     assert backend.range_reads == [], "raised before any backend read"
@@ -435,9 +400,8 @@ def test_a_recorded_format_version_of_zero_is_still_compared(
     runtime = make_runtime(
         manager,
         backend,
-        Continuation(
+        continuation(
             {1: AFTER(Offset("200-0"))},
-            {1: "tokens"},
             {1: "tokens"},
             {1: "memory"},
             {1: 0},
@@ -445,200 +409,15 @@ def test_a_recorded_format_version_of_zero_is_still_compared(
     )
 
     with pytest.raises(StreamStorageError, match="format version"):
-        runtime.register(
-            wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
-        )
+        runtime.register(wait_id=1, stream_key=runtime.stream_key("tokens"))
 
     assert manager.registered == [], "the cursor must not reach the manager"
     assert backend.range_reads == [], "raised before any backend read"
 
 
-def test_a_header_that_recorded_no_format_version_skips_the_check(
-    manager: StubManager, backend: MemoryStreamBackend
-) -> None:
-    """The other half of reading that map by membership.
-
-    A header written before the binding was carried has no entry at all, and
-    there is nothing to compare against; refusing it would strand every chain
-    that continued as new across the upgrade.
-    """
-    runtime = make_runtime(
-        manager,
-        backend,
-        Continuation({1: AFTER(Offset("200-0"))}, {1: "tokens"}),
-    )
-
-    runtime.register(
-        wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
-    )
-
-    assert runtime._subscriptions[1].start_cursor == AFTER(Offset("200-0"))
-
-
-# --- reading a header this Worker did not write -------------------------------
-
-
-#: One wait at ``AFTER("100-3")`` on stream ``tokens``, as a Worker that only
-#: knew schema version 1 wrote it. Written out rather than produced by this
-#: module's encoder, so a change to the encoder cannot quietly redefine what a
-#: history in flight is expected to contain.
-VERSION_1_HEADER = bytes([1, 1, 1, 0x01, 5]) + b"100-3" + bytes([6]) + b"tokens"
-
-
-def test_a_version_1_continuation_still_restores(
-    manager: StubManager, backend: MemoryStreamBackend
-) -> None:
-    """A chain that continued as new before the binding was carried.
-
-    Its successor's ``WorkflowExecutionStarted`` already holds those bytes, and
-    that Run has to start where its predecessor stopped rather than at
-    ``BEGINNING``. Nothing was recorded about the store, so the checks that need
-    one are skipped -- not failed against nothing -- and re-encoding reproduces
-    the bytes the header arrived as, since a header carrying only cursors has no
-    extension to append.
-    """
-    restored = decode_continuation(VERSION_1_HEADER)
-
-    assert restored.cursors == {1: AFTER(Offset("100-3"))}
-    assert restored.backend_names == {}
-    assert encode_continuation(restored) == VERSION_1_HEADER
-
-    runtime = make_runtime(manager, backend, restored)
-    runtime.register(
-        wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
-    )
-
-    assert runtime._subscriptions[1].start_cursor == AFTER(Offset("100-3"))
-
-
-def _restore_as_a_worker_without_the_binding(raw: bytes, subscribed_stream: str) -> Any:
-    """What a Worker deployed before the binding existed does with these bytes.
-
-    Written out rather than imported, because the behaviour under test is a
-    *shipped* one and is frozen. Both halves of it are: that decoder accepts
-    schema version 1 and nothing else, reads the count and exactly that many
-    entries, and returns without looking at what follows -- and its restoration
-    then compares the **stream name alone**, because a backend name is not
-    something it was ever given. Importing the current implementation would test
-    this Worker against itself, which is the one pair that is never mixed.
-
-    Returns the cursor that old Worker would hand its backend.
-    """
-    reader = _Reader(raw)
-    version = reader.uvarint()
-    if version != 1:
-        raise AnnotationDecodeError(
-            f"the Continue-As-New cursor header is schema version {version}, but "
-            "this Worker understands 1. The previous Run of this chain was "
-            "executed by a newer SDK."
-        )
-    cursors: dict[int, Any] = {}
-    stream_names: dict[int, str] = {}
-    for _ in range(reader.uvarint()):
-        wait_id = reader.uvarint()
-        cursors[wait_id] = reader.cursor()
-        stream_names[wait_id] = reader.string()
-    # The whole of the old restoration check.
-    if stream_names.get(1, "") not in ("", subscribed_stream):
-        raise AssertionError("this old Worker would have reported nondeterminism")
-    return cursors.get(1)
-
-
-#: What a Worker writes once its deployment has moved to the writer stage, which
-#: is the only stage that emits the binding. Not what a default Worker writes:
-#: the reader stage ships first and emits version 1, so "live" says nothing about
-#: which of the two a header came from and the stage has to be in the name.
-WRITER_STAGE_CONTINUATION = Continuation(
-    cursors={1: AFTER(Offset("100-3")), 2: BEGINNING},
-    stream_names={1: "tokens", 2: "tool-events"},
-    backend_names={1: "store-a", 2: "store-b"},
-    provider_ids={1: "memory", 2: "redis"},
-    provider_format_versions={1: 1, 2: 3},
-)
-
-
-def test_the_v2_reader_can_be_staged_while_the_writer_remains_v1(
-    manager: StubManager, backend: MemoryStreamBackend
-) -> None:
-    """The decoder has to reach the fleet before any Worker emits v2.
-
-    This is the production runtime path rather than a directly constructed
-    ``Continuation``: finding 10 was that the value exposed a schema field but
-    the runtime always took its v2 default, leaving no way to make a deployment
-    reader-only. The same module must read a v2 header while this runtime writes
-    a v1 header that the preceding Worker can still restore.
-    """
-    runtime = make_runtime(manager, backend)
-    runtime.register(
-        wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
-    )
-
-    live = runtime.continuation()
-    raw = encode_continuation(live)
-
-    assert live.schema_version == 1
-    assert raw[0] == 1
-    assert (
-        _restore_as_a_worker_without_the_binding(raw, subscribed_stream="tokens")
-        == BEGINNING
-    )
-    assert (
-        decode_continuation(encode_continuation(WRITER_STAGE_CONTINUATION))
-        == WRITER_STAGE_CONTINUATION
-    )
-
-
-def test_a_reader_stage_worker_does_not_downgrade_an_existing_v2_chain(
-    manager: StubManager, backend: MemoryStreamBackend
-) -> None:
-    """Once recorded, must-understand binding data cannot become optional.
-
-    A v1-pinned Worker may receive a v2 successor during rollback. Writing v1
-    from that Run would let a still-older Worker accept the following successor
-    without validating its backend, recreating the silent foreign-cursor restore
-    that v2 prevents.
-    """
-    runtime = make_runtime(
-        manager,
-        backend,
-        continuation=Continuation({}, {}, schema_version=2),
-        continuation_schema_version=1,
-    )
-
-    assert runtime.continuation().schema_version == 2
-
-
-def _runtime_from_a_real_worker(
-    worker: Worker, monkeypatch: pytest.MonkeyPatch
-) -> WorkflowStreamRuntime:
-    """The runtime a Worker builds for a Run, off the production path.
-
-    ``_create_external_stream_runtime`` is what an activation reaches, so it is
-    what has to be asked: finding 10 was that every path into it produced a
-    version 2 writer, which a test constructing ``Continuation`` directly cannot
-    see. Only the manager is stubbed, because nothing here talks to a backend.
-    """
-    assert worker._workflow_worker is not None
-    monkeypatch.setattr(
-        worker._workflow_worker, "_stream_manager", lambda: StubManager()
-    )
-    runtime = worker._workflow_worker._create_external_stream_runtime(
-        WorkflowActivation(run_id="run"),
-        InitializeWorkflow(workflow_id="workflow", first_execution_run_id="first"),
-    )
-    assert runtime is not None
-    return runtime
-
-
-async def test_a_worker_without_backends_still_decodes_the_continuation(
+async def test_a_worker_without_a_backend_still_decodes_the_continuation(
     client: Client,
 ) -> None:
-    """Recorded continuation state is handled before current configuration.
-
-    A successor whose new Workflow code makes no stream call cannot be allowed
-    to turn an unsupported reserved header into an ordinary first execution just
-    because this Worker has no backend mapping.
-    """
     async with Worker(
         client,
         task_queue=f"tq-{uuid.uuid4()}",
@@ -656,157 +435,12 @@ async def test_a_worker_without_backends_still_decodes_the_continuation(
             )
 
         init.headers[CONTINUATION_HEADER].CopyFrom(
-            write_continuation_header(Continuation({1: BEGINNING}, {1: "tokens"}))
+            write_continuation_header(continuation({1: BEGINNING}, {1: "tokens"}))
         )
-        with pytest.raises(RuntimeError, match="external_stream_backends"):
+        with pytest.raises(RuntimeError, match="external_stream_backend"):
             worker._workflow_worker._create_external_stream_runtime(
                 WorkflowActivation(run_id="run"), init
             )
-
-
-async def test_a_worker_that_selects_nothing_is_the_reader_stage(
-    client: Client,
-    backend: MemoryStreamBackend,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The stage a release ships in is the stage its default deploys.
-
-    Pinned through the Worker rather than by reading the constant, because the
-    constant is only the answer if every layer between it and a live
-    Continue-As-New defers to it. Finding 10 was exactly a default that no
-    configuration could reach; a literal repeated down that path would let the
-    constant move while the default stayed put, so this fails if any layer
-    stops deferring -- and it fails on the release that moves the stage, which
-    is the release that must decide to.
-    """
-    async with Worker(
-        client,
-        task_queue=f"tq-{uuid.uuid4()}",
-        workflows=[ChainedConsumerWorkflow],
-        external_stream_backends={"tokens-memory": backend},
-    ) as worker:
-        assert (
-            worker.config().get("external_stream_continuation_schema_version") is None
-        )
-        runtime = _runtime_from_a_real_worker(worker, monkeypatch)
-
-        assert runtime.continuation().schema_version == 1
-        assert _DEFAULT_CONTINUATION_WRITE_SCHEMA_VERSION == 1, (
-            "moving the shipped stage is a deployment decision, so it must not ride "
-            "a release as a quiet constant edit"
-        )
-
-
-@pytest.mark.parametrize("schema_version", (1, 2))
-async def test_the_worker_threads_the_continuation_writer_version(
-    client: Client,
-    backend: MemoryStreamBackend,
-    monkeypatch: pytest.MonkeyPatch,
-    schema_version: int,
-) -> None:
-    """A serialization-only switch would not make a live rollout possible."""
-    async with Worker(
-        client,
-        task_queue=f"tq-{uuid.uuid4()}",
-        workflows=[ChainedConsumerWorkflow],
-        external_stream_backends={"tokens-memory": backend},
-        external_stream_continuation_schema_version=schema_version,
-    ) as worker:
-        assert (
-            worker.config().get("external_stream_continuation_schema_version")
-            == schema_version
-        )
-        assert worker._workflow_worker is not None
-        assert (
-            worker._workflow_worker._external_stream_continuation_schema_version
-            == schema_version
-        )
-        runtime = _runtime_from_a_real_worker(worker, monkeypatch)
-
-        assert runtime.continuation().schema_version == schema_version
-
-
-async def test_a_write_version_this_worker_cannot_read_fails_construction(
-    client: Client, backend: MemoryStreamBackend
-) -> None:
-    """A Worker that writes what it cannot read is caught before it polls.
-
-    The same reason the backend registry is validated in the constructor: the
-    alternative is failing the first Continue-As-New of a Run that has already
-    consumed records against that setting.
-    """
-    with pytest.raises(ValueError, match="must be one of 1, 2"):
-        Worker(
-            client,
-            task_queue=f"tq-{uuid.uuid4()}",
-            workflows=[ChainedConsumerWorkflow],
-            external_stream_backends={"tokens-memory": backend},
-            external_stream_continuation_schema_version=3,
-        )
-
-
-def test_a_writer_stage_header_is_refused_by_a_worker_without_the_binding() -> None:
-    """The binding is must-understand data, so refusal is the required outcome.
-
-    A Worker that cannot validate the binding must not start the successor Run,
-    and the version number is the only thing that can make it one: no
-    arrangement of bytes makes deployed code perform a check it has no code for.
-    An envelope such a Worker *can* parse — the binding appended behind the
-    entries it reads, say — is one it restores with the check skipped, and this
-    test shows what that costs. The old restoration compares the stream name and
-    nothing else, so a fleet where `tokens` resolves to another store on the old
-    build hands it a cursor produced somewhere else, and every record below that
-    boundary is skipped in silence.
-
-    Refusing instead fails the successor's first Workflow Task until a
-    binding-aware Worker takes it, which is a blocked Run rather than a wrong
-    one — the direction ADR-014 takes throughout this feature.
-    """
-    raw = encode_continuation(WRITER_STAGE_CONTINUATION)
-
-    assert raw[0] == 2, (
-        "a writer-stage header must announce a version that a Worker unable to "
-        "check the binding refuses outright"
-    )
-
-    with pytest.raises(AnnotationDecodeError, match="schema version 2"):
-        _restore_as_a_worker_without_the_binding(raw, subscribed_stream="tokens")
-
-    # What that refusal prevents: the same old Worker, handed a header it *can*
-    # parse, accepts the cursor on the strength of the stream name alone and
-    # never learns which store produced it.
-    version_1_shape = encode_continuation(
-        dataclasses.replace(
-            WRITER_STAGE_CONTINUATION,
-            backend_names={},
-            provider_ids={},
-            provider_format_versions={},
-            schema_version=1,
-        )
-    )
-    assert _restore_as_a_worker_without_the_binding(
-        version_1_shape, subscribed_stream="tokens"
-    ) == AFTER(Offset("100-3")), (
-        "the old restoration must be shown accepting a cursor with no backend "
-        "check, or the refusal above is not protecting anything"
-    )
-
-
-def test_a_header_with_the_binding_inlined_still_decodes() -> None:
-    """Written only by a build between the binding landing and this envelope.
-
-    A chain that continued as new under one has a successor whose start header
-    holds those bytes, so they stay readable -- and re-encoding reproduces them
-    rather than silently rewriting a header this Worker only read.
-    """
-    inlined = dataclasses.replace(WRITER_STAGE_CONTINUATION, schema_version=2)
-    raw = encode_continuation(inlined)
-
-    assert raw[0] == 2
-    decoded = decode_continuation(raw)
-
-    assert decoded == inlined
-    assert encode_continuation(decoded) == raw
 
 
 # --- what gets committed ------------------------------------------------------
@@ -824,9 +458,7 @@ def test_the_continuation_reports_what_was_consumed_not_what_was_delivered(
     cursor would step over records nothing had ever shown to Workflow code.
     """
     runtime = make_runtime(manager, backend)
-    runtime.register(
-        wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
-    )
+    runtime.register(wait_id=1, stream_key=runtime.stream_key("tokens"))
     batch = [
         StreamRecord(RecordKind.DATA, b"a", "s", i).placed_at(Offset(f"10-{i}"))
         for i in range(3)
@@ -850,9 +482,7 @@ def test_a_control_record_still_advances_consumption(
     and it would be redelivered on every Run of the chain.
     """
     runtime = make_runtime(manager, backend)
-    runtime.register(
-        wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
-    )
+    runtime.register(wait_id=1, stream_key=runtime.stream_key("tokens"))
     fence = StreamRecord(RecordKind.WRITE_FENCE, b"", "s", 0).placed_at(Offset("10-0"))
 
     runtime.record_consumption(1, fence)
@@ -865,11 +495,9 @@ def test_a_run_that_delivered_nothing_still_reports_its_start(
 ) -> None:
     """Otherwise the successor would restart at BEGINNING and redeliver."""
     runtime = make_runtime(
-        manager, backend, Continuation({1: AFTER(Offset("100-0"))}, {1: "tokens"})
+        manager, backend, continuation({1: AFTER(Offset("100-0"))}, {1: "tokens"})
     )
-    runtime.register(
-        wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
-    )
+    runtime.register(wait_id=1, stream_key=runtime.stream_key("tokens"))
 
     assert runtime.continuation().cursors[1] == AFTER(Offset("100-0"))
 
@@ -889,7 +517,7 @@ class ChainedConsumerWorkflow:
     @workflow.run
     async def run(self, remaining: int) -> list[str]:
         tokens = external_stream.with_options(idle_timeout=timedelta(seconds=30)).topic(
-            "tokens", backend="tokens-memory", type=str
+            "tokens", type=str
         )
         seen: list[str] = []
         async for token in tokens.subscribe():
@@ -921,7 +549,7 @@ async def test_a_chain_resumes_where_its_predecessor_stopped(
         client,
         task_queue=task_queue,
         workflows=[ChainedConsumerWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         handle = await client.start_workflow(
             ChainedConsumerWorkflow.run,
@@ -945,18 +573,14 @@ async def test_a_chain_resumes_where_its_predecessor_stopped(
         )
 
 
-async def test_a_writer_stage_chain_carries_the_binding_through_history(
+async def test_a_chain_carries_the_provider_binding_through_history(
     client: Client, backend: MemoryStreamBackend
 ) -> None:
     """The binding reaches the successor as History, and is checked on the way in.
 
-    The chain above runs at the stage this release ships, which writes version 1
-    and therefore carries no binding at all -- so nothing end-to-end exercises
-    the bytes the binding was added for. Everything else that does builds a
-    ``Continuation`` by hand, which cannot show that a live Worker puts the
-    binding on the command, that the server persists it into the successor's
-    ``WorkflowExecutionStarted``, or that the successor validates it rather than
-    merely tolerating it.
+    This shows that a live Worker puts the binding on the command, the server
+    persists it into the successor's ``WorkflowExecutionStarted``, and the
+    successor validates it rather than merely tolerating it.
 
     The last of those is asserted against the *recorded* bytes with only the
     provider identity moved, so the run that must fail differs from the run that
@@ -967,8 +591,7 @@ async def test_a_writer_stage_chain_carries_the_binding_through_history(
         client,
         task_queue=task_queue,
         workflows=[ChainedConsumerWorkflow],
-        external_stream_backends={"tokens-memory": backend},
-        external_stream_continuation_schema_version=2,
+        external_stream_backend=backend,
     ):
         handle = await client.start_workflow(
             ChainedConsumerWorkflow.run,
@@ -999,10 +622,6 @@ async def test_a_writer_stage_chain_carries_the_binding_through_history(
     attributes = continued[0].workflow_execution_continued_as_new_event_attributes
     recorded = decode_continuation(attributes.header.fields[CONTINUATION_HEADER].data)
 
-    assert recorded.schema_version == 2, (
-        "a Worker at the writer stage wrote a header with no binding in it"
-    )
-    assert recorded.backend_names == {1: "tokens-memory"}
     assert recorded.provider_ids == {1: MemoryStreamBackend.provider_id}
     assert recorded.provider_format_versions == {
         1: MemoryStreamBackend.provider_format_version
@@ -1025,18 +644,16 @@ async def test_a_writer_stage_chain_carries_the_binding_through_history(
     # about the binding rather than about the history.
     matched = await Replayer(
         workflows=[ChainedConsumerWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ).replay_workflow(successor, raise_on_replay_failure=False)
 
     assert matched.replay_failure is None, (
         f"the successor's own history no longer replays: {matched.replay_failure}"
     )
 
-    # Same history, same records, same stream and backend *names* -- only the
-    # implementation behind the name has moved, which is a deployment change no
-    # Workflow edit is visible for. Accepting the cursor would be finding 01: the
-    # boundary means nothing in this store, and every record below it is skipped
-    # in silence.
+    # Same history, same records, and same stream -- only the configured
+    # implementation has moved. Accepting the cursor would skip records in
+    # silence because the boundary means nothing in the replacement store.
     #
     # Reported by *marker* replay, not by the continuation: the successor's
     # `ReplayExternalStreams` job is handled before its Workflow code runs, so on
@@ -1049,7 +666,7 @@ async def test_a_writer_stage_chain_carries_the_binding_through_history(
     foreign._records = {k: list(v) for k, v in backend._records.items()}
     moved = await Replayer(
         workflows=[ChainedConsumerWorkflow],
-        external_stream_backends={"tokens-memory": foreign},
+        external_stream_backend=foreign,
     ).replay_workflow(successor, raise_on_replay_failure=False)
 
     assert moved.replay_failure is not None, (
@@ -1068,14 +685,12 @@ async def test_a_writer_stage_chain_carries_the_binding_through_history(
         StubManager(),
         foreign,
         recorded,
-        backends={"tokens-memory": foreign},
     )
 
     with pytest.raises(StreamStorageError, match="'other-memory'"):
         first_task.register(
             wait_id=1,
             stream_key=first_task.stream_key("tokens"),
-            backend_name="tokens-memory",
         )
 
     assert foreign.range_reads == [], (
@@ -1107,7 +722,7 @@ class LateConsumerContinueAsNewWorkflow:
     @workflow.run
     async def run(self, remaining: int) -> list[str]:
         tokens = external_stream.with_options(idle_timeout=timedelta(seconds=30)).topic(
-            "tokens", backend="tokens-memory", type=str
+            "tokens", type=str
         )
         subscription = tokens.subscribe()
         iterator = subscription.__aiter__()
@@ -1143,7 +758,7 @@ class SignalContinueAsNewWorkflow:
     @workflow.run
     async def run(self, remaining: int) -> list[str]:
         tokens = external_stream.with_options(idle_timeout=timedelta(seconds=30)).topic(
-            "tokens", backend="tokens-memory", type=str
+            "tokens", type=str
         )
         subscription = tokens.subscribe()
         iterator = subscription.__aiter__()
@@ -1246,7 +861,7 @@ async def test_a_consumer_that_runs_after_the_terminal_command_is_still_consumed
         client,
         task_queue=task_queue,
         workflows=[LateConsumerContinueAsNewWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         assert await asyncio.wait_for(handle.result(), 30) == ["c", "d"], (
             "the successor was handed a record its predecessor consumed after "
@@ -1272,7 +887,7 @@ async def test_a_signal_handler_continuing_as_new_waits_for_the_consumer(
         client,
         task_queue=task_queue,
         workflows=[SignalContinueAsNewWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         await _until_staged(handle)
         await handle.signal(SignalContinueAsNewWorkflow.wrap_up, 1)
@@ -1312,7 +927,7 @@ async def test_a_history_written_at_the_earlier_boundary_still_replays(
         client,
         task_queue=task_queue,
         workflows=[LateConsumerContinueAsNewWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         await asyncio.wait_for(handle.result(), 30)
         history = await client.get_workflow_handle(
@@ -1345,7 +960,7 @@ async def test_a_history_written_at_the_earlier_boundary_still_replays(
 
     result = await Replayer(
         workflows=[LateConsumerContinueAsNewWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ).replay_workflow(history, raise_on_replay_failure=False)
 
     assert result.replay_failure is None, (

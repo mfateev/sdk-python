@@ -85,7 +85,7 @@ def backend() -> MemoryStreamBackend:
 def make_runtime(manager: Any, backend: MemoryStreamBackend) -> WorkflowStreamRuntime:
     return WorkflowStreamRuntime(
         manager=manager,
-        backends={"tokens": backend},
+        backend=backend,
         run_id=RUN_ID,
         namespace="ns",
         workflow_id="wf",
@@ -122,7 +122,7 @@ class NeverEmptyManager:
         self.rearmed: list[str] = []
         self._next: dict[int, int] = {}
 
-    def register(self, *, run_id, wait_id, stream_key, backend_name, start_cursor):  # type: ignore[no-untyped-def]
+    def register(self, *, run_id, wait_id, stream_key, start_cursor):  # type: ignore[no-untyped-def]
         self._next.setdefault(wait_id, 0)
 
     def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]
@@ -191,9 +191,7 @@ async def test_a_never_empty_subscription_yields_control_after_the_budget(
     runtime = make_runtime(manager, backend)
     _install_runtime(workflow_instance, runtime)
     runtime.begin_activation()
-    subscription = external_stream.topic(
-        "tokens", backend="tokens", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
 
     seen: list[str] = []
     task = asyncio.ensure_future(consume(subscription.__aiter__(), seen))
@@ -231,9 +229,7 @@ async def test_the_budget_blocks_even_though_records_are_buffered(
     runtime = make_runtime(manager, backend)
     _install_runtime(workflow_instance, runtime)
     runtime.begin_activation()
-    subscription = external_stream.topic(
-        "tokens", backend="tokens", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
 
     seen: list[str] = []
     task = asyncio.ensure_future(consume(subscription.__aiter__(), seen))
@@ -260,9 +256,7 @@ async def test_the_next_activation_gets_a_fresh_budget(
     runtime = make_runtime(manager, backend)
     _install_runtime(workflow_instance, runtime)
     runtime.begin_activation()
-    subscription = external_stream.topic(
-        "tokens", backend="tokens", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
 
     seen: list[str] = []
     task = asyncio.ensure_future(consume(subscription.__aiter__(), seen))
@@ -296,8 +290,8 @@ async def test_merge_spends_one_budget_across_every_subscription(
     runtime = make_runtime(manager, backend)
     _install_runtime(workflow_instance, runtime)
     runtime.begin_activation()
-    first = external_stream.topic("a", backend="tokens", type=str).subscribe()
-    second = external_stream.topic("b", backend="tokens", type=str).subscribe()
+    first = external_stream.topic("a", type=str).subscribe()
+    second = external_stream.topic("b", type=str).subscribe()
 
     seen: list[tuple[int, str]] = []
 
@@ -329,8 +323,8 @@ async def test_merge_blocks_on_every_wait_once_the_budget_is_spent(
     runtime = make_runtime(manager, backend)
     _install_runtime(workflow_instance, runtime)
     runtime.begin_activation()
-    first = external_stream.topic("a", backend="tokens", type=str).subscribe()
-    second = external_stream.topic("b", backend="tokens", type=str).subscribe()
+    first = external_stream.topic("a", type=str).subscribe()
+    second = external_stream.topic("b", type=str).subscribe()
 
     seen: list[tuple[int, str]] = []
 
@@ -383,8 +377,8 @@ async def test_two_independent_consumers_share_one_budget(
     runtime = make_runtime(manager, backend)
     _install_runtime(workflow_instance, runtime)
     runtime.begin_activation()
-    first = external_stream.topic("a", backend="tokens", type=str).subscribe()
-    second = external_stream.topic("b", backend="tokens", type=str).subscribe()
+    first = external_stream.topic("a", type=str).subscribe()
+    second = external_stream.topic("b", type=str).subscribe()
 
     seen_first: list[str] = []
     seen_second: list[str] = []
@@ -463,9 +457,7 @@ async def test_a_carried_over_ready_list_is_charged_to_the_next_activation(
     runtime = make_runtime(manager, backend)
     _install_runtime(workflow_instance, runtime)
     runtime.begin_activation()
-    subscription = external_stream.topic(
-        "tokens", backend="tokens", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
 
     # One activation that delivers a whole batch and consumes a single record,
     # which is the ordinary shape of a consumer that does real work per record:
@@ -515,7 +507,7 @@ class OneBusyOneQuietManager:
         self._next = 0
         self._quiet_pending = True
 
-    def register(self, *, run_id, wait_id, stream_key, backend_name, start_cursor):  # type: ignore[no-untyped-def]
+    def register(self, *, run_id, wait_id, stream_key, start_cursor):  # type: ignore[no-untyped-def]
         pass
 
     def note_wait_generation(self, run_id, wait_id, generation) -> None:  # type: ignore[no-untyped-def]
@@ -571,8 +563,8 @@ async def test_merge_does_not_starve_a_stream_behind_a_saturated_one(
     runtime = make_runtime(manager, backend)
     _install_runtime(workflow_instance, runtime)
     runtime.begin_activation()
-    busy = external_stream.topic("busy", backend="tokens", type=str).subscribe()
-    quiet = external_stream.topic("quiet", backend="tokens", type=str).subscribe()
+    busy = external_stream.topic("busy", type=str).subscribe()
+    quiet = external_stream.topic("quiet", type=str).subscribe()
     assert (busy.wait_id, quiet.wait_id) == (1, 2)
 
     seen: list[tuple[int, str]] = []
@@ -693,7 +685,7 @@ async def test_merge_reaches_a_wait_the_budget_cannot_pay_for_in_one_pass(
     # for and the test passes without exercising anything.
     assert runtime.delivery_budget_remaining() == small_budget
     subscriptions = [
-        external_stream.topic(f"s{i}", backend="tokens", type=str).subscribe()
+        external_stream.topic(f"s{i}", type=str).subscribe()
         for i in range(small_budget + 1)
     ]
     last = subscriptions[-1]
@@ -759,7 +751,7 @@ async def test_merge_keeps_the_skew_bounded_when_the_count_splits_the_budget(
     # for and the test passes without exercising anything.
     assert runtime.delivery_budget_remaining() == small_budget
     subscriptions = [
-        external_stream.topic(f"s{i}", backend="tokens", type=str).subscribe()
+        external_stream.topic(f"s{i}", type=str).subscribe()
         for i in range(_SKEWED_STREAMS)
     ]
 
@@ -816,14 +808,12 @@ async def test_rearming_re_reports_readiness_for_a_non_empty_buffer() -> None:
     backend = MemoryStreamBackend()
     notifier = RecordingNotifier()
     manager = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=notifier,
         watch_block=timedelta(milliseconds=20),
     )
     try:
-        subscription = manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        subscription = manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
         await backend.append(
             stream_key, StreamRecord(RecordKind.DATA, b"a", "session", 0)
         )
@@ -856,14 +846,12 @@ async def test_rearming_says_nothing_about_an_empty_buffer() -> None:
     backend = MemoryStreamBackend()
     notifier = RecordingNotifier()
     manager = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=notifier,
         watch_block=timedelta(milliseconds=20),
     )
     try:
-        manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
         await asyncio.sleep(0.05)
         assert notifier.calls == []
 
@@ -898,13 +886,13 @@ async def test_a_record_arriving_after_the_last_drain_is_re_announced() -> None:
     backend = MemoryStreamBackend()
     notifier = RecordingNotifier()
     manager = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=notifier,
         watch_block=timedelta(milliseconds=20),
     )
     try:
         runtime = make_runtime(manager, backend)
-        runtime.register(wait_id=1, stream_key=stream_key, backend_name="tokens")
+        runtime.register(wait_id=1, stream_key=stream_key)
         # A wait is blocked from creation, so reaching generation 1 means taking a
         # record and blocking again -- which is the ordinary shape and the one the
         # generation counter exists for.
@@ -1116,9 +1104,7 @@ def test_a_wait_the_budget_stopped_is_not_immediately_parkable(
 
     runtime = make_runtime(StubManager(), backend)
     runtime.begin_activation()
-    runtime.register(
-        wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
-    )
+    runtime.register(wait_id=1, stream_key=runtime.stream_key("tokens"))
     record = StreamRecord(RecordKind.WRITE_FENCE, b"", "s", 0).placed_at(Offset("1"))
     runtime.record_delivery(1, record)
     runtime.note_blocked(1, True)
@@ -1191,9 +1177,7 @@ async def test_the_double_check_refill_still_delivers_a_late_record(
     runtime = make_runtime(manager, backend)
     _install_runtime(workflow_instance, runtime)
     runtime.begin_activation()
-    subscription = external_stream.topic(
-        "tokens", backend="tokens", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
 
     iterator = subscription.__aiter__()
 
@@ -1239,9 +1223,7 @@ async def test_a_replay_segment_larger_than_the_budget_is_delivered_in_full(
     runtime = make_runtime(StubManager(), backend)
     _install_runtime(workflow_instance, runtime)
     runtime.begin_activation()
-    subscription = external_stream.topic(
-        "tokens", backend="tokens", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
     runtime.begin_replay_segment(
         [
             (
@@ -1307,9 +1289,7 @@ async def test_replay_delivers_in_full_even_when_the_live_budget_is_spent(
     runtime = make_runtime(StubManager(), backend)
     _install_runtime(workflow_instance, runtime)
     runtime.begin_activation()
-    subscription = external_stream.topic(
-        "tokens", backend="tokens", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
 
     # Spend the whole live budget first, through the delivery that charges it.
     spent = StreamRecord(RecordKind.DATA, payload, "s", 0).placed_at(Offset("live"))
@@ -1375,9 +1355,7 @@ def test_a_budget_stop_records_batch_limit(backend: MemoryStreamBackend) -> None
 
     runtime = make_runtime(StubManager(), backend)
     runtime.begin_activation()
-    runtime.register(
-        wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
-    )
+    runtime.register(wait_id=1, stream_key=runtime.stream_key("tokens"))
     for i in range(MAX_RECORDS_PER_ACTIVATION):
         record = StreamRecord(RecordKind.DATA, b"x", "s", i).placed_at(
             Offset(f"{i:08d}")
@@ -1408,9 +1386,7 @@ def test_an_activation_that_ran_out_of_records_still_records_no_data(
 
     runtime = make_runtime(StubManager(), backend)
     runtime.begin_activation()
-    runtime.register(
-        wait_id=1, stream_key=runtime.stream_key("tokens"), backend_name="tokens"
-    )
+    runtime.register(wait_id=1, stream_key=runtime.stream_key("tokens"))
     for i in range(5):
         record = StreamRecord(RecordKind.DATA, b"x", "s", i).placed_at(
             Offset(f"{i:08d}")

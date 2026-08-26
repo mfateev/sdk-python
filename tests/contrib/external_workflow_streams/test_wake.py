@@ -219,7 +219,7 @@ def _worker_sending_wakes(client_identity: str):  # type: ignore[no-untyped-def]
     worker = object.__new__(_WorkflowWorker)
     worker._client = object()  # only ever handed to the patched sender
     worker._external_stream_manager = StreamSubscriptionManager(
-        backends={},
+        backend=None,
         notify_ready=notify_ready,
         client_identity=client_identity,
     )

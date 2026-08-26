@@ -2,7 +2,7 @@
 
 The producer handle is a **different type** from the Workflow-side one, and not
 the same object passed across a process boundary. A Workflow handle is bound to
-the running Workflow's identity and the Worker's backend registry; a producer
+the running Workflow's identity and backend configuration; a producer
 handle is constructed explicitly from credentials the producer holds.
 
 Every binding input is explicit, because none of them can be inferred:

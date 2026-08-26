@@ -97,7 +97,7 @@ class SlowRangeBackend(MemoryStreamBackend):
 def make_runtime(backend, manager):  # type: ignore[no-untyped-def]
     return WorkflowStreamRuntime(
         manager=manager,
-        backends={"tokens": backend},
+        backend=backend,
         run_id=RUN_ID,
         namespace="ns",
         workflow_id="wf",
@@ -109,7 +109,7 @@ def make_runtime(backend, manager):  # type: ignore[no-untyped-def]
 
 def make_manager(backend):  # type: ignore[no-untyped-def]
     return StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=_notify,
         watch_block=timedelta(milliseconds=10),
     )
@@ -138,7 +138,6 @@ async def test_finalization_touches_no_provider_at_all() -> None:
         runtime.register(
             wait_id=1,
             stream_key=runtime.stream_key("tokens"),
-            backend_name="tokens",
         )
 
         terminal = runtime.add_terminal()
@@ -162,7 +161,7 @@ async def test_finalization_reports_where_delivery_stopped_not_where_the_stream_
     runtime = make_runtime(backend, manager)
     try:
         key = runtime.stream_key("tokens")
-        runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+        runtime.register(wait_id=1, stream_key=key)
         runtime.record_delivery(
             1,
             StreamRecord(RecordKind.DATA, b"a", "s", 0).placed_at(Offset("5-0")),
@@ -195,7 +194,7 @@ async def test_a_park_slower_than_the_deadlock_timeout_is_still_answered() -> No
     runtime = make_runtime(backend, manager)
     try:
         key = runtime.stream_key("tokens")
-        runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+        runtime.register(wait_id=1, stream_key=key)
 
         started = asyncio.get_running_loop().time()
         became_ready = await asyncio.wait_for(
@@ -226,8 +225,8 @@ async def test_a_recheck_that_finds_records_abandons_the_whole_park() -> None:
     try:
         first = runtime.stream_key("tokens")
         second = runtime.stream_key("tool-events")
-        runtime.register(wait_id=1, stream_key=first, backend_name="tokens")
-        runtime.register(wait_id=2, stream_key=second, backend_name="tokens")
+        runtime.register(wait_id=1, stream_key=first)
+        runtime.register(wait_id=2, stream_key=second)
 
         # A record on *one* of the two streams.
         await backend.append(first, StreamRecord(RecordKind.DATA, b"a", "s", 0))
@@ -272,7 +271,6 @@ async def test_intents_are_installed_before_anything_is_rechecked() -> None:
             runtime.register(
                 wait_id=wait_id,
                 stream_key=runtime.stream_key(name),
-                backend_name="tokens",
             )
 
         await manager.prepare_park(RUN_ID, 1, runtime.blocked_snapshot())
@@ -338,7 +336,7 @@ async def test_the_delivering_activation_reads_nothing_itself() -> None:
         await manager.prepare_replay(RUN_ID, annotation_for(key, placed))
 
         # From here on the provider is hostile. Delivery still has to work.
-        manager._backends = {**manager._backends, "tokens": HostileBackend()}
+        manager._backend = HostileBackend()
 
         plan = manager.take_replay_plan(RUN_ID)
 

@@ -37,16 +37,10 @@ OTHER_KEY = StreamKey("ns", "wf", "run-1", "tool-events")
 
 
 def binding(key: StreamKey, start_cursor: Cursor = BEGINNING) -> StreamBinding:
-    """A binding naming its own backend, as every real one does.
-
-    The provider identity lives on the binding rather than on the header: one
-    annotation can carry waits on several backends, so a single label could be
-    right for at most one of them.
-    """
+    """A binding carrying the configured backend's provider identity."""
     return StreamBinding(
         stream_key=key,
         start_cursor=start_cursor,
-        backend_name="tokens",
         provider_id="redis-streams",
         provider_format_version=1,
     )
@@ -398,7 +392,6 @@ def test_a_bindings_frame_is_the_header_frame_body_under_its_own_tag() -> None:
             "05" + "run-1".encode().hex(),
             "0b" + "tool-events".encode().hex(),
             "00",  # start cursor BEGINNING
-            "06" + "tokens".encode().hex(),  # backend name
             "0d" + "redis-streams".encode().hex(),  # provider id
             "01",  # provider format version 1
         ]
@@ -599,19 +592,14 @@ def test_the_reserve_is_only_spendable_by_the_frames_it_was_set_aside_for() -> N
 #: pass is the mistake it exists to catch: any change here is a wire-format
 #: change, and markers already in History were written by the old encoder.
 #:
-#: This constant was regenerated once, for schema version 2, which moved the
-#: provider identity out of the header and onto each binding. That is allowed
-#: exactly because the feature is private and unreleased -- there is no History
-#: anywhere holding a version-1 marker. `decode_annotation` refuses version 1
-#: rather than reading it, so the regeneration cannot silently reinterpret an
-#: older marker.
+#: The feature is private and unreleased, so this covers only the current format
+#: and deliberately provides no compatibility fixture for earlier prototypes.
 GOLDEN_ANNOTATION = Annotation(
     header=AnnotationHeader(
         streams={
             1: StreamBinding(
                 stream_key=StreamKey("ns", "wf", "run-1", "tokens"),
                 start_cursor=BEGINNING,
-                backend_name="tokens",
                 provider_id="redis-streams",
                 provider_format_version=1,
             )
@@ -630,7 +618,7 @@ GOLDEN_ANNOTATION = Annotation(
 GOLDEN_BYTES = bytes.fromhex(
     "".join(
         [
-            "02",  # schema version 2
+            "01",  # schema version 1
             "01",  # header frame
             "01",  # one stream
             "01",  # wait id 1
@@ -639,7 +627,6 @@ GOLDEN_BYTES = bytes.fromhex(
             "05" + "run-1".encode().hex(),
             "06" + "tokens".encode().hex(),
             "00",  # start cursor BEGINNING
-            "06" + "tokens".encode().hex(),  # backend name
             "0d" + "redis-streams".encode().hex(),  # provider id
             "01",  # provider format version 1
             "02",  # segment frame

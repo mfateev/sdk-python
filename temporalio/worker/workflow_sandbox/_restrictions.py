@@ -790,9 +790,9 @@ SandboxRestrictions.invalid_module_members_default = SandboxMatcher(
                     children={
                         # External stream provider instances hold connections
                         # and credentials and live on the Worker, outside the
-                        # sandbox. Workflow code names a registered backend; it
-                        # never constructs or imports one, and a provider
-                        # reached from in here would be a second, unregistered
+                        # sandbox. Workflow code uses the backend configured on
+                        # its Worker; it never constructs or imports one, and a
+                        # provider reached from in here would be a second
                         # instance that no watcher owns.
                         "external_workflow_streams": SandboxMatcher(
                             children={
@@ -802,8 +802,7 @@ SandboxRestrictions.invalid_module_members_default = SandboxMatcher(
                                         "External stream providers may not be "
                                         "imported from Workflow code. Register "
                                         "the provider on the Worker with "
-                                        "external_stream_backends={...} and "
-                                        "name it from the Workflow instead."
+                                        "external_stream_backend=... instead."
                                     ),
                                 ),
                             },

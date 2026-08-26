@@ -1,9 +1,8 @@
 """The per-Workflow-instance runtime handle (P10a, P10b).
 
 One of these is created per Run and handed to Workflow code as an opaque handle.
-It is the only thing that crosses the sandbox boundary, and it exposes exactly
-three capabilities: resolve a backend *name*, register a wait, and pop from that
-wait's buffer. No provider instance is reachable through it.
+It is the only thing that crosses the sandbox boundary, and it exposes only
+stream operations. No provider instance is reachable through it.
 
 It also builds the **observation delta** -- the thing that makes replay possible
 -- because it is the only component that sees deliveries in the order Workflow
@@ -56,11 +55,7 @@ from temporalio.contrib.external_workflow_streams._backend import (
     StreamKey,
 )
 from temporalio.contrib.external_workflow_streams._codec import StreamPayloadCodec
-from temporalio.contrib.external_workflow_streams._continuation import (
-    _DEFAULT_CONTINUATION_WRITE_SCHEMA_VERSION,
-    Continuation,
-    _validate_continuation_schema_version,
-)
+from temporalio.contrib.external_workflow_streams._continuation import Continuation
 from temporalio.contrib.external_workflow_streams._errors import (
     ExternalStreamCapacityError,
     StreamStorageError,
@@ -131,7 +126,6 @@ class _SubscriptionState:
 
     wait_id: int
     stream_key: StreamKey
-    backend_name: str
     start_cursor: Cursor
     idle_timeout: timedelta
 
@@ -205,7 +199,7 @@ class WorkflowStreamRuntime:
         self,
         *,
         manager: StreamSubscriptionManager,
-        backends: Mapping[str, StreamBackend],
+        backend: StreamBackend | None,
         run_id: str,
         namespace: str,
         workflow_id: str,
@@ -214,21 +208,10 @@ class WorkflowStreamRuntime:
         default_idle_timeout: timedelta,
         max_annotation_bytes: int = MAX_ANNOTATION_BYTES,
         continuation: Continuation | None = None,
-        continuation_schema_version: int = _DEFAULT_CONTINUATION_WRITE_SCHEMA_VERSION,
     ) -> None:
         """Create the per-Run runtime and restore any continuation state."""
-        _validate_continuation_schema_version(continuation_schema_version)
-        if continuation is not None:
-            _validate_continuation_schema_version(continuation.schema_version)
-            # A reader-stage Worker may start a new chain at v1, but it must not
-            # turn an existing v2 chain back into bytes an old Worker accepts.
-            # That would discard must-understand binding proof already carried
-            # by the chain and recreate finding 9 on its following Run.
-            continuation_schema_version = max(
-                continuation_schema_version, continuation.schema_version
-            )
         self._manager = manager
-        self._backends = backends
+        self._backend = backend
         self._run_id = run_id
         self._namespace = namespace
         self._workflow_id = workflow_id
@@ -250,13 +233,6 @@ class WorkflowStreamRuntime:
         #: read from the backend -- a cursor derived from mutable backend state
         #: would give replay whatever the stream holds now (ADR-022).
         self._continuation = continuation
-        #: The schema this deployment writes for a successor, raised to the
-        #: predecessor's version when necessary so a chain never sheds fields
-        #: an older reader must not ignore. Kept separately from what this
-        #: runtime can read so the v2 reader can be rolled out while new chains
-        #: remain pinned to v1 (ADR-039).
-        self._continuation_schema_version = continuation_schema_version
-
         self._subscriptions: dict[int, _SubscriptionState] = {}
         #: Where the *current* annotation begins, per wait. Captured when the
         #: annotation begins rather than when its header is first needed --
@@ -563,7 +539,7 @@ class WorkflowStreamRuntime:
 
         A header is one indivisible frame, and a binding carries four
         caller-chosen strings -- namespace, Workflow ID, first-execution Run ID,
-        stream name -- plus the backend name and provider id. Enough
+        stream name -- plus the provider id. Enough
         subscriptions, or long enough valid names, and the header alone is larger
         than the whole budget. Nothing downstream can recover from that: rollover
         writes a *fresh* header, so the next annotation is the same size and the
@@ -608,7 +584,7 @@ class WorkflowStreamRuntime:
             f"{self._max_annotation_bytes}-byte budget. "
             "Rolling the Workflow Task over cannot help: every annotation begins "
             "with a header of this size. Subscribe to fewer streams from one "
-            "Workflow, or shorten the stream and backend names."
+            "Workflow, or shorten the stream and provider names."
         )
 
     def rearm_readiness(self) -> None:
@@ -635,7 +611,6 @@ class WorkflowStreamRuntime:
         *,
         wait_id: int,
         stream_key: StreamKey,
-        backend_name: str,
         idle_timeout: timedelta | None = None,
         start_cursor: Cursor | None = None,
     ) -> None:
@@ -654,26 +629,19 @@ class WorkflowStreamRuntime:
                 point at which the answer is still "do not make this
                 subscription" rather than "this Workflow Task cannot be
                 completed".
-            temporalio.workflow.NondeterminismError: This wait's stream or
-                backend is not the one the predecessor Run recorded it against
-                -- see :meth:`restored_start`.
-            StreamStorageError: The backend this wait names no longer resolves to
-                the provider the predecessor read it through.
+            temporalio.workflow.NondeterminismError: This wait's stream is not
+                the one the predecessor Run recorded -- see
+                :meth:`restored_start`.
+            StreamStorageError: The configured backend no longer uses the
+                provider the predecessor read through.
         """
-        if backend_name not in self._backends:
-            known = ", ".join(sorted(self._backends)) or "<none>"
-            raise KeyError(
-                f"no external stream backend named {backend_name!r} is registered on "
-                f"this Worker; registered backends are: {known}"
+        if self._backend is None:
+            raise RuntimeError(
+                "external streams are not configured on this Worker; pass "
+                "external_stream_backend=... to the Worker"
             )
-        # Resolved before the cursor is restored, because restoration compares
-        # the predecessor's provider declaration against the backend this name
-        # now names: a name that resolves to nothing is a Worker configuration
-        # error and has to be reported as itself.
         if start_cursor is None:
-            start_cursor = self.restored_start(
-                wait_id, stream_key.stream_name, backend_name
-            )
+            start_cursor = self.restored_start(wait_id, stream_key.stream_name)
         if self._replay_bindings is not None:
             # A subscription made while a marker is being replayed -- which is
             # every subscription, on the activation that both starts the
@@ -682,11 +650,10 @@ class WorkflowStreamRuntime:
             # can be handed through the wrong subscription.
             binding = self._replay_bindings.get(wait_id)
             if binding is not None:
-                self._verify_binding(wait_id, stream_key, backend_name, binding)
+                self._verify_binding(wait_id, stream_key, binding)
         state = _SubscriptionState(
             wait_id=wait_id,
             stream_key=stream_key,
-            backend_name=backend_name,
             start_cursor=start_cursor,
             delivery_cursor=start_cursor,
             consumption_cursor=start_cursor,
@@ -710,7 +677,6 @@ class WorkflowStreamRuntime:
             run_id=self._run_id,
             wait_id=wait_id,
             stream_key=stream_key,
-            backend_name=backend_name,
             start_cursor=start_cursor,
         )
         # A registration alone is replay-visible: it is what puts the stream in
@@ -814,23 +780,18 @@ class WorkflowStreamRuntime:
         for wait_id, state in sorted(self._subscriptions.items()):
             binding = self._replay_bindings.get(wait_id)
             if binding is not None:
-                self._verify_binding(
-                    wait_id, state.stream_key, state.backend_name, binding
-                )
+                self._verify_binding(wait_id, state.stream_key, binding)
 
     def _verify_binding(
         self,
         wait_id: int,
         stream_key: StreamKey,
-        backend_name: str,
         binding: StreamBinding,
     ) -> None:
         """Row four, and deliberately not integrity loss.
 
-        Both fields compared here were chosen by Workflow code -- the stream the
-        topic names and the backend it names it on -- so a difference means the
-        code moved, not that anything is wrong with the backend. Reporting it as
-        integrity loss would send an operator to repair a store that is fine.
+        The stream compared here was chosen by Workflow code, so a difference
+        means the code moved, not that anything is wrong with the backend.
 
         Only the **stream name** is compared, not the whole key. The other three
         components -- namespace, Workflow id, first execution Run id -- are the
@@ -854,14 +815,6 @@ class WorkflowStreamRuntime:
                 "call was inserted, removed, or reordered, which renumbers "
                 "every later wait; gate the change behind workflow.patched() "
                 "exactly as an inserted timer would be."
-            )
-        if backend_name != binding.backend_name:
-            raise temporalio.workflow.NondeterminismError(
-                f"the marker records external stream wait {wait_id} against "
-                f"backend {binding.backend_name!r}, but this Workflow subscribes "
-                f"it against {backend_name!r}. The recorded records live in the "
-                "backend that wrote them; gate the change behind "
-                "workflow.patched() exactly as an inserted timer would be."
             )
 
     def begin_replay_segment(
@@ -1364,12 +1317,10 @@ class WorkflowStreamRuntime:
         path, so a continuation taken from the last *marker* would restart the
         successor at a stale cursor and lose the final segment.
 
-        Carried with each cursor is the whole binding it is a position in --
-        stream, backend, and the provider identity that backend declares -- and
-        it is taken from :meth:`_binding`, the same place the annotation header
-        takes it from. An offset means nothing outside the store that produced
-        it, so a successor that resumed on the wait number alone could hand it
-        to a store that never held those records.
+        Carried with each cursor is the whole binding it is a position in -- the
+        stream and configured provider identity -- taken from :meth:`_binding`,
+        the same place the annotation header takes it from. An offset means
+        nothing outside the store that produced it.
         """
         bindings = {
             wait_id: self._binding(state)
@@ -1384,9 +1335,6 @@ class WorkflowStreamRuntime:
                 wait_id: binding.stream_key.stream_name
                 for wait_id, binding in bindings.items()
             },
-            backend_names={
-                wait_id: binding.backend_name for wait_id, binding in bindings.items()
-            },
             provider_ids={
                 wait_id: binding.provider_id for wait_id, binding in bindings.items()
             },
@@ -1394,26 +1342,18 @@ class WorkflowStreamRuntime:
                 wait_id: binding.provider_format_version
                 for wait_id, binding in bindings.items()
             },
-            schema_version=self._continuation_schema_version,
         )
 
-    def restored_start(
-        self, wait_id: int, stream_name: str, backend_name: str
-    ) -> Cursor:
+    def restored_start(self, wait_id: int, stream_name: str) -> Cursor:
         """The start cursor for a subscription, from the predecessor Run if any.
 
         ``BEGINNING`` on a first execution -- the same field, filled the same
         way, so replay reads an explicit boundary in either case.
 
-        The whole binding is compared before the cursor is handed back, because
-        a cursor is a position *in one store* and every other store will accept
-        it as if it were a position in theirs. This is the Continue-As-New
-        counterpart of :meth:`_verify_binding`, and it is split the same way:
-        the stream and the backend are what Workflow code chose, so a change
-        there is nondeterminism, while the provider behind a backend name is a
-        deployment fact and a change there is a storage failure. Both are raised
-        before the cursor reaches the manager, so no backend ever reads at a
-        boundary that was not produced against it.
+        The whole binding is compared before the cursor is handed back. The
+        stream is Workflow code, so a change is nondeterminism; the provider is
+        Worker configuration, so a change is a storage failure. Both are raised
+        before the cursor reaches the manager.
         """
         if self._continuation is None:
             return BEGINNING
@@ -1433,22 +1373,11 @@ class WorkflowStreamRuntime:
                 "reordered, which renumbers every later wait; gate the change "
                 "behind workflow.patched() exactly as an inserted timer would be."
             )
-        recorded_backend = self._continuation.backend_names.get(wait_id, "")
-        if recorded_backend and recorded_backend != backend_name:
-            raise temporalio.workflow.NondeterminismError(
-                f"the predecessor Run recorded external stream wait {wait_id} "
-                f"against backend {recorded_backend!r}, but this Run subscribes "
-                f"it against {backend_name!r}. The restored cursor is a position "
-                f"in {recorded_backend!r} and names nothing in {backend_name!r}, "
-                "which would resume the stream at an unrelated boundary; gate "
-                "the change behind workflow.patched() exactly as an inserted "
-                "timer would be."
-            )
-        self._verify_restored_provider(wait_id, backend_name)
+        self._verify_restored_provider(wait_id)
         return restored
 
-    def _verify_restored_provider(self, wait_id: int, backend_name: str) -> None:
-        """Whether the name still resolves to what produced the cursor.
+    def _verify_restored_provider(self, wait_id: int) -> None:
+        """Whether the configured backend is what produced the cursor.
 
         A deployment question rather than a Workflow one, and classified exactly
         as :meth:`StreamSubscriptionManager._replay_backend` classifies it: the
@@ -1461,47 +1390,34 @@ class WorkflowStreamRuntime:
         could make it, which is why the continuation carries the provider
         identity at all.
 
-        An empty recorded provider id means the predecessor had nothing to
-        record -- a header from before the binding was carried, or a backend that
-        had already left the Worker's registration when the continuation was
-        taken -- and there is nothing to compare against.
-
-        The format version is decided by *membership* rather than truthiness. The
-        backend contract types it as a plain integer and reserves no value, so
-        zero is a version a provider may declare and the encoding represents it
-        exactly. Read as a "nothing recorded" sentinel it silently skipped the
-        comparison, which made Continue-As-New less safe than marker replay for
-        the same binding: a cursor written at version 0 was handed to a version 1
-        implementation.
+        The backend contract reserves no format-version value, so zero is
+        compared exactly like every other version.
         """
         assert self._continuation is not None
-        recorded_id = self._continuation.provider_ids.get(wait_id, "")
-        if not recorded_id:
-            return
-        backend = self._backends.get(backend_name)
+        recorded_id = self._continuation.provider_ids[wait_id]
+        backend = self._backend
         if backend is None:
-            # `register` refuses an unregistered name before it gets here.
-            return
+            raise RuntimeError(
+                "external streams are not configured on this Worker; pass "
+                "external_stream_backend=... to the Worker"
+            )
         declared_id = type(backend).provider_id
         if declared_id != recorded_id:
             raise StreamStorageError(
                 f"external stream wait {wait_id} was continued from a Run that "
                 f"read it through provider {recorded_id!r}, but the backend "
-                f"registered on this Worker as {backend_name!r} declares "
-                f"{declared_id!r}. The restored cursor is a position in the store "
-                "that produced it; register the recorded provider under that name."
+                f"configured on this Worker declares {declared_id!r}. The "
+                "restored cursor is a position in the store that produced it; "
+                "configure the recorded provider."
             )
-        recorded_versions = self._continuation.provider_format_versions
         declared_version = type(backend).provider_format_version
-        if wait_id not in recorded_versions:
-            return
-        recorded_version = recorded_versions[wait_id]
+        recorded_version = self._continuation.provider_format_versions[wait_id]
         if recorded_version != declared_version:
             raise StreamStorageError(
                 f"external stream wait {wait_id} was continued from a Run that "
                 f"read it through provider {recorded_id!r} format version "
-                f"{recorded_version}, but the backend registered as "
-                f"{backend_name!r} implements format version {declared_version}. "
+                f"{recorded_version}, but the configured backend implements "
+                f"format version {declared_version}. "
                 "Resuming would interpret the restored cursor under a format it "
                 "was not written in."
             )
@@ -1594,19 +1510,17 @@ class WorkflowStreamRuntime:
         )
 
     def _binding(self, state: _SubscriptionState) -> StreamBinding:
-        backend = self._backends.get(state.backend_name)
-        # `register` refuses an unregistered name, so a missing backend here
-        # would mean the Worker's registration changed under a live Run. Its
-        # provider identity is unknowable rather than empty, so record what the
-        # Workflow named and let replay's own check report the mismatch.
+        backend = self._backend
+        if backend is None:
+            raise RuntimeError(
+                "external streams are not configured on this Worker; pass "
+                "external_stream_backend=... to the Worker"
+            )
         return StreamBinding(
             stream_key=state.stream_key,
             start_cursor=self._annotation_start.get(state.wait_id, state.start_cursor),
-            backend_name=state.backend_name,
-            provider_id=type(backend).provider_id if backend is not None else "",
-            provider_format_version=(
-                type(backend).provider_format_version if backend is not None else 1
-            ),
+            provider_id=type(backend).provider_id,
+            provider_format_version=type(backend).provider_format_version,
         )
 
     # --- quiescence (P10a) ----------------------------------------------------

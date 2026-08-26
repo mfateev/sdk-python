@@ -37,7 +37,6 @@ from temporalio.worker import Worker
 with workflow.unsafe.imports_passed_through():
     from temporalio.contrib.external_workflow_streams._api import external_stream
 
-BACKEND_NAME = "tokens-redis"
 STREAM_NAME = "tokens"
 
 READ_LOG = "reads"
@@ -54,7 +53,7 @@ class CrashConsumeWorkflow:
 
     @workflow.run
     async def run(self, expected: int) -> list[str]:
-        tokens = external_stream.topic(STREAM_NAME, backend=BACKEND_NAME, type=str)
+        tokens = external_stream.topic(STREAM_NAME, type=str)
         seen: list[str] = []
         async for token in tokens.subscribe():
             seen.append(token)
@@ -121,7 +120,7 @@ async def main() -> None:
         client,
         task_queue=args.task_queue,
         workflows=[CrashConsumeWorkflow],
-        external_stream_backends={BACKEND_NAME: backend},
+        external_stream_backend=backend,
     ):
         # Until killed. There is deliberately no shutdown path here.
         await asyncio.Event().wait()

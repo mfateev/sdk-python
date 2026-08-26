@@ -276,7 +276,7 @@ class CountProbeTokensWorkflow:
     @workflow.run
     async def run(self, expected: int) -> int:
         tokens = external_stream.with_options(idle_timeout=timedelta(seconds=30)).topic(
-            "tokens", backend="tokens-memory", type=str
+            "tokens", type=str
         )
 
         seen = 0
@@ -351,7 +351,7 @@ async def test_a_stream_records_codec_runs_with_the_consuming_workflows_context(
         probe_client,
         task_queue=task_queue,
         workflows=[CountProbeTokensWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         handle = await probe_client.start_workflow(
             CountProbeTokensWorkflow.run,
@@ -397,7 +397,7 @@ async def test_a_stream_records_conversion_runs_with_the_consuming_workflows_con
         probe_client,
         task_queue=task_queue,
         workflows=[CountProbeTokensWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         handle = await probe_client.start_workflow(
             CountProbeTokensWorkflow.run,
@@ -472,7 +472,7 @@ async def test_a_replayed_record_is_prepared_with_the_recorded_streams_context(
         return ReadinessResult.ACCEPTED
 
     manager = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=notify,
         data_converter=DataConverter(payload_codec=ContextRequiredCodec()),
         watch_block=timedelta(milliseconds=10),
@@ -487,7 +487,6 @@ async def test_a_replayed_record_is_prepared_with_the_recorded_streams_context(
                             1: StreamBinding(
                                 stream_key=key,
                                 start_cursor=BEGINNING,
-                                backend_name="tokens",
                                 provider_id=MemoryStreamBackend.provider_id,
                                 provider_format_version=(
                                     MemoryStreamBackend.provider_format_version
@@ -563,7 +562,7 @@ async def test_an_offline_replay_converts_a_record_under_the_recorded_context(
         probe_client,
         task_queue=task_queue,
         workflows=[CountProbeTokensWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         handle = await probe_client.start_workflow(
             CountProbeTokensWorkflow.run,
@@ -598,7 +597,7 @@ async def test_an_offline_replay_converts_a_record_under_the_recorded_context(
     result = await Replayer(
         workflows=[CountProbeTokensWorkflow],
         data_converter=converter,
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ).replay_workflow(history, raise_on_replay_failure=False)
 
     assert result.replay_failure is None, (

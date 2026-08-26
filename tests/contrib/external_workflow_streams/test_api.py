@@ -42,9 +42,8 @@ class FakeRuntime:
     no way to reach one -- because that is the point of the boundary.
     """
 
-    def __init__(self, registered_backends: set[str] | None = None) -> None:
-        self.registered = registered_backends or {"tokens-redis"}
-        self.registrations: list[tuple[int, StreamKey, str]] = []
+    def __init__(self) -> None:
+        self.registrations: list[tuple[int, StreamKey]] = []
         #: `wait_id -> configured idle timeout`, so a test can see that the
         #: value `with_options` was given actually reached the Worker.
         self.idle_timeouts: dict[int, timedelta] = {}
@@ -68,12 +67,9 @@ class FakeRuntime:
         *,
         wait_id: int,
         stream_key: StreamKey,
-        backend_name: str,
         idle_timeout: timedelta,
     ) -> None:
-        if backend_name not in self.registered:
-            raise KeyError(f"no external stream backend named {backend_name!r}")
-        self.registrations.append((wait_id, stream_key, backend_name))
+        self.registrations.append((wait_id, stream_key))
         self.idle_timeouts[wait_id] = idle_timeout
 
     def drain(self, wait_id: int, max_records: int | None = None) -> list[StreamRecord]:
@@ -172,54 +168,33 @@ def test_topics_inherit_their_options(
 ) -> None:
     configured = external_stream.with_options(idle_timeout=timedelta(seconds=3))
 
-    subscription = configured.topic("tokens", backend="tokens-redis").subscribe()
+    subscription = configured.topic("tokens").subscribe()
 
     assert subscription.idle_timeout == timedelta(seconds=3)
 
 
-# --- naming a backend ---------------------------------------------------------
+# --- topics -------------------------------------------------------------------
 
 
-def test_a_workflow_names_a_backend_it_never_imports(runtime: FakeRuntime) -> None:
-    """The criterion, and the reason the boundary exists.
-
-    Nothing here is a provider instance: the Workflow supplies a name, and the
-    Worker resolves it against its own registry, outside the sandbox.
-    """
-    topic = external_stream.topic("tokens", backend="tokens-redis", type=str)
+def test_a_workflow_never_sees_the_configured_backend(runtime: FakeRuntime) -> None:
+    topic = external_stream.topic("tokens", type=str)
 
     subscription = topic.subscribe()
 
     assert isinstance(subscription, ExternalStreamSubscription)
-    assert runtime.registrations == [
-        (1, StreamKey("ns", "wf", "first-run", "tokens"), "tokens-redis")
-    ]
-    assert isinstance(topic.backend_name, str)
+    assert runtime.registrations == [(1, StreamKey("ns", "wf", "first-run", "tokens"))]
 
 
-def test_naming_an_unregistered_backend_fails(
-    runtime: FakeRuntime,  # pyright: ignore[reportUnusedParameter]
-) -> None:
-    with pytest.raises(KeyError, match="no external stream backend"):
-        external_stream.topic("tokens", backend="not-registered").subscribe()
-
-
-@pytest.mark.parametrize(
-    ("name", "backend", "reason"),
-    [("", "tokens-redis", "non-empty name"), ("tokens", "", "names a backend")],
-)
-def test_a_topic_needs_both_a_name_and_a_backend(
-    name: str, backend: str, reason: str
-) -> None:
-    with pytest.raises(ValueError, match=reason):
-        external_stream.topic(name, backend=backend)
+def test_a_topic_needs_a_name() -> None:
+    with pytest.raises(ValueError, match="non-empty name"):
+        external_stream.topic("")
 
 
 def test_subscribing_without_a_configured_worker_says_so(
     workflow_instance: FakeInstance,  # pyright: ignore[reportUnusedParameter]
 ) -> None:
-    with pytest.raises(RuntimeError, match="external_stream_backends"):
-        external_stream.topic("tokens", backend="tokens-redis").subscribe()
+    with pytest.raises(RuntimeError, match="external_stream_backend"):
+        external_stream.topic("tokens").subscribe()
 
 
 # --- wait id assignment -------------------------------------------------------
@@ -228,12 +203,12 @@ def test_subscribing_without_a_configured_worker_says_so(
 def test_wait_ids_are_assigned_from_one_in_subscribe_call_order(
     runtime: FakeRuntime,
 ) -> None:
-    first = external_stream.topic("a", backend="tokens-redis").subscribe()
-    second = external_stream.topic("b", backend="tokens-redis").subscribe()
-    third = external_stream.topic("c", backend="tokens-redis").subscribe()
+    first = external_stream.topic("a").subscribe()
+    second = external_stream.topic("b").subscribe()
+    third = external_stream.topic("c").subscribe()
 
     assert [first.wait_id, second.wait_id, third.wait_id] == [1, 2, 3]
-    assert [wait_id for wait_id, _, _ in runtime.registrations] == [1, 2, 3]
+    assert [wait_id for wait_id, _ in runtime.registrations] == [1, 2, 3]
 
 
 def test_wait_ids_reproduce_across_two_runs_of_the_same_code(
@@ -251,7 +226,7 @@ def test_wait_ids_reproduce_across_two_runs_of_the_same_code(
         monkeypatch.setattr(temporalio.workflow, "instance", lambda: instance)
         _install_runtime(instance, FakeRuntime())
         return [
-            external_stream.topic(name, backend="tokens-redis").subscribe().wait_id
+            external_stream.topic(name).subscribe().wait_id
             for name in ("tokens", "tool-events", "tokens")
         ]
 
@@ -266,14 +241,14 @@ def test_two_subscriptions_to_one_stream_get_distinct_wait_ids(
     Delivery is broadcast, so each sees every record from its own position --
     which is only expressible if they are numbered apart.
     """
-    topic = external_stream.topic("tokens", backend="tokens-redis")
+    topic = external_stream.topic("tokens")
 
     first = topic.subscribe()
     second = topic.subscribe()
 
     assert first.wait_id != second.wait_id
     assert first.stream_key == second.stream_key
-    assert [wait_id for wait_id, _, _ in runtime.registrations] == [1, 2]
+    assert [wait_id for wait_id, _ in runtime.registrations] == [1, 2]
 
 
 def test_a_second_run_restarts_the_counter(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -284,15 +259,13 @@ def test_a_second_run_restarts_the_counter(monkeypatch: pytest.MonkeyPatch) -> N
     first_instance = FakeInstance()
     monkeypatch.setattr(temporalio.workflow, "instance", lambda: first_instance)
     _install_runtime(first_instance, FakeRuntime())
-    external_stream.topic("tokens", backend="tokens-redis").subscribe()
+    external_stream.topic("tokens").subscribe()
 
     second_instance = FakeInstance()
     monkeypatch.setattr(temporalio.workflow, "instance", lambda: second_instance)
     _install_runtime(second_instance, FakeRuntime())
 
-    assert (
-        external_stream.topic("tokens", backend="tokens-redis").subscribe().wait_id == 1
-    )
+    assert external_stream.topic("tokens").subscribe().wait_id == 1
 
 
 # --- iteration ----------------------------------------------------------------
@@ -303,9 +276,7 @@ async def test_iteration_yields_decoded_values_from_the_buffer(
     runtime: FakeRuntime,
 ) -> None:
     codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
-    subscription = external_stream.topic(
-        "tokens", backend="tokens-redis", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
     runtime.buffers[subscription.wait_id] = [
         StreamRecord(RecordKind.DATA, await codec.encode(v), "s", i)
         for i, v in enumerate(["a", "b"])
@@ -324,9 +295,7 @@ async def test_iteration_yields_decoded_values_from_the_buffer(
 async def test_control_records_are_never_yielded(runtime: FakeRuntime) -> None:
     """A fence advances the cursor but is the runtime's, not the Workflow's."""
     codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
-    subscription = external_stream.topic(
-        "tokens", backend="tokens-redis", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
     runtime.buffers[subscription.wait_id] = [
         StreamRecord(RecordKind.DATA, await codec.encode("a"), "s", 0),
         StreamRecord(RecordKind.WRITE_FENCE, b"", "s", 1),
@@ -347,9 +316,7 @@ async def test_an_empty_buffer_blocks_on_a_readiness_future(
     runtime: FakeRuntime,  # pyright: ignore[reportUnusedParameter]
 ) -> None:
     """Iteration never polls the backend; only Core can say when to look again."""
-    subscription = external_stream.topic(
-        "tokens", backend="tokens-redis", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
 
     iterator = subscription.__aiter__()
     pending = asyncio.ensure_future(iterator.__anext__())
@@ -373,9 +340,7 @@ def test_closing_a_subscription_unsubscribes_it(runtime: FakeRuntime) -> None:
     into a buffer nobody will drain, and a park intent still in the backend for
     every producer that asks.
     """
-    subscription = external_stream.topic(
-        "tokens", backend="tokens-redis", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
 
     subscription.close()
 
@@ -408,9 +373,7 @@ async def test_a_second_coroutine_waiting_on_one_subscription_is_refused(
     resolved, and the subscription closed: permanently stuck, with the shared
     blocked flag saying the wait was not even blocked.
     """
-    subscription = external_stream.topic(
-        "tokens", backend="tokens-redis", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
 
     first = asyncio.ensure_future(subscription.__aiter__().__anext__())
     await asyncio.sleep(0.05)
@@ -447,9 +410,7 @@ async def test_iterating_again_after_the_first_consumer_stopped_is_allowed(
     could not tell that shape from two live consumers, and would refuse it.
     """
     codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
-    subscription = external_stream.topic(
-        "tokens", backend="tokens-redis", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
     runtime.buffers[subscription.wait_id] = [
         StreamRecord(RecordKind.DATA, await codec.encode(value), "s", i)
         for i, value in enumerate(["a", "b"])
@@ -476,8 +437,8 @@ async def test_a_merge_cannot_take_a_wait_another_consumer_is_blocked_on(
     half-way would leave its earlier waits blocked with no coroutine behind them
     -- which is the state that asks Core to retain a Workflow Task for nobody.
     """
-    first = external_stream.topic("a", backend="tokens-redis", type=str).subscribe()
-    second = external_stream.topic("b", backend="tokens-redis", type=str).subscribe()
+    first = external_stream.topic("a", type=str).subscribe()
+    second = external_stream.topic("b", type=str).subscribe()
 
     solo = asyncio.ensure_future(second.__aiter__().__anext__())
     await asyncio.sleep(0.05)
@@ -550,9 +511,7 @@ async def test_a_record_buffered_while_not_iterating_is_still_delivered(
     already sitting in front of it.
     """
     codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
-    subscription = external_stream.topic(
-        "tokens", backend="tokens-redis", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
     runtime.buffers[subscription.wait_id] = [
         StreamRecord(RecordKind.DATA, await codec.encode("first"), "s", 0)
     ]
@@ -583,9 +542,7 @@ async def test_a_record_buffered_after_blocking_begins_still_resolves(
     future is what delivers it.
     """
     codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
-    subscription = external_stream.topic(
-        "tokens", backend="tokens-redis", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
 
     iterator = subscription.__aiter__()
     pending = asyncio.ensure_future(iterator.__anext__())
@@ -646,9 +603,7 @@ async def test_decoding_on_the_workflow_thread_cannot_suspend(
     command, or a deadlock timeout can appear.
     """
     codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
-    subscription = external_stream.topic(
-        "tokens", backend="tokens-redis", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
     runtime.buffers[subscription.wait_id] = [
         StreamRecord(RecordKind.DATA, await codec.encode("a"), "s", 0)
     ]
@@ -678,9 +633,7 @@ async def test_a_cancelled_delivery_leaves_the_record_unconsumed(
     successor resumes from.
     """
     codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
-    subscription = external_stream.topic(
-        "tokens", backend="tokens-redis", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
 
     iterator = subscription.__aiter__()
     pending = asyncio.ensure_future(iterator.__anext__())
@@ -718,9 +671,7 @@ async def test_a_failed_decode_leaves_the_record_unconsumed(
     """
     codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
     runtime.codec = FailingCodec()
-    subscription = external_stream.topic(
-        "tokens", backend="tokens-redis", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
     runtime.buffers[subscription.wait_id] = [
         StreamRecord(RecordKind.DATA, await codec.encode("a"), "s", 0)
     ]
@@ -750,9 +701,7 @@ async def test_a_preparation_failure_is_raised_where_the_record_would_arrive(
     otherwise.
     """
     codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
-    subscription = external_stream.topic(
-        "tokens", backend="tokens-redis", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
     runtime.buffers[subscription.wait_id] = [
         PreparedRecord.of(
             StreamRecord(RecordKind.DATA, await codec.encode("a"), "s", 0),
@@ -795,9 +744,7 @@ async def test_an_unprepared_record_is_refused_rather_than_decoded_late(
     runtime.codec = StreamPayloadCodec(
         temporalio.converter.DataConverter(payload_codec=NeverDecodes()), str
     )
-    subscription = external_stream.topic(
-        "tokens", backend="tokens-redis", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
     runtime.buffers[subscription.wait_id] = [
         StreamRecord(RecordKind.DATA, await plain.encode("a"), "s", 0)
     ]

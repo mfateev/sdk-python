@@ -30,7 +30,6 @@ from temporalio.contrib.external_workflow_streams._record import BEGINNING
 from temporalio.worker import Worker
 from tests.contrib.external_workflow_streams.conftest import KEY_NAMESPACE, redis_url
 from tests.contrib.external_workflow_streams.crash_worker import (
-    BACKEND_NAME,
     STREAM_NAME,
     CrashConsumeWorkflow,
     read_log_key,
@@ -199,7 +198,7 @@ async def test_a_crash_before_the_marker_makes_the_next_worker_re_read(
             client,
             task_queue=task_queue,
             workflows=[CrashConsumeWorkflow],
-            external_stream_backends={BACKEND_NAME: successor},
+            external_stream_backend=successor,
         ):
             await _wait_until(
                 lambda: _read_anything(publisher._client, prefix, "successor"),

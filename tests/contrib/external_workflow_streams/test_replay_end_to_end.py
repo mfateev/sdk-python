@@ -70,7 +70,7 @@ class ConditionWorkflow:
     @workflow.run
     async def run(self, expected: int) -> list[int]:
         tokens = external_stream.with_options(idle_timeout=timedelta(seconds=30)).topic(
-            "tokens", backend="tokens-memory", type=str
+            "tokens", type=str
         )
 
         async def watch() -> None:
@@ -108,7 +108,7 @@ class EmptyStreamWorkflow:
     @workflow.run
     async def run(self) -> str:
         tokens = external_stream.with_options(idle_timeout=timedelta(seconds=1)).topic(
-            "tokens", backend="tokens-memory", type=str
+            "tokens", type=str
         )
         subscription = tokens.subscribe()
         iterator = subscription.__aiter__()
@@ -125,7 +125,7 @@ class QuietSubscriptionWorkflow:
 
     @workflow.run
     async def run(self) -> str:
-        external_stream.topic("tokens", backend="tokens-memory", type=str).subscribe()
+        external_stream.topic("tokens", type=str).subscribe()
         return "done"
 
 
@@ -193,7 +193,7 @@ async def test_replaying_a_stream_history_reproduces_the_same_observations(
         client,
         task_queue=task_queue,
         workflows=[ConditionWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         handle = await client.start_workflow(
             ConditionWorkflow.run,
@@ -222,7 +222,7 @@ async def test_replaying_a_stream_history_reproduces_the_same_observations(
 
     replayer = Replayer(
         workflows=[ConditionWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     )
     result = await replayer.replay_workflow(history)
 
@@ -254,13 +254,13 @@ async def test_replaying_a_stream_history_reproduces_the_same_observations(
     )
 
 
-async def test_a_history_with_stream_markers_needs_its_backends_to_replay(
+async def test_a_history_with_stream_markers_needs_its_backend_to_replay(
     client: Client, backend: MemoryStreamBackend
 ) -> None:
     """Replay re-reads the recorded ranges, so it needs the provider.
 
     Without the option there is no way to supply one, and the replay fails the
-    way a Worker with no backends would -- correct, but a configuration error
+    way a Worker with no backend would -- correct, but a configuration error
     rather than a finding about the history. Asserted so the option cannot
     quietly stop being threaded through.
     """
@@ -269,7 +269,7 @@ async def test_a_history_with_stream_markers_needs_its_backends_to_replay(
         client,
         task_queue=task_queue,
         workflows=[ConditionWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         handle = await client.start_workflow(
             ConditionWorkflow.run,
@@ -288,7 +288,7 @@ async def test_a_history_with_stream_markers_needs_its_backends_to_replay(
     )
 
     assert without.replay_failure is not None
-    assert "external_stream_backends" in str(without.replay_failure), (
+    assert "external_stream_backend" in str(without.replay_failure), (
         "the failure must name the missing option rather than surface as an "
         f"attribute error: {without.replay_failure}"
     )
@@ -302,7 +302,7 @@ async def test_a_no_backend_replayer_validates_a_removed_quiet_subscription(
     A quiet subscription still writes its binding into the marker. The next
     Workflow version removes the only ``subscribe()`` call while leaving its
     ordinary Temporal command sequence unchanged, and the Replayer deliberately
-    has no backend mapping. It must still decode the marker and apply the reverse
+    has no backend configured. It must still decode the marker and apply the reverse
     binding check rather than accepting the history because no live stream
     runtime happened to be configured.
     """
@@ -311,7 +311,7 @@ async def test_a_no_backend_replayer_validates_a_removed_quiet_subscription(
         client,
         task_queue=task_queue,
         workflows=[QuietSubscriptionWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         handle = await client.start_workflow(
             QuietSubscriptionWorkflow.run,
@@ -335,7 +335,7 @@ async def test_a_no_backend_replayer_validates_a_removed_quiet_subscription(
 
     assert result.replay_failure is not None, (
         "removing the recorded subscription replayed successfully when the "
-        "Replayer had no backend registry"
+        "Replayer had no backend configured"
     )
     assert "never created" in str(result.replay_failure), (
         "the marker's reverse binding check did not report the removed quiet "
@@ -358,7 +358,7 @@ async def test_an_empty_stream_replays_from_its_recorded_boundary(
         client,
         task_queue=task_queue,
         workflows=[EmptyStreamWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         handle = await client.start_workflow(
             EmptyStreamWorkflow.run,
@@ -376,7 +376,7 @@ async def test_an_empty_stream_replays_from_its_recorded_boundary(
 
     result = await Replayer(
         workflows=[EmptyStreamWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ).replay_workflow(history, raise_on_replay_failure=False)
 
     assert result.replay_failure is None, (
@@ -416,7 +416,7 @@ class EmptyStreamParkWorkflow:
             workflow.unsafe.is_replaying()
         )
         tokens = external_stream.with_options(idle_timeout=timedelta(seconds=1)).topic(
-            "tokens", backend="tokens-memory", type=str
+            "tokens", type=str
         )
         async for token in tokens.subscribe():
             self._seen.append(token)
@@ -759,7 +759,7 @@ async def test_an_empty_stream_parked_and_evicted_replays_from_the_recorded_curs
         client,
         task_queue=task_queue,
         workflows=[EmptyStreamParkWorkflow, CacheFillerWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
         # One slot, so running anything else evicts the Run under test.
         max_cached_workflows=1,
         max_concurrent_workflow_tasks=2,
@@ -935,7 +935,7 @@ async def test_an_empty_stream_parked_and_evicted_replays_from_the_recorded_curs
     await publish(backend, key, ["late-one", "late-two"])
     against_live = await Replayer(
         workflows=[EmptyStreamParkWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ).replay_workflow(history, raise_on_replay_failure=False)
     assert against_live.replay_failure is None, (
         f"replaying the history the Worker wrote failed: {against_live.replay_failure}"
@@ -950,7 +950,7 @@ async def test_an_empty_stream_parked_and_evicted_replays_from_the_recorded_curs
     recorded_only = RecordedRangesOnlyBackend(backend, late)
     against_recorded = await Replayer(
         workflows=[EmptyStreamParkWorkflow],
-        external_stream_backends={"tokens-memory": recorded_only},
+        external_stream_backend=recorded_only,
     ).replay_workflow(history, raise_on_replay_failure=False)
     assert against_recorded.replay_failure is None, (
         "replay could not reproduce the Run from the ranges its markers name, "

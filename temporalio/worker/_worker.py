@@ -152,8 +152,7 @@ class Worker:
         ),
         disable_payload_error_limit: bool = False,
         max_workflow_task_external_storage_concurrency: int = _DEFAULT_WORKFLOW_TASK_EXTERNAL_STORAGE_CONCURRENCY,
-        external_stream_backends: Mapping[str, Any] | None = None,
-        external_stream_continuation_schema_version: int | None = None,
+        external_stream_backend: Any | None = None,
     ) -> None:
         """Create a worker to process workflows and/or activities.
 
@@ -279,31 +278,13 @@ class Worker:
             graceful_shutdown_timeout: Amount of time after shutdown is called
                 that activities are given to complete before their tasks are
                 cancelled.
-            external_stream_backends: Named External Workflow Stream provider
-                instances, referenced from Workflow code by name only. Every
-                provider must declare ``guarantees_immutability = True``;
+            external_stream_backend: External Workflow Stream provider instance.
+                The provider must declare ``guarantees_immutability = True``;
                 Worker construction fails otherwise.
 
                 .. warning::
                     This option is experimental and the feature it configures
                     is incomplete.
-            external_stream_continuation_schema_version: Schema version this
-                Worker writes into an External Workflow Stream Continue-As-New
-                header. ``None`` uses the version this SDK release ships as its
-                deployment stage, which is the reader-only stage: it decodes
-                every version it knows while writing the oldest one any
-                previously released Worker can read. Set this to 2 only after
-                every Worker that may receive the successor Run can decode
-                version 2, or when Worker Versioning guarantees that a
-                version-1-only Worker cannot receive it. Version 2 carries the
-                backend/provider binding and is required to detect a cursor
-                being restored into a different store. A chain that has already
-                received a version-2 header remains on version 2 even when this
-                setting is 1; must-understand binding data is never downgraded.
-
-                .. warning::
-                    This option is experimental and exists only to stage the
-                    continuation format transition safely.
             workflow_failure_exception_types: The types of exceptions that, if a
                 workflow-thrown exception extends, will cause the
                 workflow/update to fail instead of suspending the workflow via
@@ -419,10 +400,7 @@ class Worker:
             nexus_task_poller_behavior=nexus_task_poller_behavior,
             disable_payload_error_limit=disable_payload_error_limit,
             max_workflow_task_external_storage_concurrency=max_workflow_task_external_storage_concurrency,
-            external_stream_backends=external_stream_backends,
-            external_stream_continuation_schema_version=(
-                external_stream_continuation_schema_version
-            ),
+            external_stream_backend=external_stream_backend,
         )
 
         plugins_from_client = cast(
@@ -449,38 +427,17 @@ class Worker:
         """
         self._config = config
 
-        # Named external stream backends. Validated here rather than lazily so
+        # The external stream backend is validated here rather than lazily so
         # that a provider which cannot guarantee record immutability fails
-        # Worker construction, before any Workflow can name it -- not at
-        # replay, after data has been consumed against it.
-        self._external_stream_backends = None
-        raw_backends = config.get("external_stream_backends")
-        if raw_backends:
-            from temporalio.contrib.external_workflow_streams._registry import (
-                ExternalStreamBackendRegistry,
+        # Worker construction, before any Workflow can consume through it.
+        self._external_stream_backend = config.get("external_stream_backend")
+        if self._external_stream_backend is not None:
+            from temporalio.contrib.external_workflow_streams._backend import (
+                _validate_backend,
             )
 
-            self._external_stream_backends = ExternalStreamBackendRegistry(raw_backends)
-
-        # Validated here for the same reason the backends above are: a version
-        # this Worker could not also read has to fail Worker construction rather
-        # than the first Continue-As-New that tries to write it. `None` means
-        # "whatever stage this release ships", which `_WorkflowWorker` resolves
-        # against the one constant that holds it -- left unresolved here so
-        # Worker construction alone does not import the continuation module.
-        # The validation runtime resolves it when a Run starts so reserved
-        # continuation headers cannot be skipped by a Worker whose current code
-        # and configuration no longer use streams.
-        external_stream_continuation_schema_version = config.get(
-            "external_stream_continuation_schema_version"
-        )
-        if external_stream_continuation_schema_version is not None:
-            from temporalio.contrib.external_workflow_streams._continuation import (
-                _validate_continuation_schema_version,
-            )
-
-            _validate_continuation_schema_version(
-                external_stream_continuation_schema_version
+            self._external_stream_backend = _validate_backend(
+                self._external_stream_backend
             )
 
         if not (
@@ -632,10 +589,7 @@ class Worker:
                 encode_headers=client_config["header_codec_behavior"]
                 != HeaderCodecBehavior.NO_CODEC,
                 max_workflow_task_external_storage_concurrency=max_workflow_task_external_storage_concurrency,
-                external_stream_backends=self._external_stream_backends,
-                external_stream_continuation_schema_version=(
-                    external_stream_continuation_schema_version
-                ),
+                external_stream_backend=self._external_stream_backend,
             )
 
         tuner = config.get("tuner")
@@ -1122,8 +1076,7 @@ class WorkerConfig(TypedDict, total=False):
     nexus_task_poller_behavior: PollerBehavior
     disable_payload_error_limit: bool
     max_workflow_task_external_storage_concurrency: int
-    external_stream_backends: Mapping[str, Any] | None
-    external_stream_continuation_schema_version: int | None
+    external_stream_backend: Any | None
 
 
 def _warn_if_activity_executor_max_workers_is_inconsistent(

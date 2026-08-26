@@ -54,7 +54,7 @@ def backend() -> MemoryStreamBackend:
 @pytest_asyncio.fixture  # type: ignore[reportUntypedFunctionDecorator]
 async def manager(backend: MemoryStreamBackend):
     mgr = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=_notify,
         watch_block=timedelta(milliseconds=10),
     )
@@ -65,7 +65,7 @@ async def manager(backend: MemoryStreamBackend):
 def make_runtime(manager, backend, continuation=None):  # type: ignore[no-untyped-def]
     return WorkflowStreamRuntime(
         manager=manager,
-        backends={"tokens": backend},
+        backend=backend,
         run_id=RUN_ID,
         namespace="ns",
         workflow_id="wf",
@@ -99,7 +99,6 @@ async def test_readiness_on_one_of_several_streams_resets_global_quiescence(
         runtime.register(
             wait_id=wait_id,
             stream_key=runtime.stream_key(name),
-            backend_name="tokens",
         )
         runtime.note_blocked(wait_id, True)
     before = {w.wait_id: w.generation for w in runtime.quiescent_snapshot()}  # type: ignore[union-attr]
@@ -140,7 +139,6 @@ async def test_an_alternating_two_stream_batch_rolls_over_within_budget(
         runtime.register(
             wait_id=wait_id,
             stream_key=runtime.stream_key(name),
-            backend_name="tokens",
         )
 
     delivered = 0
@@ -186,7 +184,6 @@ async def test_simultaneously_ready_streams_are_drained_in_one_pass(
             run_id=RUN_ID,
             wait_id=wait_id,
             stream_key=key,
-            backend_name="tokens",
             start_cursor=BEGINNING,
         )
     await backend.append(
@@ -247,10 +244,12 @@ async def test_two_same_stream_subscriptions_never_overwrite_each_other(
         Continuation(
             {1: AFTER(Offset("10-0")), 2: AFTER(Offset("90-0"))},
             {1: "tokens", 2: "tokens"},
+            {1: "memory", 2: "memory"},
+            {1: 1, 2: 1},
         ),
     )
-    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
-    runtime.register(wait_id=2, stream_key=key, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=key)
+    runtime.register(wait_id=2, stream_key=key)
     assert runtime._subscriptions[1].start_cursor == AFTER(Offset("10-0"))
     assert runtime._subscriptions[2].start_cursor == AFTER(Offset("90-0"))
 
@@ -277,7 +276,6 @@ async def test_the_idle_timeout_reduction_reproduces_exactly(
             runtime.register(
                 wait_id=wait_id,
                 stream_key=runtime.stream_key(f"s{wait_id}"),
-                backend_name="tokens",
                 idle_timeout=timedelta(seconds=wait_id),
             )
             runtime.note_blocked(wait_id, True)
@@ -309,7 +307,6 @@ async def test_a_wake_for_one_stream_resolves_every_blocked_wait(
         runtime.register(
             wait_id=wait_id,
             stream_key=runtime.stream_key(name),
-            backend_name="tokens",
         )
         runtime.note_blocked(wait_id, True)
         future: asyncio.Future[None] = loop.create_future()
@@ -334,9 +331,7 @@ async def test_resolving_twice_is_harmless(
     request but a stale Signal can still arrive alongside a live one.
     """
     runtime = make_runtime(manager, backend)
-    runtime.register(
-        wait_id=1, stream_key=runtime.stream_key("a"), backend_name="tokens"
-    )
+    runtime.register(wait_id=1, stream_key=runtime.stream_key("a"))
     future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
     runtime.register_pending(1, future)
 

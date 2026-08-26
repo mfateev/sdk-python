@@ -60,7 +60,7 @@ class Harness:
         self.wakes: list[tuple[str, int]] = []
         self.metric: list[str] = []
         self.manager = StreamSubscriptionManager(
-            backends={"tokens": backend},
+            backend=backend,
             notify_ready=self._notify,
             send_wake=self._wake,
             run_status=self._probe,
@@ -94,7 +94,6 @@ class Harness:
             run_id=RUN_ID,
             wait_id=wait_id,
             stream_key=key,
-            backend_name="tokens",
             start_cursor=BEGINNING,
         )
         return key
@@ -286,7 +285,7 @@ async def test_a_wake_with_no_sender_configured_is_reported_not_ignored(
 ) -> None:
     """Silently skipping it would report a clean shutdown that lost a record."""
     manager = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=lambda *_: _accepted(),
         run_status=lambda _: _no_open_task(),
         watch_block=timedelta(milliseconds=10),
@@ -295,7 +294,6 @@ async def test_a_wake_with_no_sender_configured_is_reported_not_ignored(
         run_id=RUN_ID,
         wait_id=1,
         stream_key=StreamKey("ns", "wf", "first-run", "tokens"),
-        backend_name="tokens",
         start_cursor=BEGINNING,
     )
 
@@ -324,7 +322,7 @@ async def test_a_probe_failure_does_not_stop_the_shutdown(
         raise ConnectionError("service unavailable")
 
     manager = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=lambda *_: _accepted(),
         run_status=failing_probe,
         watch_block=timedelta(milliseconds=10),
@@ -333,7 +331,6 @@ async def test_a_probe_failure_does_not_stop_the_shutdown(
         run_id=RUN_ID,
         wait_id=1,
         stream_key=StreamKey("ns", "wf", "first-run", "tokens"),
-        backend_name="tokens",
         start_cursor=BEGINNING,
     )
 
@@ -361,7 +358,7 @@ async def test_shutdown_is_never_blocked_past_the_grace_period(
         return RunStatus.NO_OPEN_WORKFLOW_TASK
 
     manager = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=lambda *_: _accepted(),
         run_status=hanging_probe,
         watch_block=timedelta(milliseconds=10),
@@ -370,7 +367,6 @@ async def test_shutdown_is_never_blocked_past_the_grace_period(
         run_id=RUN_ID,
         wait_id=1,
         stream_key=StreamKey("ns", "wf", "first-run", "tokens"),
-        backend_name="tokens",
         start_cursor=BEGINNING,
     )
 
@@ -409,7 +405,6 @@ async def test_a_grace_period_expiry_counts_every_wake_it_abandons(
             run_id=RUN_ID,
             wait_id=wait_id,
             stream_key=StreamKey("ns", "wf", "first-run", f"tokens-{wait_id}"),
-            backend_name="tokens",
             start_cursor=BEGINNING,
         )
 
@@ -454,7 +449,6 @@ async def test_a_probe_that_cannot_answer_is_not_reported_as_nothing_owed(
             run_id=RUN_ID,
             wait_id=wait_id,
             stream_key=StreamKey("ns", "wf", "first-run", f"tokens-{wait_id}"),
-            backend_name="tokens",
             start_cursor=BEGINNING,
         )
 
@@ -486,7 +480,6 @@ async def test_a_hanging_probe_counts_the_runs_it_never_answered_for(
         run_id=RUN_ID,
         wait_id=1,
         stream_key=StreamKey("ns", "wf", "first-run", "tokens-1"),
-        backend_name="tokens",
         start_cursor=BEGINNING,
     )
 
@@ -514,7 +507,6 @@ async def test_a_run_with_nothing_owed_is_not_counted_as_a_failure(
             run_id=RUN_ID,
             wait_id=1,
             stream_key=StreamKey("ns", "wf", "first-run", "tokens"),
-            backend_name="tokens",
             start_cursor=BEGINNING,
         )
 
@@ -546,7 +538,6 @@ async def test_a_wake_the_live_path_delivered_is_not_counted_as_abandoned(
             run_id=run_id,
             wait_id=1,
             stream_key=StreamKey("ns", "wf", run_id, "tokens"),
-            backend_name="tokens",
             start_cursor=BEGINNING,
         )
 
@@ -593,7 +584,7 @@ async def test_a_manager_with_no_probe_owes_nothing_and_reports_nothing(
     operator is expected to alert on.
     """
     manager = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=lambda *_: _accepted(),
         watch_block=timedelta(milliseconds=10),
     )
@@ -601,7 +592,6 @@ async def test_a_manager_with_no_probe_owes_nothing_and_reports_nothing(
         run_id=RUN_ID,
         wait_id=1,
         stream_key=StreamKey("ns", "wf", "first-run", "tokens"),
-        backend_name="tokens",
         start_cursor=BEGINNING,
     )
 

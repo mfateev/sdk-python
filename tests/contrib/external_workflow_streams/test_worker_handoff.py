@@ -90,7 +90,7 @@ class TimerThenStreamWorkflow:
     async def run(self, expected: int) -> list[str]:
         tokens = external_stream.with_options(
             idle_timeout=RETENTION_IDLE_TIMEOUT
-        ).topic("tokens", backend="tokens-memory", type=str)
+        ).topic("tokens", type=str)
         seen: list[str] = []
         iterator = tokens.subscribe().__aiter__()
         seen.append(await iterator.__anext__())
@@ -125,7 +125,7 @@ class LeftWithNoOpenTaskWorkflow:
 
     @workflow.run
     async def run(self, expected: int) -> list[str]:
-        tokens = external_stream.topic("tokens", backend="tokens-memory", type=str)
+        tokens = external_stream.topic("tokens", type=str)
         seen: list[str] = []
         iterator = tokens.subscribe().__aiter__()
         seen.append(await iterator.__anext__())
@@ -294,7 +294,7 @@ async def test_shutdown_with_no_open_task_hands_the_run_to_another_worker(
         client,
         task_queue=task_queue,
         workflows=[LeftWithNoOpenTaskWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     )
     worker_a_task = asyncio.create_task(worker_a.run())
     handle = None
@@ -394,7 +394,7 @@ async def test_shutdown_with_no_open_task_hands_the_run_to_another_worker(
             client,
             task_queue=task_queue,
             workflows=[LeftWithNoOpenTaskWorkflow],
-            external_stream_backends={"tokens-memory": backend},
+            external_stream_backend=backend,
         ):
             # Published after the handover, so delivering it proves the second
             # Worker rebuilt a live subscription rather than replaying one.
@@ -479,7 +479,7 @@ async def _leave_a_run_in_the_window(
         client,
         task_queue=task_queue,
         workflows=[LeftWithNoOpenTaskWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     )
     worker_task = asyncio.create_task(worker.run())
     handle = await client.start_workflow(
@@ -679,7 +679,7 @@ async def test_a_finalization_that_cannot_be_answered_writes_no_marker(
         client,
         task_queue=task_queue,
         workflows=[TimerThenStreamWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     )
     worker_a_task = asyncio.create_task(worker_a.run())
     shutdown_task = None
@@ -823,7 +823,7 @@ async def test_a_finalization_that_cannot_be_answered_writes_no_marker(
             client,
             task_queue=task_queue,
             workflows=[TimerThenStreamWorkflow],
-            external_stream_backends={"tokens-memory": backend},
+            external_stream_backend=backend,
         ):
             await publish(backend, key, values[3:], session=session)
             result = await asyncio.wait_for(handle.result(), 90)
@@ -873,7 +873,7 @@ def _manager_for(backend: MemoryStreamBackend) -> StreamSubscriptionManager:
         return ReadinessResult.ACCEPTED
 
     return StreamSubscriptionManager(
-        backends={"tokens-memory": backend},
+        backend=backend,
         notify_ready=accepted,
         watch_block=timedelta(milliseconds=10),
     )
@@ -907,9 +907,7 @@ async def test_a_park_intent_installed_by_a_previous_worker_is_removed(
     key = StreamKey("ns", "wf", "first-run", "tokens")
 
     worker_a = _manager_for(backend)
-    worker_a.register(
-        run_id=HANDOFF_RUN_ID, wait_id=1, stream_key=key, backend_name="tokens-memory"
-    )
+    worker_a.register(run_id=HANDOFF_RUN_ID, wait_id=1, stream_key=key)
     confirmed = not await worker_a.prepare_park(HANDOFF_RUN_ID, 7, {1: BEGINNING})
     assert confirmed, "nothing was appended, so this park must have confirmed"
     await worker_a.shutdown()
@@ -926,7 +924,6 @@ async def test_a_park_intent_installed_by_a_previous_worker_is_removed(
             run_id=HANDOFF_RUN_ID,
             wait_id=1,
             stream_key=key,
-            backend_name="tokens-memory",
         )
 
         await wait_until(

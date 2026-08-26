@@ -702,7 +702,7 @@ class StreamSubscriptionManager:
     def __init__(
         self,
         *,
-        backends: Mapping[str, StreamBackend],
+        backend: StreamBackend | None,
         notify_ready: ReadinessNotifier,
         send_wake: WakeSender | None = None,
         run_status: Callable[[str], Awaitable[Any]] | None = None,
@@ -712,8 +712,8 @@ class StreamSubscriptionManager:
         buffer_size: int = DEFAULT_BUFFER_SIZE,
         watch_block: timedelta = DEFAULT_WATCH_BLOCK,
     ) -> None:
-        """Create a manager for the external stream providers on one Worker."""
-        self._backends = backends
+        """Create a manager for the external stream backend on one Worker."""
+        self._backend = backend
         #: The Worker's own converter, used for the **asynchronous half** of
         #: decoding only -- retrieval and codec, never the payload converter,
         #: which needs a type only Workflow code knows. Optional so a manager
@@ -811,7 +811,6 @@ class StreamSubscriptionManager:
         run_id: str,
         wait_id: int,
         stream_key: StreamKey,
-        backend_name: str,
         start_cursor: Cursor = BEGINNING,
     ) -> Subscription:
         """Registers a wait and starts its watcher. Non-blocking.
@@ -819,7 +818,12 @@ class StreamSubscriptionManager:
         Called from the Workflow thread, so it must not await: the watcher task
         is scheduled onto the manager's loop rather than started here.
         """
-        backend = self._backends[backend_name]
+        backend = self._backend
+        if backend is None:
+            raise RuntimeError(
+                "external streams are not configured on this Worker; pass "
+                "external_stream_backend=... to the Worker"
+            )
         subscription = Subscription(
             run_id=run_id,
             wait_id=wait_id,
@@ -2205,8 +2209,8 @@ class StreamSubscriptionManager:
 
         Subscriptions may not exist yet: on replay the Workflow has not run far
         enough to call ``subscribe()``. The annotation's own header carries the
-        stream key, the backend name, and the provider identity for each wait,
-        which is why it records them.
+        stream key and configured provider identity for each wait, which is why
+        it records them.
         """
         from temporalio.contrib.external_workflow_streams._annotation import (
             decode_annotation,
@@ -2255,47 +2259,32 @@ class StreamSubscriptionManager:
     ) -> StreamBackend | None:
         """The one backend a recorded wait may be read from.
 
-        Selection is by the **name the Workflow itself named**, never by a
-        search for something that declares the recorded provider id. A provider
-        id names an implementation, not a store: two Redis instances -- separate
-        clusters, or one cluster with separate key prefixes -- declare the same
-        id and hold entirely different records, so picking the first match reads
-        one wait's recorded range out of a store that never held it. That does
-        not fail cleanly either; the range simply is not there, and it surfaces
-        as integrity loss against a backend nothing is wrong with.
-
-        Returning ``None`` leaves the wait unresolved, which
-        :func:`build_replay_plan` reports as nondeterminism if the annotation
-        recorded any records for it. That is the right reading of a name the
-        Workflow no longer subscribes: the name is Workflow code.
+        Returning ``None`` leaves the wait unresolved when no backend is
+        configured; :func:`build_replay_plan` then reports any recorded ranges
+        that cannot be read.
         """
-        backend = self._backends.get(binding.backend_name)
+        backend = self._backend
         if backend is None:
             return None
 
-        # Whether the name still resolves to the *same implementation* is a
-        # deployment question, not a Workflow one: the Workflow is unchanged and
-        # the backend is undamaged, so neither nondeterminism nor integrity loss
-        # describes it. It is reported as a storage failure -- retried, and it
-        # clears when a Worker carrying the recorded implementation picks the
-        # task up -- and it is raised before any read, so an incompatible
-        # implementation never gets to interpret the recorded offsets at all.
+        # Whether the Worker still carries the same implementation is a
+        # deployment question, not a Workflow one. It is raised before any read,
+        # so an incompatible implementation never interprets recorded offsets.
         declared_id = type(backend).provider_id
         if declared_id != binding.provider_id:
             raise StreamStorageError(
                 f"external stream wait {wait_id} was recorded against provider "
-                f"{binding.provider_id!r}, but the backend registered on this "
-                f"Worker as {binding.backend_name!r} declares {declared_id!r}. "
-                "This Worker cannot read what that marker recorded; register the "
-                "recorded provider under that name."
+                f"{binding.provider_id!r}, but the backend configured on this "
+                f"Worker declares {declared_id!r}. This Worker cannot read what "
+                "that marker recorded; configure the recorded provider."
             )
         declared_version = type(backend).provider_format_version
         if declared_version != binding.provider_format_version:
             raise StreamStorageError(
                 f"external stream wait {wait_id} was recorded by provider "
                 f"{binding.provider_id!r} format version "
-                f"{binding.provider_format_version}, but the backend registered "
-                f"as {binding.backend_name!r} implements format version "
+                f"{binding.provider_format_version}, but the configured backend "
+                f"implements format version "
                 f"{declared_version}. Reading it would interpret the recorded "
                 "offsets under a format they were not written in."
             )

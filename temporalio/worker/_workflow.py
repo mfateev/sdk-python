@@ -106,9 +106,8 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         assert_local_activity_valid: Callable[[str], None],
         encode_headers: bool,
         max_workflow_task_external_storage_concurrency: int,
-        external_stream_continuation_schema_version: int | None = None,
         default_workflow_logic_flags: frozenset[_WorkflowLogicFlag] | None = None,
-        external_stream_backends: Mapping[str, Any] | None = None,
+        external_stream_backend: Any | None = None,
         client: Any = None,
     ) -> None:
         # Debug mode is enabled if specified or if the TEMPORAL_DEBUG env var is truthy
@@ -169,23 +168,18 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             )
         )
 
-        # External Workflow Streams. The manager is per-Worker and owns every
-        # backend connection and watcher task; it is created lazily on the
+        # External Workflow Streams. The manager is per-Worker and owns the
+        # backend connection and watcher tasks; it is created lazily on the
         # Worker's own event loop because that is the loop the watchers must run
         # on, and __init__ is not necessarily called from it.
-        # The runtime exists even when this mapping is empty. Recorded stream
+        # The runtime exists even when no backend is configured. Recorded stream
         # state comes from History, so replay annotations and continuation
         # headers must be decoded and validated independently of whether this
         # Worker can create a new live subscription. Workflow code still sees
         # the feature as unconfigured through `external_streams_configured` in
         # its instance details below.
-        self._external_stream_backends: Mapping[str, Any] = (
-            external_stream_backends or {}
-        )
-        self._external_streams_configured = bool(external_stream_backends)
-        self._external_stream_continuation_schema_version = (
-            external_stream_continuation_schema_version
-        )
+        self._external_stream_backend = external_stream_backend
+        self._external_streams_configured = external_stream_backend is not None
         #: Held only to send the reserved wake Signal, which is a raw service
         #: call rather than anything the bridge can do -- Core cannot signal a
         #: Workflow on this Worker's behalf.
@@ -594,7 +588,7 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         # runtime-only job, or raised on the Workflow thread by a delivery and
         # already turned into a failure by `activate()` -- and both must carry
         # the same cause and increment the same counter.
-        if self._external_stream_backends and completion.HasField("failed"):
+        if self._external_stream_backend is not None and completion.HasField("failed"):
             try:
                 self._note_external_stream_failure(completion)
             except Exception:
@@ -1100,7 +1094,7 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             )
 
             self._external_stream_manager = StreamSubscriptionManager(
-                backends=self._external_stream_backends,
+                backend=self._external_stream_backend,
                 # The Worker's converter, for the **asynchronous half** of
                 # decoding a record: external-payload retrieval and the user's
                 # PayloadCodec. Both are arbitrary asynchronous work and neither
@@ -1304,7 +1298,6 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             DEFAULT_IDLE_TIMEOUT,
         )
         from temporalio.contrib.external_workflow_streams._continuation import (
-            _DEFAULT_CONTINUATION_WRITE_SCHEMA_VERSION,
             read_continuation_header,
         )
         from temporalio.contrib.external_workflow_streams._runtime import (
@@ -1327,12 +1320,12 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             raise RuntimeError(
                 "Workflow History contains external stream continuation state, "
                 "but external streams are not configured on this Worker; pass "
-                "external_stream_backends={...} to the Worker"
+                "external_stream_backend=... to the Worker"
             )
 
         return WorkflowStreamRuntime(
             manager=self._stream_manager(),
-            backends=self._external_stream_backends,
+            backend=self._external_stream_backend,
             run_id=act.run_id,
             namespace=self._namespace,
             workflow_id=init.workflow_id,
@@ -1364,14 +1357,6 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
                 )
             ),
             default_idle_timeout=DEFAULT_IDLE_TIMEOUT,
-            # Resolved against the constant rather than against a literal, so
-            # moving the release's deployment stage is the one edit ADR-039 says
-            # it is instead of three that can disagree.
-            continuation_schema_version=(
-                self._external_stream_continuation_schema_version
-                if self._external_stream_continuation_schema_version is not None
-                else _DEFAULT_CONTINUATION_WRITE_SCHEMA_VERSION
-            ),
             # Read here, before the Workflow object exists and therefore before
             # any subscribe() call: a start cursor restored after a subscription
             # was established would already have been overwritten by BEGINNING

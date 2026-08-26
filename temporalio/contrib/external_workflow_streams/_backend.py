@@ -161,8 +161,8 @@ class ParkIntentRemoval(enum.Enum):
 class StreamBackend(abc.ABC):
     """A stream provider.
 
-    Instances live **outside** the Workflow sandbox, on the Worker, and are
-    named from Workflow code rather than imported into it.
+    Instances live **outside** the Workflow sandbox, on the Worker. Workflow
+    code never imports or holds the configured instance.
     """
 
     guarantees_immutability: ClassVar[bool | None] = None
@@ -398,3 +398,31 @@ class StreamBackend(abc.ABC):
     def strictly_increasing(self, offsets: list[Offset]) -> bool:
         """Whether ``offsets`` ascend under this provider's ordering rule."""
         return all(self.compare_offsets(a, b) < 0 for a, b in zip(offsets, offsets[1:]))
+
+
+def _validate_backend(backend: object) -> StreamBackend:
+    """Validate the backend before a Worker can consume through it."""
+    if not isinstance(backend, StreamBackend):
+        raise TypeError(
+            f"external stream backend is a {type(backend).__name__}, which is not "
+            f"a {StreamBackend.__name__}"
+        )
+
+    declared = type(backend).guarantees_immutability
+    if declared is not True:
+        raise ValueError(
+            f"external stream backend {type(backend).__name__} declares "
+            f"guarantees_immutability = {declared!r}. Configuration requires True: "
+            "the provider must guarantee that a record's bytes cannot change "
+            "once written, because replay validates presence, count, order, and "
+            "control positions only. A provider that cannot make that guarantee "
+            "does not satisfy the backend contract."
+        )
+
+    if not type(backend).provider_id:
+        raise ValueError(
+            f"external stream backend {type(backend).__name__} declares no "
+            "provider_id; every replay annotation header records it, so replay "
+            "could not verify which provider wrote a marker"
+        )
+    return backend

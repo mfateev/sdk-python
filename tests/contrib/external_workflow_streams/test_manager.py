@@ -73,7 +73,7 @@ def make_manager(
     send_wake: object | None = None,
 ) -> StreamSubscriptionManager:
     return StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=notifier,
         send_wake=send_wake,  # type: ignore[arg-type]
         buffer_size=buffer_size,
@@ -129,9 +129,7 @@ async def test_readiness_is_reported_only_after_a_record_is_buffered(
     backend = MemoryStreamBackend()
     notifier = RecordingNotifier()
     manager = make_manager(backend, notifier)
-    subscription = manager.register(
-        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-    )
+    subscription = manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
     try:
         await asyncio.sleep(0.05)
         assert notifier.calls == [], "nothing is buffered, so nothing is ready"
@@ -154,9 +152,7 @@ async def test_a_drain_returns_buffered_records_without_touching_the_backend(
     backend = MemoryStreamBackend()
     notifier = RecordingNotifier()
     manager = make_manager(backend, notifier)
-    manager.register(
-        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-    )
+    manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
     try:
         await append(backend, stream_key, b"a", b"b")
         await asyncio.wait_for(notifier.notified.wait(), 2)
@@ -179,9 +175,7 @@ async def test_draining_advances_only_the_delivery_cursor(
     backend = MemoryStreamBackend()
     notifier = RecordingNotifier()
     manager = make_manager(backend, notifier)
-    subscription = manager.register(
-        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-    )
+    subscription = manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
     try:
         await append(backend, stream_key, b"a")
         await asyncio.wait_for(notifier.notified.wait(), 2)
@@ -222,9 +216,7 @@ async def test_a_backend_slower_than_the_deadlock_timeout_delays_readiness(
     backend = SlowBackend()
     notifier = RecordingNotifier()
     manager = make_manager(backend, notifier, watch_block=timedelta(milliseconds=20))
-    manager.register(
-        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-    )
+    manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
     try:
         await append(backend, stream_key, b"a")
 
@@ -257,9 +249,7 @@ async def test_a_full_buffer_stops_prefetch_without_dropping_or_blocking(
     backend = MemoryStreamBackend()
     notifier = RecordingNotifier()
     manager = make_manager(backend, notifier, buffer_size=3)
-    subscription = manager.register(
-        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-    )
+    subscription = manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
     try:
         await append(backend, stream_key, *[bytes([i]) for i in range(10)])
         await asyncio.sleep(0.2)
@@ -323,9 +313,7 @@ async def test_the_provider_is_never_called_from_the_workflow_thread(
     backend = ThreadCheckingBackend()
     notifier = RecordingNotifier()
     manager = make_manager(backend, notifier)
-    manager.register(
-        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-    )
+    manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
     try:
         await append(backend, stream_key, b"a", b"b")
         await asyncio.wait_for(notifier.notified.wait(), 2)
@@ -363,9 +351,7 @@ async def test_eviction_discards_prefetch_state_and_restarts_from_committed(
     backend = MemoryStreamBackend()
     notifier = RecordingNotifier()
     manager = make_manager(backend, notifier)
-    subscription = manager.register(
-        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-    )
+    subscription = manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
     await append(backend, stream_key, b"a", b"b", b"c")
     await asyncio.wait_for(notifier.notified.wait(), 2)
     manager.drain(RUN_ID, 1, max_records=1)
@@ -388,9 +374,7 @@ async def test_a_committed_cursor_is_where_a_restart_resumes(
     backend = MemoryStreamBackend()
     notifier = RecordingNotifier()
     manager = make_manager(backend, notifier)
-    subscription = manager.register(
-        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-    )
+    subscription = manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
     try:
         await append(backend, stream_key, b"a", b"b")
         await asyncio.wait_for(notifier.notified.wait(), 2)
@@ -435,9 +419,7 @@ async def test_undeliverable_readiness_owes_a_wake_and_keeps_the_right_watchers(
         woken.append(subscription.wait_id)
 
     manager = make_manager(backend, notifier, send_wake=send_wake)
-    manager.register(
-        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-    )
+    manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
     try:
         await append(backend, stream_key, b"a")
         await asyncio.wait_for(notifier.notified.wait(), 2)
@@ -467,9 +449,7 @@ async def test_deliverable_readiness_owes_no_wake(
         woken.append(subscription.wait_id)
 
     manager = make_manager(backend, notifier, send_wake=send_wake)
-    manager.register(
-        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-    )
+    manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
     try:
         await append(backend, stream_key, b"a")
         await asyncio.wait_for(notifier.notified.wait(), 2)
@@ -497,12 +477,8 @@ async def test_the_blocked_snapshot_is_read_from_manager_state_alone(
     backend = ThreadCheckingBackend()
     notifier = RecordingNotifier()
     manager = make_manager(backend, notifier)
-    manager.register(
-        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-    )
-    manager.register(
-        run_id=RUN_ID, wait_id=2, stream_key=stream_key, backend_name="tokens"
-    )
+    manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
+    manager.register(run_id=RUN_ID, wait_id=2, stream_key=stream_key)
     try:
         await append(backend, stream_key, b"a")
         await asyncio.wait_for(notifier.notified.wait(), 2)
@@ -535,7 +511,6 @@ async def test_a_start_cursor_is_where_a_continued_chain_resumes(
         run_id=RUN_ID,
         wait_id=1,
         stream_key=stream_key,
-        backend_name="tokens",
         start_cursor=restored,
     )
     try:
@@ -556,12 +531,8 @@ async def test_cancelling_one_subscription_leaves_the_others(
     backend = MemoryStreamBackend()
     notifier = RecordingNotifier()
     manager = make_manager(backend, notifier)
-    manager.register(
-        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-    )
-    manager.register(
-        run_id=RUN_ID, wait_id=2, stream_key=stream_key, backend_name="tokens"
-    )
+    manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
+    manager.register(run_id=RUN_ID, wait_id=2, stream_key=stream_key)
     try:
         await manager.cancel(RUN_ID, 1)
 
@@ -586,9 +557,7 @@ async def test_cancelling_a_wait_takes_back_its_park_intent(
     """
     backend = MemoryStreamBackend()
     manager = make_manager(backend, RecordingNotifier())
-    manager.register(
-        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-    )
+    manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
     try:
         assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING})
         assert await backend.parked_wait_ids(stream_key) == [1]
@@ -613,9 +582,7 @@ async def test_cancelling_a_wait_stops_its_watcher(stream_key: StreamKey) -> Non
     """
     backend = MemoryStreamBackend()
     manager = make_manager(backend, RecordingNotifier())
-    subscription = manager.register(
-        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-    )
+    subscription = manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
     try:
         await asyncio.sleep(0.05)
         assert subscription._watcher is not None and not subscription._watcher.done()
@@ -650,9 +617,7 @@ async def test_a_cancel_from_the_workflow_thread_reaches_a_loop_with_nothing_to_
     manager = make_manager(
         backend, RecordingNotifier(), watch_block=timedelta(seconds=30)
     )
-    manager.register(
-        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-    )
+    manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
     try:
         # Long enough for the watcher to settle into its blocking read.
         await asyncio.sleep(0.1)
@@ -688,9 +653,7 @@ async def test_shutdown_tears_down_every_run(stream_key: StreamKey) -> None:
     notifier = RecordingNotifier()
     manager = make_manager(backend, notifier)
     for run_id in ("run-a", "run-b"):
-        manager.register(
-            run_id=run_id, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        manager.register(run_id=run_id, wait_id=1, stream_key=stream_key)
 
     await manager.shutdown()
 
@@ -703,12 +666,8 @@ async def test_manager_state_is_keyed_by_run(stream_key: StreamKey) -> None:
     backend = MemoryStreamBackend()
     notifier = RecordingNotifier()
     manager = make_manager(backend, notifier)
-    manager.register(
-        run_id="run-a", wait_id=1, stream_key=stream_key, backend_name="tokens"
-    )
-    manager.register(
-        run_id="run-b", wait_id=1, stream_key=stream_key, backend_name="tokens"
-    )
+    manager.register(run_id="run-a", wait_id=1, stream_key=stream_key)
+    manager.register(run_id="run-b", wait_id=1, stream_key=stream_key)
     try:
         await manager.evict_run("run-a")
 
@@ -756,7 +715,6 @@ async def test_re_registering_a_wait_stops_the_watcher_it_replaced(
             run_id="run-1",
             wait_id=1,
             stream_key=stream_key,
-            backend_name="tokens",
         )
         await asyncio.sleep(0.05)
         assert first._watcher is not None and not first._watcher.done()
@@ -765,7 +723,6 @@ async def test_re_registering_a_wait_stops_the_watcher_it_replaced(
             run_id="run-1",
             wait_id=1,
             stream_key=stream_key,
-            backend_name="tokens",
         )
         await asyncio.sleep(0.05)
 
@@ -792,9 +749,7 @@ async def test_an_evicted_run_re_delivers_the_records_it_had_already_seen(
     backend = MemoryStreamBackend()
     notifier = RecordingNotifier()
     manager = make_manager(backend, notifier)
-    manager.register(
-        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-    )
+    manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
     await append(backend, stream_key, b"a", b"b", b"c")
     await asyncio.wait_for(notifier.notified.wait(), 2)
     first_pass = [r.offset for r in manager.drain(RUN_ID, 1)]
@@ -804,9 +759,7 @@ async def test_an_evicted_run_re_delivers_the_records_it_had_already_seen(
     await manager.evict_run(RUN_ID)
 
     notifier.notified.clear()
-    manager.register(
-        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-    )
+    manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
     await asyncio.wait_for(notifier.notified.wait(), 2)
     second_pass = [r.offset for r in manager.drain(RUN_ID, 1)]
 
@@ -846,9 +799,7 @@ async def test_a_stale_answer_is_re_reported_rather_than_dropped(
     notifier = StaleThenAccepted()
     manager = make_manager(backend, notifier)
     try:
-        manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
         await append(backend, stream_key, b"a")
         await asyncio.wait_for(notifier.notified.wait(), 2)
         await asyncio.sleep(0.3)
@@ -897,9 +848,7 @@ async def test_a_stale_retry_that_finds_the_run_gone_tears_the_watcher_down(
     wake = CountingWake(failures=0)
     manager = make_manager(backend, notifier, send_wake=wake)
     try:
-        subscription = manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        subscription = manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
         await append(backend, stream_key, b"a")
 
         await until(
@@ -948,9 +897,7 @@ async def test_a_readiness_transport_failure_does_not_kill_the_watcher(
     notifier = FailsOnce()
     manager = make_manager(backend, notifier)
     try:
-        subscription = manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        subscription = manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
         await append(backend, stream_key, b"a")
         await asyncio.wait_for(notifier.notified.wait(), 2)
         await asyncio.sleep(0.5)
@@ -983,9 +930,7 @@ async def test_a_wake_failure_does_not_kill_the_watcher(
 
     manager = make_manager(backend, notifier, send_wake=failing_wake)
     try:
-        subscription = manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        subscription = manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
         await append(backend, stream_key, b"a")
         await asyncio.wait_for(notifier.notified.wait(), 2)
         await asyncio.sleep(0.3)
@@ -1071,12 +1016,8 @@ async def test_the_park_set_is_cores_wait_set_and_not_every_registration() -> No
     parked = StreamKey("ns", "wf", "first-run", "tokens")
     driving = StreamKey("ns", "wf", "first-run", "tool-events")
     try:
-        manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=parked, backend_name="tokens"
-        )
-        manager.register(
-            run_id=RUN_ID, wait_id=2, stream_key=driving, backend_name="tokens"
-        )
+        manager.register(run_id=RUN_ID, wait_id=1, stream_key=parked)
+        manager.register(run_id=RUN_ID, wait_id=2, stream_key=driving)
         # Wait 2 has a record sitting in it. Workflow code is not blocked on it,
         # so it is not in the set Core asks to park.
         await append(backend, driving, b"b")
@@ -1132,12 +1073,8 @@ async def test_a_failed_park_leaves_no_externally_visible_half(failing: str) -> 
     first = StreamKey("ns", "wf", "first-run", "tokens")
     second = StreamKey("ns", "wf", "first-run", "tool-events")
     try:
-        manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=first, backend_name="tokens"
-        )
-        manager.register(
-            run_id=RUN_ID, wait_id=2, stream_key=second, backend_name="tokens"
-        )
+        manager.register(run_id=RUN_ID, wait_id=1, stream_key=first)
+        manager.register(run_id=RUN_ID, wait_id=2, stream_key=second)
 
         # Reported as the taxonomy's transient row -- a backend that is
         # unreachable is nothing for an operator to do anything about -- with
@@ -1186,12 +1123,8 @@ async def test_a_cancelled_park_takes_back_the_intents_it_had_installed() -> Non
     manager = make_manager(backend, RecordingNotifier())
     key = StreamKey("ns", "wf", "first-run", "tokens")
     try:
-        manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=key, backend_name="tokens"
-        )
-        manager.register(
-            run_id=RUN_ID, wait_id=2, stream_key=key, backend_name="tokens"
-        )
+        manager.register(run_id=RUN_ID, wait_id=1, stream_key=key)
+        manager.register(run_id=RUN_ID, wait_id=2, stream_key=key)
         parking = asyncio.get_running_loop().create_task(
             manager.prepare_park(RUN_ID, 4, {1: BEGINNING, 2: BEGINNING})
         )
@@ -1298,9 +1231,7 @@ async def test_one_blip_does_not_end_the_inherited_park_reconciliation(
     await _inherit(backend, stream_key, RUN_ID)
     manager = make_manager(backend, RecordingNotifier())
     try:
-        manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
 
         await until(
             lambda: _nothing_parked(backend, stream_key),
@@ -1328,9 +1259,7 @@ async def test_an_inherited_intent_is_retried_autonomously_after_recovery(
     await _inherit(backend, stream_key, RUN_ID)
     manager = make_manager(backend, RecordingNotifier())
     try:
-        manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
         await until(
             lambda: (
                 not manager._reconciliations
@@ -1379,7 +1308,6 @@ async def test_a_close_whose_removal_fails_leaves_the_removal_owed(
                 run_id=RUN_ID,
                 wait_id=wait_id,
                 stream_key=stream_key,
-                backend_name="tokens",
             )
         assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING, 2: BEGINNING})
 
@@ -1416,7 +1344,6 @@ async def test_a_failed_resolve_removal_retries_without_another_event(
             run_id=RUN_ID,
             wait_id=1,
             stream_key=stream_key,
-            backend_name="tokens",
         )
         assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING})
 
@@ -1473,7 +1400,6 @@ async def test_shutdown_cancels_and_awaits_an_owed_removal_retry(
         run_id=RUN_ID,
         wait_id=1,
         stream_key=stream_key,
-        backend_name="tokens",
     )
     assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING})
     await manager.resolve_park(RUN_ID)
@@ -1533,9 +1459,7 @@ async def test_a_removal_call_that_hangs_does_not_end_the_autonomous_retry(
     backend = HangsOnceThenRecovers()
     manager = make_manager(backend, RecordingNotifier())
     try:
-        manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
         assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING})
         await manager.resolve_park(RUN_ID)
         await asyncio.wait_for(backend.hanging.wait(), 2)
@@ -1568,9 +1492,7 @@ async def test_shutdown_makes_the_last_attempt_the_retry_loop_cannot(
     """
     backend = FailingRemovals(failures=99)
     manager = make_manager(backend, RecordingNotifier())
-    manager.register(
-        run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-    )
+    manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
     assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING})
     await manager.resolve_park(RUN_ID)
     # Long enough for the backoff to have grown past the grace period below, so
@@ -1626,9 +1548,7 @@ async def test_cleanup_re_announces_the_record_the_stale_intent_silenced(
         send_wake=send_wake,
     )
     try:
-        manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
         assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING})
         await manager.resolve_park(RUN_ID)
         assert await backend.current_park_generation(stream_key, 1) == 4
@@ -1702,9 +1622,7 @@ async def test_reconciling_an_inherited_intent_re_announces_what_it_silenced(
     try:
         await _inherit(backend, stream_key, RUN_ID)
         await append(backend, stream_key, b"1")
-        manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
 
         await until(lambda: sent, "the watcher must announce the buffered record")
         assert sent[0] == 7, "the wake named the inherited generation"
@@ -1782,9 +1700,7 @@ async def test_a_removal_whose_reply_was_lost_still_re_announces(
         send_wake=send_wake,
     )
     try:
-        manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
         assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING})
 
         # Core has ended the park, so generation 4 is dead the moment this
@@ -1841,9 +1757,7 @@ async def test_discovering_an_inherited_intent_is_retried_after_recovery(
     manager = make_manager(backend, RecordingNotifier())
     try:
         await _inherit(backend, stream_key, RUN_ID)
-        manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
         await until(
             lambda: backend.reads >= PARK_REMOVAL_ATTEMPTS,
             "the inline attempts must be spent before recovery",
@@ -1877,9 +1791,7 @@ async def test_closing_a_wait_removes_an_intent_it_only_inherited(
     await _inherit(backend, stream_key, RUN_ID)
     manager = make_manager(backend, RecordingNotifier())
     try:
-        manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
         await until(
             lambda: backend.removal_attempts >= PARK_REMOVAL_ATTEMPTS,
             "the reconciliation must have given up before the close is asked to "
@@ -1916,7 +1828,6 @@ async def test_an_owed_removal_outlives_eviction_and_keeps_retrying(
                 run_id=RUN_ID,
                 wait_id=wait_id,
                 stream_key=stream_key,
-                backend_name="tokens",
             )
         assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING, 2: BEGINNING})
         await manager.cancel(RUN_ID, 1)
@@ -1974,9 +1885,7 @@ async def test_a_cleanup_after_eviction_still_announces_what_it_silenced(
 
     manager = make_manager(backend, RecordingNotifier(), send_wake=send_wake)
     try:
-        manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
         assert not await manager.prepare_park(RUN_ID, 4, {1: BEGINNING})
         await manager.resolve_park(RUN_ID)
         assert await backend.current_park_generation(stream_key, 1) == 4, (
@@ -2032,9 +1941,7 @@ async def test_a_drain_never_removes_the_intent_of_a_park_that_replaced_it(
     backend = FailingRemovals(failures=99)
     manager = make_manager(backend, RecordingNotifier())
     try:
-        manager.register(
-            run_id="run-a", wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        manager.register(run_id="run-a", wait_id=1, stream_key=stream_key)
         assert not await manager.prepare_park("run-a", 4, {1: BEGINNING})
         await manager.cancel("run-a", 1)
         backend.failures = 0
@@ -2106,9 +2013,7 @@ async def test_a_failed_live_wake_is_retried_as_the_same_wake(
     wake = CountingWake(failures=1)
     manager = make_manager(backend, notifier, send_wake=wake)
     try:
-        manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
         await append(backend, stream_key, b"a")
 
         await until(
@@ -2144,9 +2049,7 @@ async def test_replayed_readiness_is_coalesced_until_the_task_completes(
         # That completion cannot have been caused by the wake and must not
         # release its gate.
         manager.note_workflow_task_started(RUN_ID)
-        manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
         await append(backend, stream_key, b"a")
         await until(
             lambda: len(wake.counters) >= 1,
@@ -2155,9 +2058,7 @@ async def test_replayed_readiness_is_coalesced_until_the_task_completes(
         manager.note_workflow_task_completed(RUN_ID, terminal=False)
 
         await manager.evict_run(RUN_ID)
-        manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
         await until(
             lambda: len(notifier.calls) >= 2,
             "replay never re-reported the reconstructed buffered readiness",
@@ -2211,9 +2112,7 @@ async def test_a_failed_wake_attempt_cannot_claim_a_completion_for_its_retry(
     manager = make_manager(backend, notifier, send_wake=raced_wake)
     try:
         manager.note_workflow_task_started(RUN_ID)
-        manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
         await append(backend, stream_key, b"a")
         await asyncio.wait_for(started[0].wait(), 2)
 
@@ -2267,9 +2166,7 @@ async def test_a_new_buffered_range_after_eviction_gets_a_new_wake_counter(
         first = await backend.append(
             stream_key, StreamRecord(RecordKind.DATA, b"a", "sa", 0)
         )
-        manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
         await until(
             lambda: len(wake.counters) >= 1,
             "the first incarnation never owed its wake, so there is nothing for "
@@ -2288,7 +2185,6 @@ async def test_a_new_buffered_range_after_eviction_gets_a_new_wake_counter(
             run_id=RUN_ID,
             wait_id=1,
             stream_key=stream_key,
-            backend_name="tokens",
             start_cursor=AFTER(first.offset),
         )
         await append(backend, stream_key, b"b")
@@ -2322,9 +2218,7 @@ async def test_a_wake_owed_by_a_vanished_run_is_retried_before_it_is_dropped(
     manager = make_manager(backend, notifier, send_wake=wake)
     wake.observe = lambda: manager.subscription(RUN_ID, 1) is not None
     try:
-        manager.register(
-            run_id=RUN_ID, wait_id=1, stream_key=stream_key, backend_name="tokens"
-        )
+        manager.register(run_id=RUN_ID, wait_id=1, stream_key=stream_key)
         await append(backend, stream_key, b"a")
 
         await until(

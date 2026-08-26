@@ -192,8 +192,8 @@ class WorkflowInstanceDetails:
     watcher tasks, and a copy re-created inside the sandbox would watch nothing.
     Workflow code only ever sees this handle -- never a provider instance.
 
-    Present for validation even when no ``external_stream_backends`` were
-    registered on the Worker, because recorded state must be handled based on
+    Present for validation even when no ``external_stream_backend`` was
+    configured on the Worker, because recorded state must be handled based on
     History rather than current Worker configuration.
     """
     external_streams_configured: bool = False

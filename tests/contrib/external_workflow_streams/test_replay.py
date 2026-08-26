@@ -86,7 +86,7 @@ def key() -> StreamKey:
 @pytest_asyncio.fixture  # type: ignore[reportUntypedFunctionDecorator]
 async def manager(backend: MemoryStreamBackend):
     mgr = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=_notify,
         watch_block=timedelta(milliseconds=10),
     )
@@ -122,22 +122,13 @@ def binding(
     key: StreamKey,
     start_cursor: Cursor = BEGINNING,
     *,
-    backend_name: str = "tokens",
     provider_id: str = MemoryStreamBackend.provider_id,
     provider_format_version: int = MemoryStreamBackend.provider_format_version,
 ) -> StreamBinding:
-    """A binding naming the backend the manager fixture registers.
-
-    Every binding names its own backend and carries that backend's provider
-    identity. Nothing about replay may be derived from an annotation-wide
-    provider label: the API lets each topic name a different backend, and two
-    instances of one provider -- two Redis clusters, or two key prefixes --
-    declare the same id while holding entirely different records.
-    """
+    """A binding carrying the configured backend's provider identity."""
     return StreamBinding(
         stream_key=key,
         start_cursor=start_cursor,
-        backend_name=backend_name,
         provider_id=provider_id,
         provider_format_version=provider_format_version,
     )
@@ -400,7 +391,7 @@ async def test_an_unreachable_backend_fails_as_transient_storage(
 
     unreachable = UnreachableBackend()
     manager = StreamSubscriptionManager(
-        backends={"tokens": unreachable},
+        backend=unreachable,
         notify_ready=_notify,
         watch_block=timedelta(milliseconds=10),
     )
@@ -528,7 +519,7 @@ async def test_an_unreachable_payload_store_is_a_storage_failure_not_a_decode_on
     driver = _FailingRetrieveDriver()
     converter = _extstore_converter(driver)
     manager = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=_notify,
         data_converter=converter,
         watch_block=timedelta(milliseconds=10),
@@ -546,7 +537,7 @@ async def test_an_unreachable_payload_store_is_a_storage_failure_not_a_decode_on
         # The manager is what prepares, so the converter under test is the one it
         # holds; the runtime here only needs to make the subscription.
         runtime = make_runtime(manager, backend)
-        runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+        runtime.register(wait_id=1, stream_key=key)
 
         driver.fail = True
         if path == "live":
@@ -647,7 +638,7 @@ def make_runtime(manager, backend):  # type: ignore[no-untyped-def]
 
     return WorkflowStreamRuntime(
         manager=manager,
-        backends={"tokens": backend},
+        backend=backend,
         run_id=RUN_ID,
         namespace="ns",
         workflow_id="wf",
@@ -753,7 +744,7 @@ async def test_the_driver_drains_once_per_recorded_segment(
     # The `subscribe()` call the marker recorded. A stub stands in for Workflow
     # code, so it has to make it: a replay that ends with a recorded binding
     # never recreated is a removed subscription whatever is driving the drains.
-    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=key)
 
     stub = drive(runtime)
 
@@ -790,7 +781,7 @@ async def test_a_drain_sees_only_its_own_segments_records(
     )
     await manager.prepare_replay(RUN_ID, annotation)
     runtime = make_runtime(manager, backend)
-    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=key)
 
     seen_per_drain: list[list[Offset]] = []
 
@@ -822,7 +813,7 @@ async def test_the_driver_reads_nothing_and_ends_replay_mode(
     placed = await append_five(backend, key)
     await manager.prepare_replay(RUN_ID, annotation_for(key, placed))
     runtime = make_runtime(manager, backend)
-    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=key)
     before = len(backend.range_reads)
 
     drive(runtime)
@@ -847,7 +838,7 @@ async def test_a_replayed_drain_never_reaches_the_live_buffer(
     # The marker committed the first two records only.
     await manager.prepare_replay(RUN_ID, annotation_for(key, placed[:2]))
     runtime = make_runtime(manager, backend)
-    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=key)
     subscription = manager.subscription(RUN_ID, 1)
     assert subscription is not None
     subscription._append(placed[2:], subscription._prefetch_epoch)
@@ -946,7 +937,7 @@ async def test_two_markers_reassemble_in_workflow_task_order(
 
     runtime = make_runtime(manager, backend)
     # One subscription across both markers, as the rollover preserves it.
-    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=key)
     per_marker: list[list[list[Offset]]] = []
 
     for annotation in (first_marker, second_marker):
@@ -1014,8 +1005,8 @@ async def test_one_segment_delivers_each_waits_own_records(
     )
     await manager.prepare_replay(RUN_ID, annotation)
     runtime = make_runtime(manager, backend)
-    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
-    runtime.register(wait_id=2, stream_key=other, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=key)
+    runtime.register(wait_id=2, stream_key=other)
 
     drained: dict[int, list[Offset]] = {}
 
@@ -1064,7 +1055,7 @@ async def test_live_delivery_after_a_replay_resumes_past_the_marker(
     """
     placed = await append_five(backend, key)
     runtime = make_runtime(manager, backend)
-    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=key)
 
     subscription = manager.subscription(RUN_ID, 1)
     assert subscription is not None
@@ -1121,7 +1112,7 @@ async def test_the_first_live_drain_after_a_replay_needs_no_loop_turn(
     """
     placed = await append_five(backend, key)
     runtime = make_runtime(manager, backend)
-    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=key)
 
     subscription = manager.subscription(RUN_ID, 1)
     assert subscription is not None
@@ -1187,7 +1178,7 @@ async def test_a_failing_activation_reports_its_own_error_not_the_replays(
     placed = await append_five(backend, key)
     await manager.prepare_replay(RUN_ID, annotation_for(key, placed))
     runtime = make_runtime(manager, backend)
-    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=key)
 
     from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
 
@@ -1257,7 +1248,7 @@ async def test_a_marker_with_no_segments_closes_before_the_activations_own_drain
     )
     await manager.prepare_replay(RUN_ID, annotation)
     runtime = make_runtime(manager, backend)
-    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=key)
 
     subscription = manager.subscription(RUN_ID, 1)
     assert subscription is not None
@@ -1330,7 +1321,7 @@ async def test_a_read_in_flight_across_a_reposition_cannot_be_appended(
     manager._prepare = paused_prepare  # type: ignore[assignment]
 
     runtime = make_runtime(manager, backend)
-    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=key)
     subscription = manager.subscription(RUN_ID, 1)
     assert subscription is not None
 
@@ -1410,7 +1401,7 @@ async def test_a_replay_activation_never_delivers_a_record_the_marker_omits(
     )
     await manager.prepare_replay(RUN_ID, annotation)
     runtime = make_runtime(manager, backend)
-    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=key)
 
     subscription = manager.subscription(RUN_ID, 1)
     assert subscription is not None
@@ -1493,7 +1484,7 @@ async def test_a_marker_drains_once_per_segment_including_the_activations_own(
     )
     await manager.prepare_replay(RUN_ID, annotation)
     runtime = make_runtime(manager, backend)
-    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=key)
 
     predicate_evaluations = 0
 
@@ -1574,7 +1565,7 @@ async def test_a_wait_rebound_to_another_stream_is_nondeterminism(
     runtime = make_runtime(manager, backend)
     # The Workflow's `subscribe()` calls are unchanged in number and order, so
     # wait 1 is still wait 1 -- it just reads a different stream now.
-    runtime.register(wait_id=1, stream_key=right, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=right)
 
     with pytest.raises(temporalio.workflow.NondeterminismError) as caught:
         drive(runtime)
@@ -1618,41 +1609,12 @@ async def test_a_rebinding_made_during_the_replay_activation_is_caught_too(
     class LateRegisteringStub(DriverStub):
         def _run_once(self, *, check_conditions: bool) -> None:
             super()._run_once(check_conditions=check_conditions)
-            runtime.register(wait_id=1, stream_key=right, backend_name="tokens")
+            runtime.register(wait_id=1, stream_key=right)
 
     from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
 
     with pytest.raises(temporalio.workflow.NondeterminismError, match="workflow"):
         drive_with(LateRegisteringStub(runtime))
-
-
-@pytest.mark.asyncio
-async def test_a_wait_rebound_to_another_backend_is_nondeterminism(
-    manager: StreamSubscriptionManager, backend: MemoryStreamBackend
-) -> None:
-    """The backend a topic names is Workflow code, so moving it is a code change.
-
-    Same stream name, different store: the records the marker recorded live in
-    the backend that wrote them, and reading a second store because the wait
-    number matched is the same silent substitution as reading a second stream.
-    """
-    key = StreamKey("ns", "wf", uuid.uuid4().hex, "tokens")
-    recorded = await _one_record(backend, key)
-    manager._backends = {**manager._backends, "other": MemoryStreamBackend()}
-
-    await manager.prepare_replay(
-        RUN_ID,
-        _single_run_annotation(
-            {1: binding(key)},
-            [Run(1, recorded.offset, recorded.offset, 1)],  # type: ignore[arg-type]
-        ),
-    )
-    runtime = make_runtime(manager, backend)
-    runtime._backends = dict(manager._backends)  # type: ignore[attr-defined]
-    runtime.register(wait_id=1, stream_key=key, backend_name="other")
-
-    with pytest.raises(temporalio.workflow.NondeterminismError, match="backend"):
-        drive(runtime)
 
 
 @pytest.mark.asyncio
@@ -1684,7 +1646,7 @@ async def test_a_removed_subscription_leaves_recorded_deliveries_unconsumed(
     )
     runtime = make_runtime(manager, backend)
     # Wait 2's `subscribe()` call is gone; wait 1 is untouched.
-    runtime.register(wait_id=1, stream_key=left, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=left)
 
     class OnlyWaitOneStub(DriverStub):
         def _run_once(self, *, check_conditions: bool) -> None:
@@ -1740,7 +1702,7 @@ async def test_a_removed_subscription_that_recorded_nothing_is_nondeterminism(
     runtime = make_runtime(manager, backend)
     # Wait 2's `subscribe()` call is gone. Wait 1 is untouched and consumes
     # exactly what the marker recorded for it.
-    runtime.register(wait_id=1, stream_key=left, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=left)
 
     with pytest.raises(temporalio.workflow.NondeterminismError) as caught:
         drive(runtime)
@@ -1808,8 +1770,8 @@ async def test_a_removed_middle_subscription_to_the_same_stream_is_nondeterminis
     # The middle `subscribe()` is gone, so the Workflow now makes two waits
     # where History records three -- and the survivor that was wait 3 is
     # registered as wait 2.
-    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
-    runtime.register(wait_id=2, stream_key=key, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=key)
+    runtime.register(wait_id=2, stream_key=key)
 
     with pytest.raises(temporalio.workflow.NondeterminismError) as caught:
         drive(runtime)
@@ -1848,11 +1810,11 @@ async def test_a_subscription_the_marker_never_bound_is_not_a_removal(
         ),
     )
     runtime = make_runtime(manager, backend)
-    runtime.register(wait_id=1, stream_key=left, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=left)
     # The new `subscribe()`, reached because replay keeps running after the
     # marker's own Workflow Task. Nothing in this marker binds it, and nothing
     # should.
-    runtime.register(wait_id=2, stream_key=added, backend_name="tokens")
+    runtime.register(wait_id=2, stream_key=added)
 
     stub = drive(runtime)
 
@@ -1894,7 +1856,7 @@ async def test_a_subscription_made_during_the_replay_drive_is_not_missing(
         def _run_once(self, *, check_conditions: bool) -> None:
             super()._run_once(check_conditions=check_conditions)
             if 1 not in runtime.subscriptions():
-                runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
+                runtime.register(wait_id=1, stream_key=key)
             taken.extend(r.offset for r in runtime.drain(1))  # type: ignore[misc]
 
     from temporalio.worker._workflow_instance import _WorkflowInstanceImpl
@@ -1936,7 +1898,7 @@ async def test_a_removed_subscriptions_records_are_taken_by_nobody(
         ),
     )
     runtime = make_runtime(manager, backend)
-    runtime.register(wait_id=1, stream_key=left, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=left)
 
     with pytest.raises(
         temporalio.workflow.NondeterminismError, match="never took"
@@ -1949,103 +1911,33 @@ async def test_a_removed_subscriptions_records_are_taken_by_nobody(
     )
 
 
-# --- one wait, one backend instance ------------------------------------------
-
-
-@pytest_asyncio.fixture  # type: ignore[reportUntypedFunctionDecorator]
-async def two_backend_manager():  # type: ignore[no-untyped-def]
-    """Two instances of the *same* provider, registered under two names.
-
-    The configuration a single provider label cannot describe: both declare
-    provider id ``memory``, and they hold entirely different records -- exactly
-    as two Redis clusters, or two key prefixes on one cluster, would.
-    """
-    left, right = MemoryStreamBackend(), MemoryStreamBackend()
-    mgr = StreamSubscriptionManager(
-        backends={"left": left, "right": right},
-        notify_ready=_notify,
-        watch_block=timedelta(milliseconds=10),
-    )
-    yield mgr, left, right
-    await mgr.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_each_waits_range_is_read_from_the_backend_that_owns_it(
-    two_backend_manager,  # type: ignore[no-untyped-def]
-) -> None:
-    """Replay reads a wait's recorded range from the store that wrote it.
-
-    Resolving a wait by searching for the first registered backend declaring the
-    recorded provider id cannot do this: a provider id names an implementation,
-    not a store. The failure is not even clean -- the range simply is not in the
-    instance that was picked, and it is reported as integrity loss against a
-    backend nothing is wrong with.
-
-    Prepared before any subscription exists, which is the real ordering: on
-    replay the Workflow has not run far enough to call ``subscribe()``, so the
-    annotation is the only thing that can say where to read.
-    """
-    manager, left_backend, right_backend = two_backend_manager
-    left = StreamKey("ns", "wf", uuid.uuid4().hex, "tokens")
-    right = StreamKey("ns", "wf", uuid.uuid4().hex, "tokens")
-    left_record = await _one_record(left_backend, left)
-    right_record = await _one_record(right_backend, right)
-
-    plan = await manager.prepare_replay(
-        RUN_ID,
-        _single_run_annotation(
-            {
-                1: binding(left, backend_name="left"),
-                2: binding(right, backend_name="right"),
-            },
-            [
-                Run(1, left_record.offset, left_record.offset, 1),  # type: ignore[arg-type]
-                Run(2, right_record.offset, right_record.offset, 1),  # type: ignore[arg-type]
-            ],
-        ),
-    )
-
-    assert len(left_backend.range_reads) == 1, (
-        f"wait 1 must be read from the instance holding it, got "
-        f"{left_backend.range_reads}"
-    )
-    assert len(right_backend.range_reads) == 1, (
-        "wait 2's range was never read from the instance that owns it; it was "
-        "routed to the other instance, which declares the same provider id"
-    )
-    (segment,) = plan.segments
-    assert [(w, r.offset) for w, r in segment.deliveries] == [
-        (1, left_record.offset),
-        (2, right_record.offset),
-    ]
+# --- provider binding ---------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_a_backend_declaring_another_provider_is_refused_before_any_read(
-    two_backend_manager,  # type: ignore[no-untyped-def]
+    manager: StreamSubscriptionManager, backend: MemoryStreamBackend
 ) -> None:
-    """A name rebound to a different implementation is a deployment problem.
+    """A differently configured implementation is a deployment problem.
 
     Neither nondeterminism -- the Workflow is unchanged -- nor integrity loss:
-    the store that wrote the records is simply not the one registered under that
-    name here. It is refused before the read, so an implementation that cannot
+    the store that wrote the records is simply not the one configured here. It
+    is refused before the read, so an implementation that cannot
     interpret those offsets never gets to try.
     """
-    manager, left_backend, _ = two_backend_manager
     left = StreamKey("ns", "wf", uuid.uuid4().hex, "tokens")
-    record = await _one_record(left_backend, left)
+    record = await _one_record(backend, left)
 
     with pytest.raises(StreamStorageError, match="declares"):
         await manager.prepare_replay(
             RUN_ID,
             _single_run_annotation(
-                {1: binding(left, backend_name="left", provider_id="redis-streams")},
+                {1: binding(left, provider_id="redis-streams")},
                 [Run(1, record.offset, record.offset, 1)],  # type: ignore[arg-type]
             ),
         )
 
-    assert left_backend.range_reads == [], (
+    assert backend.range_reads == [], (
         "the recorded range must not be read through an implementation that "
         "did not write it"
     )
@@ -2053,7 +1945,7 @@ async def test_a_backend_declaring_another_provider_is_refused_before_any_read(
 
 @pytest.mark.asyncio
 async def test_an_unreadable_provider_format_version_is_refused_before_any_read(
-    two_backend_manager,  # type: ignore[no-untyped-def]
+    manager: StreamSubscriptionManager, backend: MemoryStreamBackend
 ) -> None:
     """The recorded format version is checked, not merely stored.
 
@@ -2062,9 +1954,8 @@ async def test_an_unreadable_provider_format_version_is_refused_before_any_read(
     and every one of replay's four range checks would be applied to the wrong
     interpretation of the bytes.
     """
-    manager, left_backend, _ = two_backend_manager
     left = StreamKey("ns", "wf", uuid.uuid4().hex, "tokens")
-    record = await _one_record(left_backend, left)
+    record = await _one_record(backend, left)
 
     with pytest.raises(StreamStorageError, match="format version"):
         await manager.prepare_replay(
@@ -2073,7 +1964,6 @@ async def test_an_unreadable_provider_format_version_is_refused_before_any_read(
                 {
                     1: binding(
                         left,
-                        backend_name="left",
                         provider_format_version=(
                             MemoryStreamBackend.provider_format_version + 1
                         ),
@@ -2083,31 +1973,7 @@ async def test_an_unreadable_provider_format_version_is_refused_before_any_read(
             ),
         )
 
-    assert left_backend.range_reads == []
-
-
-@pytest.mark.asyncio
-async def test_a_marker_naming_an_unregistered_backend_is_nondeterminism(
-    two_backend_manager,  # type: ignore[no-untyped-def]
-) -> None:
-    """A recorded backend name that resolves to nothing is row four as well.
-
-    The name came from Workflow code, so the honest readings are that the
-    Workflow now names a different backend or that this Worker is missing a
-    registration -- neither of which is damage to a store.
-    """
-    manager, left_backend, _ = two_backend_manager
-    left = StreamKey("ns", "wf", uuid.uuid4().hex, "tokens")
-    record = await _one_record(left_backend, left)
-
-    with pytest.raises(temporalio.workflow.NondeterminismError, match="not registered"):
-        await manager.prepare_replay(
-            RUN_ID,
-            _single_run_annotation(
-                {1: binding(left, backend_name="retired")},
-                [Run(1, record.offset, record.offset, 1)],  # type: ignore[arg-type]
-            ),
-        )
+    assert backend.range_reads == []
 
 
 # --- a wait registered after the header, replayed ----------------------------
@@ -2142,7 +2008,7 @@ async def test_a_wait_registered_mid_annotation_replays(
 
     recorder = WorkflowStreamRuntime(
         manager=manager,
-        backends={"tokens": backend},
+        backend=backend,
         run_id="recording-run",
         namespace="ns",
         workflow_id="wf",
@@ -2150,11 +2016,11 @@ async def test_a_wait_registered_mid_annotation_replays(
         data_converter=temporalio.converter.DataConverter.default,
         default_idle_timeout=timedelta(seconds=1),
     )
-    recorder.register(wait_id=1, stream_key=first_key, backend_name="tokens")
+    recorder.register(wait_id=1, stream_key=first_key)
     recorder.record_delivery(1, first_record)
     deltas = [recorder.take_observation_delta()]
     # The header is fixed from here on: Core already holds those bytes.
-    recorder.register(wait_id=2, stream_key=late_key, backend_name="tokens")
+    recorder.register(wait_id=2, stream_key=late_key)
     recorder.record_delivery(2, late_record)
     deltas.append(recorder.take_observation_delta())
     annotation = b"".join(d for d in deltas if d is not None) + recorder.add_terminal()
@@ -2163,8 +2029,8 @@ async def test_a_wait_registered_mid_annotation_replays(
 
     plan = await manager.prepare_replay(RUN_ID, annotation)
     runtime = make_runtime(manager, backend)
-    runtime.register(wait_id=1, stream_key=first_key, backend_name="tokens")
-    runtime.register(wait_id=2, stream_key=late_key, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=first_key)
+    runtime.register(wait_id=2, stream_key=late_key)
 
     drained: dict[int, list[Offset]] = {1: [], 2: []}
 
@@ -2242,8 +2108,8 @@ async def test_a_segment_replays_in_its_recorded_cross_stream_order(
 
     runtime.begin_replay(plan.annotation.header.streams)
     try:
-        first = external_stream.topic("left", backend="tokens", type=str).subscribe()
-        second = external_stream.topic("right", backend="tokens", type=str).subscribe()
+        first = external_stream.topic("left", type=str).subscribe()
+        second = external_stream.topic("right", type=str).subscribe()
         assert (first.wait_id, second.wait_id) == (1, 2)
 
         runtime.begin_replay_segment(list(plan.segments[0].deliveries))
@@ -2298,8 +2164,8 @@ async def test_a_replayed_drain_stops_at_another_waits_record(
     )
     await manager.prepare_replay(RUN_ID, annotation)
     runtime = make_runtime(manager, backend)
-    runtime.register(wait_id=1, stream_key=left, backend_name="tokens")
-    runtime.register(wait_id=2, stream_key=right, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=left)
+    runtime.register(wait_id=2, stream_key=right)
 
     taken: list[tuple[int, Offset]] = []
 

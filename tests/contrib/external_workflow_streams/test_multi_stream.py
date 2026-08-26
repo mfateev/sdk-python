@@ -76,7 +76,7 @@ class StubManager:
         #: `(run_id, wait_id)` for every wait the runtime asked to stop serving.
         self.cancelled: list[tuple[str, int]] = []
 
-    def register(self, *, run_id, wait_id, stream_key, backend_name, start_cursor):  # type: ignore[no-untyped-def]
+    def register(self, *, run_id, wait_id, stream_key, start_cursor):  # type: ignore[no-untyped-def]
         pass
 
     def cancel_from_workflow_thread(self, run_id, wait_id):  # type: ignore[no-untyped-def]
@@ -98,7 +98,7 @@ def manager() -> StubManager:
 async def live_manager(backend: MemoryStreamBackend):
     """A real manager, for the tests that need records to actually move."""
     mgr = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=_notify,
         watch_block=timedelta(milliseconds=10),
     )
@@ -109,7 +109,7 @@ async def live_manager(backend: MemoryStreamBackend):
 def make_runtime(manager, backend, idle=timedelta(seconds=1)):  # type: ignore[no-untyped-def]
     return WorkflowStreamRuntime(
         manager=manager,
-        backends={"tokens": backend},
+        backend=backend,
         run_id=RUN_ID,
         namespace="ns",
         workflow_id="wf",
@@ -140,12 +140,8 @@ def test_one_idle_stream_cannot_park_while_another_is_active(
     never quiet.
     """
     runtime = make_runtime(manager, backend)
-    runtime.register(
-        wait_id=1, stream_key=runtime.stream_key("idle"), backend_name="tokens"
-    )
-    runtime.register(
-        wait_id=2, stream_key=runtime.stream_key("busy"), backend_name="tokens"
-    )
+    runtime.register(wait_id=1, stream_key=runtime.stream_key("idle"))
+    runtime.register(wait_id=2, stream_key=runtime.stream_key("busy"))
     runtime.note_blocked(1, True)
     # The second is *not* blocked -- Workflow code is still working through it.
     runtime.note_blocked(2, False)
@@ -168,7 +164,6 @@ def test_the_quiescent_set_is_complete_when_everything_is_blocked(
         runtime.register(
             wait_id=wait_id,
             stream_key=runtime.stream_key(name),
-            backend_name="tokens",
         )
         runtime.note_blocked(wait_id, True)
 
@@ -193,7 +188,6 @@ def test_differing_idle_timeouts_reduce_to_the_minimum(
         runtime.register(
             wait_id=wait_id,
             stream_key=runtime.stream_key(f"s{wait_id}"),
-            backend_name="tokens",
             idle_timeout=timedelta(seconds=seconds),
         )
         runtime.note_blocked(wait_id, True)
@@ -228,7 +222,7 @@ def test_with_options_timeouts_reach_the_reduction_through_the_public_api(
     for name, seconds in (("slow", 30), ("quick", 4), ("slower", 60)):
         subscription = (
             external_stream.with_options(idle_timeout=timedelta(seconds=seconds))
-            .topic(name, backend="tokens", type=str)
+            .topic(name, type=str)
             .subscribe()
         )
         runtime.note_blocked(subscription.wait_id, True)
@@ -247,13 +241,11 @@ def test_the_reduction_ignores_waits_that_are_not_blocked(
     runtime.register(
         wait_id=1,
         stream_key=runtime.stream_key("a"),
-        backend_name="tokens",
         idle_timeout=timedelta(seconds=7),
     )
     runtime.register(
         wait_id=2,
         stream_key=runtime.stream_key("b"),
-        backend_name="tokens",
         idle_timeout=timedelta(milliseconds=50),
     )
     runtime.note_blocked(1, True)
@@ -279,7 +271,6 @@ def test_a_fence_on_one_stream_alone_does_not_make_the_set_parkable(
         runtime.register(
             wait_id=wait_id,
             stream_key=runtime.stream_key(name),
-            backend_name="tokens",
         )
         runtime.note_blocked(wait_id, True)
     runtime.record_delivery(1, fence(0, "10-0"))
@@ -302,7 +293,6 @@ def test_all_fenced_streams_make_the_whole_set_parkable(
         runtime.register(
             wait_id=wait_id,
             stream_key=runtime.stream_key(name),
-            backend_name="tokens",
         )
         runtime.note_blocked(wait_id, True)
         runtime.record_delivery(wait_id, fence(0, f"1{wait_id}-0"))
@@ -322,9 +312,7 @@ def test_a_record_after_a_fence_reopens_the_stream(
     would strand every record another producer went on to write.
     """
     runtime = make_runtime(manager, backend)
-    runtime.register(
-        wait_id=1, stream_key=runtime.stream_key("a"), backend_name="tokens"
-    )
+    runtime.register(wait_id=1, stream_key=runtime.stream_key("a"))
     runtime.note_blocked(1, True)
     runtime.record_delivery(1, fence(0, "10-0"))
     assert runtime.quiescent_snapshot()[0].immediately_parkable  # type: ignore[index]
@@ -349,8 +337,8 @@ async def test_two_same_stream_subscriptions_install_distinct_park_intents(
     """
     runtime = make_runtime(live_manager, backend)
     key = runtime.stream_key("tokens")
-    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
-    runtime.register(wait_id=2, stream_key=key, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=key)
+    runtime.register(wait_id=2, stream_key=key)
     # Two different positions, so a collapsed intent is visible rather than
     # merely suspected.
     runtime.record_delivery(1, data(0, "10-0"))
@@ -380,8 +368,8 @@ async def test_each_same_stream_subscription_receives_every_record(
     """
     runtime = make_runtime(live_manager, backend)
     key = runtime.stream_key("tokens")
-    runtime.register(wait_id=1, stream_key=key, backend_name="tokens")
-    runtime.register(wait_id=2, stream_key=key, backend_name="tokens")
+    runtime.register(wait_id=1, stream_key=key)
+    runtime.register(wait_id=2, stream_key=key)
     codec = StreamPayloadCodec(temporalio.converter.DataConverter.default, str)
     for i, value in enumerate(["a", "b"]):
         await backend.append(
@@ -414,7 +402,6 @@ def test_an_alternating_two_stream_batch_encodes_one_run_per_delivery(
         runtime.register(
             wait_id=wait_id,
             stream_key=runtime.stream_key(name),
-            backend_name="tokens",
         )
     for i in range(2):
         runtime.record_delivery(1, data(i, f"1{i}-0"))
@@ -441,9 +428,7 @@ def test_consecutive_records_from_one_stream_are_one_run(
     is the cost model this feature exists to avoid.
     """
     runtime = make_runtime(manager, backend)
-    runtime.register(
-        wait_id=1, stream_key=runtime.stream_key("a"), backend_name="tokens"
-    )
+    runtime.register(wait_id=1, stream_key=runtime.stream_key("a"))
     for i in range(5):
         runtime.record_delivery(1, data(i, f"10-{i}"))
 
@@ -468,8 +453,7 @@ class FakeRuntime:
         self.pending: dict[int, asyncio.Future[None]] = {}
         self.deliveries: list[tuple[int, StreamRecord]] = []
         self.consumed: list[tuple[int, StreamRecord]] = []
-        self.registered = {"tokens-redis"}
-        self.registrations: list[tuple[int, StreamKey, str]] = []
+        self.registrations: list[tuple[int, StreamKey]] = []
         self.budget = MAX_RECORDS_PER_ACTIVATION
 
     def stream_key(self, stream_name: str) -> StreamKey:
@@ -480,10 +464,9 @@ class FakeRuntime:
         *,
         wait_id: int,
         stream_key: StreamKey,
-        backend_name: str,
         idle_timeout: timedelta,  # pyright: ignore[reportUnusedParameter]
     ):
-        self.registrations.append((wait_id, stream_key, backend_name))
+        self.registrations.append((wait_id, stream_key))
 
     def drain(self, wait_id: int, max_records: int | None = None):
         buffered = self.buffers.get(wait_id, [])
@@ -558,8 +541,8 @@ async def test_merge_yields_from_every_subscription(fake_runtime: FakeRuntime) -
     would let a backlogged first stream spend a whole activation budget on
     itself and reach the second one never.
     """
-    first = external_stream.topic("a", backend="tokens-redis", type=str).subscribe()
-    second = external_stream.topic("b", backend="tokens-redis", type=str).subscribe()
+    first = external_stream.topic("a", type=str).subscribe()
+    second = external_stream.topic("b", type=str).subscribe()
     fake_runtime.buffers[first.wait_id] = await encoded("a1", "a2")
     fake_runtime.buffers[second.wait_id] = await encoded("b1")
 
@@ -581,8 +564,8 @@ async def test_merge_drains_in_wait_id_order_regardless_of_argument_order(
     An order that depended on argument order -- or on which watcher happened to
     run first -- would replay differently than it ran.
     """
-    first = external_stream.topic("a", backend="tokens-redis", type=str).subscribe()
-    second = external_stream.topic("b", backend="tokens-redis", type=str).subscribe()
+    first = external_stream.topic("a", type=str).subscribe()
+    second = external_stream.topic("b", type=str).subscribe()
     fake_runtime.buffers[first.wait_id] = await encoded("a1")
     fake_runtime.buffers[second.wait_id] = await encoded("b1")
 
@@ -604,8 +587,8 @@ async def test_merge_marks_every_wait_blocked_when_nothing_is_ready(
     Blocking on only the first would leave the second out of the snapshot, and
     Core would park a wait the Workflow was still waiting on.
     """
-    first = external_stream.topic("a", backend="tokens-redis", type=str).subscribe()
-    second = external_stream.topic("b", backend="tokens-redis", type=str).subscribe()
+    first = external_stream.topic("a", type=str).subscribe()
+    second = external_stream.topic("b", type=str).subscribe()
 
     iterator = merge(first, second)
     pending = asyncio.ensure_future(iterator.__anext__())
@@ -629,8 +612,8 @@ async def test_merge_resumes_when_any_one_wait_is_resolved(
     fake_runtime: FakeRuntime,
 ) -> None:
     """One record on one stream is enough; it need not wait for the others."""
-    first = external_stream.topic("a", backend="tokens-redis", type=str).subscribe()
-    second = external_stream.topic("b", backend="tokens-redis", type=str).subscribe()
+    first = external_stream.topic("a", type=str).subscribe()
+    second = external_stream.topic("b", type=str).subscribe()
 
     iterator = merge(first, second)
     pending = asyncio.ensure_future(iterator.__anext__())
@@ -647,7 +630,7 @@ async def test_merging_a_subscription_with_itself_is_refused(
     fake_runtime: FakeRuntime,  # pyright: ignore[reportUnusedParameter]
 ) -> None:
     """It would deliver every record to that wait twice."""
-    only = external_stream.topic("a", backend="tokens-redis", type=str).subscribe()
+    only = external_stream.topic("a", type=str).subscribe()
 
     with pytest.raises(ValueError, match="same subscription twice"):
         await merge(only, only).__anext__()
@@ -664,8 +647,8 @@ async def test_merging_nothing_is_refused(
 @pytest.mark.asyncio
 async def test_merge_never_yields_control_records(fake_runtime: FakeRuntime) -> None:
     """A fence advances the cursor but belongs to the runtime, not the Workflow."""
-    first = external_stream.topic("a", backend="tokens-redis", type=str).subscribe()
-    second = external_stream.topic("b", backend="tokens-redis", type=str).subscribe()
+    first = external_stream.topic("a", type=str).subscribe()
+    second = external_stream.topic("b", type=str).subscribe()
     records = await encoded("a1", "a2")
     fake_runtime.buffers[first.wait_id] = [
         records[0],
@@ -710,8 +693,7 @@ async def test_a_replayed_segment_is_yielded_in_its_recorded_order(
     """
     recorded = [2, 1, 3, 1, 2, 3, 3]
     subscriptions = [
-        external_stream.topic(name, backend="tokens", type=str).subscribe()
-        for name in ("a", "b", "c")
+        external_stream.topic(name, type=str).subscribe() for name in ("a", "b", "c")
     ]
     assert [s.wait_id for s in subscriptions] == [1, 2, 3]
     records = await encoded(*(f"r{i}" for i in range(len(recorded))))
@@ -753,8 +735,8 @@ class TwoStreamWorkflow:
         from temporalio.contrib.external_workflow_streams._api import merge as m
 
         options = es.with_options(idle_timeout=timedelta(seconds=30))
-        left = options.topic("left", backend="tokens-memory", type=str).subscribe()
-        right = options.topic("right", backend="tokens-memory", type=str).subscribe()
+        left = options.topic("left", type=str).subscribe()
+        right = options.topic("right", type=str).subscribe()
 
         seen: list[str] = []
         async for _, value in m(left, right):
@@ -778,7 +760,7 @@ async def test_a_workflow_consumes_two_streams_as_one_wait_set(
         client,
         task_queue=task_queue,
         workflows=[TwoStreamWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         handle = await client.start_workflow(
             TwoStreamWorkflow.run,
@@ -836,7 +818,7 @@ def test_a_subscription_nobody_has_iterated_is_not_blocked(
     something else entirely -- a timer, an activity, a signal handler -- must not
     on its own produce a wait for Core to hold the task open for.
     """
-    external_stream.topic("tokens", backend="tokens", type=str).subscribe()
+    external_stream.topic("tokens", type=str).subscribe()
 
     assert public_api_runtime.quiescent_snapshot() is None, (
         "a subscription that has never been iterated reported itself as a "
@@ -855,9 +837,7 @@ async def test_a_cancelled_wait_leaves_the_quiescent_set(
     half is the standard shape. If the cancelled half stays in the blocked set,
     every such race leaves a ghost wait behind, and the ghosts accumulate.
     """
-    subscription = external_stream.topic(
-        "tokens", backend="tokens", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
 
     pending = asyncio.ensure_future(subscription.__aiter__().__anext__())
     await asyncio.sleep(0.05)
@@ -880,9 +860,7 @@ async def test_closing_a_subscription_ends_its_wait_and_its_iteration(
     public_api_runtime: WorkflowStreamRuntime,
 ) -> None:
     """``_finished`` has to be reachable, or iteration has no end at all."""
-    subscription = external_stream.topic(
-        "tokens", backend="tokens", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
 
     iterator = subscription.__aiter__()
     pending = asyncio.ensure_future(iterator.__anext__())
@@ -912,9 +890,7 @@ async def test_closing_a_subscription_tells_the_worker_to_stop_serving_it(
     and a park intent still in the backend, and only the manager can take either
     of them back.
     """
-    subscription = external_stream.topic(
-        "tokens", backend="tokens", type=str
-    ).subscribe()
+    subscription = external_stream.topic("tokens", type=str).subscribe()
 
     subscription.close()
 
@@ -941,8 +917,8 @@ async def test_a_resolved_merge_leaves_no_nonwinning_wait_blocked(
     them once the group returns, so leaving one in the quiescent snapshot asks
     Core to retain and eventually park a Workflow Task for nobody.
     """
-    first = external_stream.topic("a", backend="tokens", type=str).subscribe()
-    second = external_stream.topic("b", backend="tokens", type=str).subscribe()
+    first = external_stream.topic("a", type=str).subscribe()
+    second = external_stream.topic("b", type=str).subscribe()
     iterator = merge(first, second)
     pending = asyncio.ensure_future(iterator.__anext__())
     await asyncio.sleep(0.05)
@@ -986,8 +962,8 @@ async def test_a_merge_double_check_leaves_no_nonwinning_wait_blocked(
     its double-check and returns early; that successful exit must still unblock
     every member.
     """
-    first = external_stream.topic("a", backend="tokens", type=str).subscribe()
-    second = external_stream.topic("b", backend="tokens", type=str).subscribe()
+    first = external_stream.topic("a", type=str).subscribe()
+    second = external_stream.topic("b", type=str).subscribe()
     record = (await encoded("b1"))[0].placed_at(Offset("00000001"))
     drain_calls: dict[int, int] = {}
 
@@ -1025,8 +1001,8 @@ async def test_a_half_registered_merge_leaves_no_wait_blocked(
     marked blocked have futures nothing can resolve, and the snapshot asks Core
     to retain a Workflow Task on their behalf.
     """
-    first = external_stream.topic("a", backend="tokens", type=str).subscribe()
-    second = external_stream.topic("b", backend="tokens", type=str).subscribe()
+    first = external_stream.topic("a", type=str).subscribe()
+    second = external_stream.topic("b", type=str).subscribe()
 
     real = public_api_runtime.new_readiness_future
     made = 0

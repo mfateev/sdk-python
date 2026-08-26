@@ -209,17 +209,12 @@ async def build_replay_plan(
             backend = backends.get(run.wait_id)
             key = stream_keys.get(run.wait_id)
             if key is not None and backend is None:
-                # The wait is in the annotation, so the Workflow did create it;
-                # what did not resolve is the backend name the marker recorded.
-                # Also row four: the backend a topic names is Workflow code, and
-                # the recorded records live in the backend that wrote them.
-                raise temporalio.workflow.NondeterminismError(
+                # The wait is in the annotation, so the Workflow did create it.
+                # The deployment is missing the store needed to read it.
+                raise StreamStorageError(
                     f"the marker records external stream wait {run.wait_id} "
-                    "against a backend name that is not registered on this "
-                    "Worker. Either the Workflow now names a different backend "
-                    "-- gate that behind workflow.patched() exactly as an "
-                    "inserted timer would be -- or this Worker is missing that "
-                    "backend from external_stream_backends."
+                    "but no external stream backend is configured on this "
+                    "Worker; pass external_stream_backend=... to the Worker"
                 )
             if backend is None or key is None:
                 # Row four of the failure taxonomy, and **not** integrity loss.

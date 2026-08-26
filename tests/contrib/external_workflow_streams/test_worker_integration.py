@@ -62,7 +62,7 @@ class ConsumeTokensWorkflow:
     @workflow.run
     async def run(self, expected: int) -> list[str]:
         tokens = external_stream.with_options(idle_timeout=timedelta(seconds=30)).topic(
-            "tokens", backend="tokens-memory", type=str
+            "tokens", type=str
         )
 
         async for token in tokens.subscribe():
@@ -88,7 +88,7 @@ class CountTokensWorkflow:
     @workflow.run
     async def run(self, expected: int) -> int:
         tokens = external_stream.with_options(idle_timeout=timedelta(seconds=30)).topic(
-            "tokens", backend="tokens-memory", type=str
+            "tokens", type=str
         )
 
         seen = 0
@@ -105,7 +105,7 @@ class SubscribeOnlyWorkflow:
 
     @workflow.run
     async def run(self) -> None:
-        tokens = external_stream.topic("tokens", backend="tokens-memory", type=str)
+        tokens = external_stream.topic("tokens", type=str)
         async for _ in tokens.subscribe():
             pass
 
@@ -123,7 +123,7 @@ class TimerSuppressedSubscriptionWorkflow:
 
     @workflow.run
     async def run(self) -> None:
-        tokens = external_stream.topic("tokens", backend="tokens-memory", type=str)
+        tokens = external_stream.topic("tokens", type=str)
         timer = asyncio.ensure_future(asyncio.sleep(600))
         try:
             async for _ in tokens.subscribe():
@@ -181,7 +181,7 @@ async def test_a_workflow_consumes_records_it_never_read_itself(
         client,
         task_queue=task_queue,
         workflows=[ConsumeTokensWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         handle = await client.start_workflow(
             ConsumeTokensWorkflow.run,
@@ -224,7 +224,7 @@ async def test_no_stream_payload_reaches_history(
         client,
         task_queue=task_queue,
         workflows=[CountTokensWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         handle = await client.start_workflow(
             CountTokensWorkflow.run,
@@ -274,7 +274,7 @@ async def test_a_blocked_workflow_retains_its_task_rather_than_completing_it(
         client,
         task_queue=task_queue,
         workflows=[SubscribeOnlyWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         handle = await client.start_workflow(
             SubscribeOnlyWorkflow.run,
@@ -301,7 +301,7 @@ async def test_a_blocked_workflow_retains_its_task_rather_than_completing_it(
             await handle.terminate()
 
 
-async def test_a_workflow_without_registered_backends_says_so(
+async def test_a_workflow_without_a_configured_backend_says_so(
     client: Client,
 ) -> None:
     """The failure names the Worker option rather than an attribute error."""
@@ -322,7 +322,7 @@ async def test_a_workflow_without_registered_backends_says_so(
             ]
             assert failures, "expected the Workflow Task to fail"
             message = failures[0].workflow_task_failed_event_attributes.failure.message
-            assert "external_stream_backends" in message, (
+            assert "external_stream_backend" in message, (
                 f"the failure should name the Worker option, got: {message}"
             )
         finally:
@@ -342,7 +342,7 @@ class TimerThenConsumeWorkflow:
     @workflow.run
     async def run(self) -> list[str]:
         tokens = external_stream.with_options(idle_timeout=timedelta(seconds=30)).topic(
-            "tokens", backend="tokens-memory", type=str
+            "tokens", type=str
         )
         seen: list[str] = []
         subscription = tokens.subscribe()
@@ -372,7 +372,7 @@ async def test_an_append_with_no_open_task_wakes_the_workflow(
         client,
         task_queue=task_queue,
         workflows=[TimerThenConsumeWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         handle = await client.start_workflow(
             TimerThenConsumeWorkflow.run,
@@ -438,7 +438,7 @@ async def test_every_marker_a_run_writes_is_a_complete_annotation(
         client,
         task_queue=task_queue,
         workflows=[TimerThenConsumeWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         handle = await client.start_workflow(
             TimerThenConsumeWorkflow.run,
@@ -510,7 +510,7 @@ class TimerThenFirstRecordWorkflow:
     @workflow.run
     async def run(self) -> list[str]:
         tokens = external_stream.with_options(idle_timeout=timedelta(seconds=30)).topic(
-            "tokens", backend="tokens-memory", type=str
+            "tokens", type=str
         )
         iterator = tokens.subscribe().__aiter__()
         # Long enough that it cannot be what resumes this Workflow. If a record
@@ -539,7 +539,7 @@ async def test_a_first_block_that_rides_a_server_bound_command_is_still_wakeable
         client,
         task_queue=task_queue,
         workflows=[TimerThenFirstRecordWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         handle = await client.start_workflow(
             TimerThenFirstRecordWorkflow.run,
@@ -873,7 +873,7 @@ class ParkedAcrossEvictionWorkflow:
 
     @workflow.run
     async def run(self, expected: int) -> list[str]:
-        tokens = external_stream.topic("tokens", backend="tokens-memory", type=str)
+        tokens = external_stream.topic("tokens", type=str)
         seen: list[str] = []
         async for token in tokens.subscribe():
             seen.append(token)
@@ -920,7 +920,7 @@ async def test_a_replayed_run_re_registers_its_wait_set(
         client,
         task_queue=task_queue,
         workflows=[ParkedAcrossEvictionWorkflow, FillerWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
         # One slot, so running anything else evicts the Run under test. Eviction
         # is what discards the wait set, the watchers, and the buffers, leaving
         # replay to rebuild all three.
@@ -1009,7 +1009,7 @@ class FloodedCountWorkflow:
     @workflow.run
     async def run(self, expected: int) -> int:
         tokens = external_stream.with_options(idle_timeout=timedelta(seconds=30)).topic(
-            "tokens", backend="tokens-memory", type=str
+            "tokens", type=str
         )
         async for _ in tokens.subscribe():
             self._seen += 1
@@ -1052,7 +1052,7 @@ async def test_a_flood_larger_than_one_activations_budget_is_delivered_in_full(
         client,
         task_queue=task_queue,
         workflows=[FloodedCountWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         handle = await client.start_workflow(
             FloodedCountWorkflow.run,
@@ -1099,7 +1099,7 @@ async def test_a_clean_shutdown_sweeps_and_tears_down_the_manager(
         client,
         task_queue=task_queue,
         workflows=[TimerSuppressedSubscriptionWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     )
     worker_task = asyncio.create_task(worker.run())
     handle = None
@@ -1237,7 +1237,7 @@ async def test_a_slow_codec_decodes_off_the_workflow_thread(
         codec_client,
         task_queue=task_queue,
         workflows=[CountTokensWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
     ):
         handle = await codec_client.start_workflow(
             CountTokensWorkflow.run,
@@ -1330,7 +1330,7 @@ async def test_a_replayed_record_is_prepared_off_the_workflow_thread(
         client,
         task_queue=task_queue,
         workflows=[ParkedAcrossEvictionWorkflow, FillerWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
         max_cached_workflows=1,
         max_concurrent_workflow_tasks=2,
     ):
@@ -1541,7 +1541,7 @@ async def test_each_failure_row_is_reported_as_its_own(
         client,
         task_queue=task_queue,
         workflows=[ParkedAcrossEvictionWorkflow, FillerWorkflow],
-        external_stream_backends={"tokens-memory": backend},
+        external_stream_backend=backend,
         # One slot, so the filler Workflow evicts the Run under test and the
         # next Workflow Task has to replay the marker.
         max_cached_workflows=1,

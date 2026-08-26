@@ -64,13 +64,13 @@ def backend() -> MemoryStreamBackend:
 @pytest_asyncio.fixture  # type: ignore[reportUntypedFunctionDecorator]
 async def runtime(backend: MemoryStreamBackend):
     manager = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=_notify,
         watch_block=timedelta(milliseconds=10),
     )
     yield WorkflowStreamRuntime(
         manager=manager,
-        backends={"tokens": backend},
+        backend=backend,
         run_id=RUN_ID,
         namespace="ns",
         workflow_id="wf",
@@ -93,7 +93,6 @@ def subscribe(
     runtime.register(
         wait_id=wait_id,
         stream_key=key,
-        backend_name="tokens",
         idle_timeout=idle_timeout,
     )
     return key
@@ -132,9 +131,7 @@ async def test_a_first_subscription_to_an_empty_stream_still_emits(
     """Without this, replay of an empty stream has nowhere to begin.
 
     The binding carries the stream key, an explicit start cursor, and the
-    backend that owns the wait -- none of which is derivable later, because a
-    cursor is never re-derived from mutable backend state and a provider label
-    cannot say which registered instance a wait was reading.
+    configured provider identity. None is derivable from mutable backend state.
     """
     key = subscribe(runtime, 1)
 
@@ -142,7 +139,6 @@ async def test_a_first_subscription_to_an_empty_stream_still_emits(
 
     binding = decoded.header.streams[1]  # type: ignore[attr-defined]
     assert binding.provider_id == "memory"
-    assert binding.backend_name == "tokens"
     assert decoded.header.streams[1].stream_key == key  # type: ignore[attr-defined]
     assert decoded.header.streams[1].start_cursor == BEGINNING  # type: ignore[attr-defined]
     assert decoded.terminal == {1: BEGINNING}  # type: ignore[attr-defined]
@@ -413,7 +409,7 @@ async def test_a_wait_registered_after_the_first_delta_reaches_the_header(
     )
 
     key = runtime.stream_key("tokens")
-    runtime.register(wait_id=2, stream_key=key, backend_name="tokens")
+    runtime.register(wait_id=2, stream_key=key)
     runtime.record_delivery(2, data("2-0"))
     second = runtime.take_observation_delta()
     assert second is not None
@@ -426,7 +422,6 @@ async def test_a_wait_registered_after_the_first_delta_reaches_the_header(
         "no stream key, no backend, and no start cursor for it"
     )
     assert decoded.header.streams[2].stream_key == key
-    assert decoded.header.streams[2].backend_name == "tokens"
     assert decoded.terminal == {1: AFTER(Offset("1-0")), 2: AFTER(Offset("2-0"))}
 
 
@@ -661,13 +656,13 @@ async def test_readiness_after_a_re_block_names_the_current_generation(
         return ReadinessResult.ACCEPTED
 
     manager = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=notify,
         watch_block=timedelta(milliseconds=10),
     )
     runtime = WorkflowStreamRuntime(
         manager=manager,
-        backends={"tokens": backend},
+        backend=backend,
         run_id=RUN_ID,
         namespace="ns",
         workflow_id="wf",
@@ -732,13 +727,13 @@ async def test_rollover_is_requested_before_the_budget_is_reached(
 ) -> None:
     """The runtime asks Core to roll the task over rather than grow the marker."""
     manager = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=_notify,
         watch_block=timedelta(milliseconds=10),
     )
     runtime = WorkflowStreamRuntime(
         manager=manager,
-        backends={"tokens": backend},
+        backend=backend,
         run_id=RUN_ID,
         namespace="ns",
         workflow_id="wf",
@@ -776,7 +771,7 @@ def _budget_runtime(
 ) -> WorkflowStreamRuntime:
     return WorkflowStreamRuntime(
         manager=manager,
-        backends={"tokens": backend},
+        backend=backend,
         run_id=RUN_ID,
         namespace="ns",
         workflow_id="wf",
@@ -806,7 +801,7 @@ async def test_the_segment_that_crosses_the_mark_asks_for_rollover_itself(
     )
 
     manager = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=_notify,
         watch_block=timedelta(milliseconds=10),
     )
@@ -891,7 +886,7 @@ async def test_a_frame_larger_than_the_slack_rolls_over_instead_of_raising(
     old check-and-fail path could not survive.
     """
     manager = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=_notify,
         watch_block=timedelta(milliseconds=10),
     )
@@ -965,7 +960,7 @@ async def test_an_activation_the_annotation_budget_stopped_is_not_wedged_by_it(
     )
 
     manager = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=_notify,
         watch_block=timedelta(milliseconds=10),
     )
@@ -1035,7 +1030,7 @@ async def test_the_first_record_of_an_activation_is_priced_from_a_measurement(
     until a larger one appears.
     """
     manager = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=_notify,
         watch_block=timedelta(milliseconds=10),
     )
@@ -1101,7 +1096,7 @@ async def test_a_run_too_large_for_any_annotation_says_so_and_fails_the_workflow
     failure, which the server retries on an encoding that cannot succeed (ADR-007).
     """
     manager = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=_notify,
         watch_block=timedelta(milliseconds=10),
     )
@@ -1139,7 +1134,7 @@ async def test_a_subscription_set_too_large_to_record_is_refused_at_subscribe(
     under replay, and names what to change.
     """
     manager = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=_notify,
         watch_block=timedelta(milliseconds=10),
     )
@@ -1179,16 +1174,17 @@ async def test_the_capacity_floor_covers_everything_an_empty_annotation_carries(
     very first completion, which relocates the failure rather than preventing it.
     """
     manager = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=_notify,
         watch_block=timedelta(milliseconds=10),
     )
     try:
-        # One wait whose stream name makes its header 230 bytes and its terminal 4.
+        # One wait whose stream name makes its header large enough that the
+        # remaining segment and spill reserve cross the budget.
         # The budget below fits both with room to spare -- and does not fit the
         # 3-byte segment frame and the 64-byte margin behind them.
         name = "s" * 200
-        runtime = _budget_runtime(backend, manager, max_annotation_bytes=300)
+        runtime = _budget_runtime(backend, manager, max_annotation_bytes=292)
         header_and_terminal = len(
             encode_header(
                 AnnotationHeader(
@@ -1196,7 +1192,6 @@ async def test_the_capacity_floor_covers_everything_an_empty_annotation_carries(
                         1: StreamBinding(
                             stream_key=runtime.stream_key(name),
                             start_cursor=BEGINNING,
-                            backend_name="tokens",
                             provider_id=MemoryStreamBackend.provider_id,
                             provider_format_version=(
                                 MemoryStreamBackend.provider_format_version
@@ -1206,15 +1201,13 @@ async def test_the_capacity_floor_covers_everything_an_empty_annotation_carries(
                 )
             )
         ) + len(encode_terminal({1: BEGINNING}))
-        assert header_and_terminal <= 300, (
+        assert header_and_terminal <= 292, (
             "this set clears header-plus-terminal, which is the whole point: a "
             "floor priced on those two alone accepts it"
         )
 
         with pytest.raises(ExternalStreamCapacityError) as caught:
-            runtime.register(
-                wait_id=1, stream_key=runtime.stream_key(name), backend_name="tokens"
-            )
+            runtime.register(wait_id=1, stream_key=runtime.stream_key(name))
         assert "margin" in str(caught.value), (
             f"the error must say what the floor covers: {caught.value}"
         )
@@ -1299,13 +1292,13 @@ async def test_a_rollover_request_closes_the_annotation_it_splits(
     )
 
     manager = StreamSubscriptionManager(
-        backends={"tokens": backend},
+        backend=backend,
         notify_ready=_notify,
         watch_block=timedelta(milliseconds=10),
     )
     runtime = WorkflowStreamRuntime(
         manager=manager,
-        backends={"tokens": backend},
+        backend=backend,
         run_id=RUN_ID,
         namespace="ns",
         workflow_id="wf",
@@ -1380,20 +1373,6 @@ async def test_running_dry_ends_the_segment_as_no_data_available(
     decoded = annotation_of(runtime)
 
     assert decoded.segments[0].end_reason == SegmentEndReason.NO_DATA_AVAILABLE  # type: ignore[attr-defined]
-
-
-# --- registration -----------------------------------------------------------
-
-
-async def test_naming_an_unregistered_backend_lists_what_is_registered(
-    runtime: WorkflowStreamRuntime,
-) -> None:
-    with pytest.raises(KeyError, match="registered backends are: tokens"):
-        runtime.register(
-            wait_id=1,
-            stream_key=runtime.stream_key("tokens"),
-            backend_name="not-registered",
-        )
 
 
 async def test_the_stream_key_comes_from_the_chain_not_the_run(

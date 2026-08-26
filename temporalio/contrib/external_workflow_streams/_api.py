@@ -3,14 +3,14 @@
 .. code-block:: python
 
     streams = external_stream.with_options(idle_timeout=timedelta(seconds=1))
-    tokens = streams.topic("tokens", backend="tokens-redis", type=str)
+    tokens = streams.topic("tokens", type=str)
 
     async for token in tokens.subscribe():
         process(token)
 
-Workflow code **names** a backend; it never constructs or imports one. Provider
-instances hold connections and credentials, live on the Worker outside the
-sandbox, and are reached only through an opaque handle.
+Workflow code never constructs or imports the backend. Its provider instance
+holds connections and credentials, lives on the Worker outside the sandbox,
+and is reached only through an opaque handle.
 
 Everything here is a mirror image of the shipped
 :py:mod:`temporalio.contrib.workflow_streams`, not a second implementation of
@@ -80,8 +80,8 @@ _RUN_STATE_ATTR = "__temporal_external_stream_state"
 class ExternalStreamRuntime(Protocol):
     """What Workflow code needs from the Worker, and nothing more.
 
-    An opaque handle across the sandbox boundary: it resolves a backend *name*
-    and registers a wait. Workflow code never sees a provider instance.
+    An opaque handle across the sandbox boundary. Workflow code never sees the
+    provider instance configured on the Worker.
     """
 
     def stream_key(self, stream_name: str) -> StreamKey:
@@ -93,7 +93,6 @@ class ExternalStreamRuntime(Protocol):
         *,
         wait_id: int,
         stream_key: StreamKey,
-        backend_name: str,
         idle_timeout: timedelta,
     ) -> None:
         """Registers a wait with the Worker's subscription manager.
@@ -242,27 +241,17 @@ class ExternalStreamOptions:
         )
 
     def topic(
-        self, name: str, *, backend: str, type: type[AnyType] | None = None
+        self, name: str, *, type: type[AnyType] | None = None
     ) -> ExternalStreamTopic[Any]:
         """A handle for one stream.
 
         Args:
             name: The stream name. The only place it appears.
-            backend: The **name** of a backend registered on the Worker with
-                ``external_stream_backends={...}``. Not a provider instance:
-                Workflow code may not hold one.
             type: The value type, used as the decode hint.
         """
         if not name:
             raise ValueError("a topic needs a non-empty name")
-        if not backend:
-            raise ValueError(
-                "a topic needs the name of a backend registered on the Worker; "
-                "Workflow code names a backend rather than constructing one"
-            )
-        return ExternalStreamTopic(
-            name=name, backend_name=backend, value_type=type, options=self
-        )
+        return ExternalStreamTopic(name=name, value_type=type, options=self)
 
 
 @dataclass(frozen=True)
@@ -274,7 +263,6 @@ class ExternalStreamTopic(Generic[AnyType]):
     """
 
     name: str
-    backend_name: str
     value_type: type[AnyType] | None
     options: ExternalStreamOptions
 
@@ -294,7 +282,7 @@ class ExternalStreamTopic(Generic[AnyType]):
         if state.runtime is None:
             raise RuntimeError(
                 "external streams are not configured on this Worker; pass "
-                "external_stream_backends={...} to the Worker"
+                "external_stream_backend=... to the Worker"
             )
         wait_id = state.next_wait_id
         state.next_wait_id += 1
@@ -303,7 +291,6 @@ class ExternalStreamTopic(Generic[AnyType]):
         state.runtime.register(
             wait_id=wait_id,
             stream_key=stream_key,
-            backend_name=self.backend_name,
             # Passed on registration rather than read back from the subscription
             # later, because the runtime is what holds the quiescent set and
             # reduces it with `min`. Leaving it out is not a smaller default --
