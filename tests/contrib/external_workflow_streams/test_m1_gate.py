@@ -250,6 +250,9 @@ M1_COVERAGE: dict[int, str | tuple[str, ...]] = {
         "test_output_runtime.py::test_oversized_marker_manifest_is_rejected_before_external_io",
         "test_output_runtime.py::test_one_oversized_logical_record_is_refused_without_poisoning_batch",
     ),
+    # 102 restores the public default to the required contract after the design
+    # documents were split into guide, specification, and rationale sets.
+    102: "test_api.py::test_the_default_idle_timeout_is_one_second",
 }
 
 #: Case number -> what is still missing, for cases the suite does not fully
