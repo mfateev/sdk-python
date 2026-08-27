@@ -27,6 +27,13 @@ to include examples, links to docs, or any other relevant information.
   external processes publish with `ExternalStreamProducer`, and Workers are
   configured with `external_stream_backend`.
 
+- Added the output direction for External Workflow Streams.
+  Workflows publish with `external_output_stream`, Activities and external
+  processes use `ExternalOutputStreamProducer`, and external consumers resume
+  through `ExternalOutputStreamClient`. Workflow output is staged outside
+  History and becomes readable only after its compact Workflow Task marker is
+  committed.
+
 - Added the `Runtime(disable_environment_info=...)` option to control whether
   runtime, hosting, and platform information is included in worker heartbeats.
 

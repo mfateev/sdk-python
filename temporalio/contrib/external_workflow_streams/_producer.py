@@ -39,6 +39,7 @@ import temporalio.converter
 from temporalio.contrib.external_workflow_streams._backend import (
     AppendConflictError,
     StreamBackend,
+    StreamDirection,
     StreamKey,
 )
 from temporalio.contrib.external_workflow_streams._codec import StreamPayloadCodec
@@ -370,13 +371,19 @@ class WorkflowChainKey:
                     "Activity cannot derive the first execution Run ID"
                 )
 
-    def stream_key(self, stream_name: str) -> StreamKey:
+    def stream_key(
+        self,
+        stream_name: str,
+        *,
+        direction: StreamDirection = StreamDirection.INPUT,
+    ) -> StreamKey:
         """Return the durable key for one stream in this Workflow chain."""
         return StreamKey(
             namespace=self.namespace,
             workflow_id=self.workflow_id,
             first_execution_run_id=self.first_execution_run_id,
             stream_name=stream_name,
+            direction=direction,
         )
 
 

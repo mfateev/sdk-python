@@ -42,6 +42,14 @@ class RecordKind(enum.IntEnum):
     the stream and asserts nothing about other producers.
     """
 
+    FINISH = 3
+    """An output topic's ordered terminal record.
+
+    Unlike a write fence, this closes the topic across its Continue-As-New
+    chain. It is explicit because Workflow failure or termination cannot be
+    relied on to execute cleanup code.
+    """
+
     @property
     def is_control(self) -> bool:
         """Whether this record advances the cursor without yielding a value."""

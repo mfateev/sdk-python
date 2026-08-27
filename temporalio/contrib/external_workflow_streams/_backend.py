@@ -48,6 +48,7 @@ __all__ = [
     "ParkIntent",
     "ParkIntentRemoval",
     "StreamBackend",
+    "StreamDirection",
     "StreamKey",
 ]
 
@@ -79,6 +80,22 @@ class ParkIntent:
             )
 
 
+@enum.unique
+class StreamDirection(enum.Enum):
+    """Which endpoint role a physical stream serves.
+
+    Direction is part of provider identity rather than a user-controlled prefix
+    on ``stream_name``. This permits an input and output topic to share a name
+    without sharing records, idempotency state, or coordination metadata.
+    """
+
+    INPUT = "input"
+    """Records produced externally and consumed by a Workflow."""
+
+    OUTPUT = "output"
+    """Records produced by a Workflow or Activity for an external client."""
+
+
 @dataclass(frozen=True)
 class StreamKey:
     """What identifies a stream, for the whole life of a Continue-As-New chain.
@@ -92,6 +109,12 @@ class StreamKey:
     workflow_id: str
     first_execution_run_id: str
     stream_name: str
+    direction: StreamDirection = StreamDirection.INPUT
+    """The endpoint direction, defaulting to the existing input protocol.
+
+    The default preserves the meaning of every four-argument ``StreamKey``
+    constructor used by existing input providers and applications.
+    """
 
     def __post_init__(self) -> None:
         """Require every component of the durable stream identity."""
@@ -103,12 +126,17 @@ class StreamKey:
         ):
             if not getattr(self, field_name):
                 raise ValueError(f"a stream key needs a non-empty {field_name}")
+        if not isinstance(self.direction, StreamDirection):
+            raise TypeError(
+                "a stream key direction must be a StreamDirection, got "
+                f"{type(self.direction).__name__}"
+            )
 
     def __str__(self) -> str:
         """Return a slash-delimited diagnostic representation."""
         return (
             f"{self.namespace}/{self.workflow_id}/"
-            f"{self.first_execution_run_id}/{self.stream_name}"
+            f"{self.first_execution_run_id}/{self.direction.value}/{self.stream_name}"
         )
 
 

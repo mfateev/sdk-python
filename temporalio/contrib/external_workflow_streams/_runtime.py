@@ -25,11 +25,13 @@ Two rules here are easy to get subtly wrong:
 from __future__ import annotations
 
 import asyncio
+import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
+import temporalio.api.common.v1
 import temporalio.converter
 import temporalio.workflow
 from temporalio.contrib.external_workflow_streams._annotation import (
@@ -52,26 +54,44 @@ from temporalio.contrib.external_workflow_streams._api import (
 )
 from temporalio.contrib.external_workflow_streams._backend import (
     StreamBackend,
+    StreamDirection,
     StreamKey,
 )
 from temporalio.contrib.external_workflow_streams._codec import StreamPayloadCodec
 from temporalio.contrib.external_workflow_streams._continuation import Continuation
 from temporalio.contrib.external_workflow_streams._errors import (
     ExternalStreamCapacityError,
+    StreamIntegrityError,
     StreamStorageError,
 )
 from temporalio.contrib.external_workflow_streams._manager import (
     StreamSubscriptionManager,
 )
+from temporalio.contrib.external_workflow_streams._output_backend import (
+    OutputStageConflictError,
+    OutputStageManifest,
+    OutputStageStatus,
+    OutputStreamBackend,
+    StagedOutputRecord,
+)
+from temporalio.contrib.external_workflow_streams._output_codec import (
+    LOGICAL_FINGERPRINT_VERSION,
+    canonical_logical_record_frame,
+    fingerprint_logical_frames,
+)
+from temporalio.contrib.external_workflow_streams._output_continuation import (
+    OutputContinuation,
+)
 from temporalio.contrib.external_workflow_streams._record import (
     AFTER,
     BEGINNING,
     Cursor,
+    RecordKind,
     StreamRecord,
 )
 from temporalio.contrib.external_workflow_streams._replay import ReplayPlan
 
-__all__ = ["QuiescentWait", "WorkflowStreamRuntime"]
+__all__ = ["QuiescentWait", "StagedWorkflowOutput", "WorkflowStreamRuntime"]
 
 _RUN_COST_FLOOR = 64
 """The per-record annotation cost assumed until a real run has been measured.
@@ -110,6 +130,10 @@ segment is finite and already recorded, so "as many as the segment holds" and
 "no limit" are the same answer.
 """
 
+_OUTPUT_MANIFEST_SCHEMA_VERSION = 1
+_MAX_OUTPUT_MANIFEST_BYTES = 64 * 1024
+"""Hard ceiling for output metadata placed in the compact History marker."""
+
 
 @dataclass(frozen=True)
 class QuiescentWait:
@@ -118,6 +142,37 @@ class QuiescentWait:
     wait_id: int
     generation: int
     immediately_parkable: bool
+
+
+@dataclass(frozen=True)
+class _LogicalOutputRecord:
+    topic: str
+    kind: RecordKind
+    payload: temporalio.api.common.v1.Payload | None
+    frame: bytes
+
+
+@dataclass(frozen=True)
+class StagedOutputTopic:
+    """One topic sub-batch staged under a Workflow Task's shared token."""
+
+    manifest: OutputStageManifest
+    finished: bool
+
+
+@dataclass(frozen=True)
+class StagedWorkflowOutput:
+    """Compact marker material for one durably staged Workflow output batch."""
+
+    schema_version: int
+    fingerprint_version: int
+    stage_token: str
+    history_floor_event_id: int
+    run_id: str
+    provider_id: str
+    provider_format_version: int
+    topics: tuple[StagedOutputTopic, ...]
+    segment_record_counts: tuple[tuple[int, ...], ...]
 
 
 @dataclass
@@ -208,6 +263,7 @@ class WorkflowStreamRuntime:
         default_idle_timeout: timedelta,
         max_annotation_bytes: int = MAX_ANNOTATION_BYTES,
         continuation: Continuation | None = None,
+        output_continuation: OutputContinuation | None = None,
     ) -> None:
         """Create the per-Run runtime and restore any continuation state."""
         self._manager = manager
@@ -298,9 +354,46 @@ class WorkflowStreamRuntime:
         #: streams run n times as long.
         self._delivered_this_activation = 0
 
+        # Workflow-originated output is logical Payload data until the Worker
+        # stages it after the activation. Keeping it here makes backend handles
+        # and codecs unreachable from Workflow code while still letting replay
+        # compare the exact deterministic pre-codec identity.
+        self._output_records: list[_LogicalOutputRecord] = []
+        self._output_topics: list[str] = []
+        if output_continuation is not None:
+            if not isinstance(backend, OutputStreamBackend):
+                raise StreamStorageError(
+                    "Workflow History contains external output continuation state, "
+                    "but the configured backend does not support output streams"
+                )
+            if (
+                output_continuation.provider_id != type(backend).provider_id
+                or output_continuation.provider_format_version
+                != type(backend).provider_format_version
+            ):
+                raise StreamStorageError(
+                    "the configured output provider does not match the provider "
+                    "recorded by the preceding Run"
+                )
+        self._output_finished: set[str] = set(
+            () if output_continuation is None else output_continuation.finished_topics
+        )
+        self._output_segments: list[dict[str, int]] = []
+        self._output_history_floor_event_id: int | None = None
+        self._output_max_records: int | None = None
+        self._output_max_logical_bytes: int | None = None
+        self._output_max_publish_latency: timedelta | None = None
+        self._output_logical_bytes = 0
+        self._output_rollover_requested = False
+        self._output_capacity_waiters: list[asyncio.Future[None]] = []
+        self._output_stage_token: str | None = None
+        self._staged_output: StagedWorkflowOutput | None = None
+        self._output_replay_manifest: Any = None
+        self._output_replay_finished_before: set[str] | None = None
+
     # --- the per-activation delivery budget ---------------------------------
 
-    def begin_activation(self) -> None:
+    def begin_activation(self, history_floor_event_id: int | None = None) -> None:
         """Resets the delivery budget. Called once per activation.
 
         The budget is per activation because that is the unit the deadlock
@@ -323,6 +416,24 @@ class WorkflowStreamRuntime:
         self._delivered_this_activation = sum(
             state.ready_records for state in self._subscriptions.values()
         )
+        if history_floor_event_id is not None:
+            if (
+                self._output_history_floor_event_id is not None
+                and self._output_history_floor_event_id != history_floor_event_id
+                and self._output_records
+            ):
+                raise RuntimeError(
+                    "a new Workflow Task began before the preceding output batch "
+                    "was staged"
+                )
+            if self._output_history_floor_event_id != history_floor_event_id:
+                self._output_segments = []
+                self._output_history_floor_event_id = history_floor_event_id
+                for waiter in self._output_capacity_waiters:
+                    if not waiter.done():
+                        waiter.set_result(None)
+                self._output_capacity_waiters = []
+        self._output_segments.append({})
 
     def delivery_budget_remaining(self) -> int:
         """How many more records this activation may hand to Workflow code.
@@ -605,6 +716,407 @@ class WorkflowStreamRuntime:
             first_execution_run_id=self._first_execution_run_id,
             stream_name=stream_name,
         )
+
+    # --- Workflow-originated output ---------------------------------------
+
+    async def publish_output(
+        self,
+        *,
+        topic: str,
+        value: Any,
+        value_type: type | None,
+        kind: RecordKind,
+        max_publish_latency: timedelta,
+        max_records: int,
+        max_logical_bytes: int,
+    ) -> None:
+        """Convert and buffer one deterministic logical output record.
+
+        This method runs on the Workflow thread. It deliberately performs only
+        the synchronous payload-converter step; codecs, external payload
+        storage, and the output provider run later on the Worker's loop.
+        """
+        del value_type  # A decode hint for readers; encoding depends on the value.
+        if self._output_replay_manifest is None and not isinstance(
+            self._backend, OutputStreamBackend
+        ):
+            raise RuntimeError(
+                "the configured external stream backend does not support output staging"
+            )
+        if topic in self._output_finished:
+            raise temporalio.workflow.NondeterminismError(
+                f"external output topic {topic!r} was already finished"
+            )
+
+        payload: temporalio.api.common.v1.Payload | None
+        if kind is RecordKind.DATA:
+            payloads = self._data_converter.payload_converter.to_payloads([value])
+            if len(payloads) != 1:
+                raise ValueError(
+                    f"converting one output value produced {len(payloads)} Payloads; "
+                    "exactly one is required"
+                )
+            payload = payloads[0]
+        else:
+            payload = None
+        frame = canonical_logical_record_frame(topic, kind, payload)
+        replaying = self._output_replay_manifest is not None
+        if not replaying and len(frame) > max_logical_bytes:
+            raise ExternalStreamCapacityError(
+                f"one record for output topic {topic!r} has {len(frame)} logical "
+                f"bytes, exceeding the configured maximum {max_logical_bytes}"
+            )
+
+        while not replaying:
+            effective_records = min(
+                max_records,
+                self._output_max_records or max_records,
+            )
+            effective_bytes = min(
+                max_logical_bytes,
+                self._output_max_logical_bytes or max_logical_bytes,
+            )
+            if not self._output_records or (
+                len(self._output_records) + 1 <= effective_records
+                and self._output_logical_bytes + len(frame) <= effective_bytes
+            ):
+                break
+            # Awaiting is the deterministic backpressure point. The activation
+            # returns with the current batch, the Worker stages it, and Core's
+            # forced replacement task resolves this future from begin_activation.
+            self._output_rollover_requested = True
+            waiter = self.new_readiness_future()
+            self._output_capacity_waiters.append(waiter)
+            await waiter
+
+        if topic not in self._output_topics:
+            self._output_topics.append(topic)
+        if not self._output_segments:
+            self._output_segments.append({})
+        self._output_segments[-1][topic] = self._output_segments[-1].get(topic, 0) + 1
+        self._output_records.append(_LogicalOutputRecord(topic, kind, payload, frame))
+        self._output_logical_bytes += len(frame)
+        # Replay validates the batch History recorded. It must not retain the
+        # currently configured capacity or latency as policy for the next live
+        # batch: those options may have changed since this marker was written,
+        # and neither is active while replaying.
+        if not replaying:
+            self._output_max_records = min(
+                max_records,
+                self._output_max_records or max_records,
+            )
+            self._output_max_logical_bytes = min(
+                max_logical_bytes,
+                self._output_max_logical_bytes or max_logical_bytes,
+            )
+            self._output_max_publish_latency = min(
+                max_publish_latency,
+                self._output_max_publish_latency or max_publish_latency,
+            )
+        if kind is RecordKind.FINISH:
+            self._output_finished.add(topic)
+
+    @property
+    def has_output(self) -> bool:
+        """Whether this Workflow Task has logical output awaiting staging."""
+        return bool(self._output_records)
+
+    @property
+    def output_rollover_requested(self) -> bool:
+        """Whether capacity backpressure is waiting for a replacement task."""
+        return self._output_rollover_requested
+
+    @property
+    def output_max_publish_latency(self) -> timedelta | None:
+        """The minimum latency configured by non-empty topics in this batch."""
+        return self._output_max_publish_latency
+
+    async def stage_output(self, history_floor_event_id: int) -> StagedWorkflowOutput:
+        """Apply outbound transforms and durably stage the current batch."""
+        if history_floor_event_id < 1:
+            raise RuntimeError(
+                "Core did not provide the exact predecessor of this Workflow "
+                "Task's Scheduled event; refusing to stage output"
+            )
+        if not self._output_records:
+            raise RuntimeError("there is no Workflow output to stage")
+        if self._output_history_floor_event_id not in (None, history_floor_event_id):
+            raise RuntimeError("the output batch belongs to a different Workflow Task")
+        backend = self._backend
+        if not isinstance(backend, OutputStreamBackend):
+            raise RuntimeError("the configured backend does not support output staging")
+
+        token = self._output_stage_token
+        if token is None:
+            token = secrets.token_urlsafe(24)
+            self._output_stage_token = token
+
+        records_by_topic = {
+            topic: [record for record in self._output_records if record.topic == topic]
+            for topic in self._output_topics
+        }
+        topic_manifests: list[StagedOutputTopic] = []
+        for sub_batch_id, topic in enumerate(self._output_topics):
+            logical_records = records_by_topic[topic]
+            fingerprint = fingerprint_logical_frames(
+                record.frame for record in logical_records
+            )
+            key = StreamKey(
+                namespace=self._namespace,
+                workflow_id=self._workflow_id,
+                first_execution_run_id=self._first_execution_run_id,
+                stream_name=topic,
+                direction=StreamDirection.OUTPUT,
+            )
+            manifest = OutputStageManifest(
+                stream_key=key,
+                provider_id=type(backend).provider_id,
+                provider_format_version=type(backend).provider_format_version,
+                stage_token=token,
+                run_id=self._run_id,
+                history_floor_event_id=history_floor_event_id,
+                sub_batch_id=sub_batch_id,
+                fingerprint_version=fingerprint.version,
+                fingerprint=fingerprint.digest,
+                record_count=fingerprint.record_count,
+                logical_byte_count=fingerprint.logical_byte_count,
+            )
+            topic_manifests.append(
+                StagedOutputTopic(
+                    manifest,
+                    any(record.kind is RecordKind.FINISH for record in logical_records),
+                )
+            )
+
+        staged = StagedWorkflowOutput(
+            schema_version=_OUTPUT_MANIFEST_SCHEMA_VERSION,
+            fingerprint_version=LOGICAL_FINGERPRINT_VERSION,
+            stage_token=token,
+            history_floor_event_id=history_floor_event_id,
+            run_id=self._run_id,
+            provider_id=type(backend).provider_id,
+            provider_format_version=type(backend).provider_format_version,
+            topics=tuple(topic_manifests),
+            segment_record_counts=tuple(
+                tuple(segment.get(topic, 0) for topic in self._output_topics)
+                for segment in self._output_segments
+            ),
+        )
+        # Bound the exact protobuf that will enter History before running a
+        # payload codec, external payload store, or provider operation. Topic
+        # names and a many-activation segment schedule can otherwise make a
+        # payload-free marker exceed the server event budget after external
+        # side effects have already happened.
+        from temporalio.bridge.proto.external_data import ExternalOutputStreamManifest
+
+        marker_manifest = ExternalOutputStreamManifest(
+            schema_version=staged.schema_version,
+            fingerprint_version=staged.fingerprint_version,
+            stage_token=staged.stage_token,
+            history_floor_event_id=staged.history_floor_event_id,
+            run_id=staged.run_id,
+            provider_id=staged.provider_id,
+            provider_format_version=staged.provider_format_version,
+        )
+        for staged_topic in staged.topics:
+            source = staged_topic.manifest
+            marker_topic = marker_manifest.topics.add()
+            marker_topic.topic = source.stream_key.stream_name
+            marker_topic.record_count = source.record_count
+            marker_topic.logical_byte_count = source.logical_byte_count
+            marker_topic.logical_fingerprint = source.fingerprint
+            marker_topic.finished = staged_topic.finished
+        for counts in staged.segment_record_counts:
+            marker_manifest.segments.add().record_counts_by_topic.extend(counts)
+        manifest_bytes = marker_manifest.ByteSize()
+        if manifest_bytes > _MAX_OUTPUT_MANIFEST_BYTES:
+            raise ExternalStreamCapacityError(
+                "this Workflow Task's external output manifest needs "
+                f"{manifest_bytes} bytes, exceeding the hard "
+                f"{_MAX_OUTPUT_MANIFEST_BYTES}-byte marker budget; shorten output "
+                "topic names or publish from fewer activation segments"
+            )
+
+        # Save the immutable attempt before the first provider await. A lost
+        # acknowledgement retries the same token and manifest; encoded bytes may
+        # change under a randomized codec, and the provider retains the first.
+        if self._staged_output is None:
+            self._staged_output = staged
+        elif self._staged_output != staged:
+            raise RuntimeError(
+                "one stage token was reused for different logical output"
+            )
+
+        encoded_by_topic: dict[str, list[StagedOutputRecord]] = {}
+        for topic in self._output_topics:
+            encoded_records: list[StagedOutputRecord] = []
+            for publish_index, record in enumerate(records_by_topic[topic]):
+                if record.payload is None:
+                    encoded = b""
+                else:
+                    copied = temporalio.api.common.v1.Payload()
+                    copied.CopyFrom(record.payload)
+                    transformed = await self._data_converter._encode_payload_sequence(
+                        [copied]
+                    )
+                    transformed = (
+                        await self._data_converter._external_store_payload_sequence(
+                            transformed
+                        )
+                    )
+                    if len(transformed) != 1:
+                        raise ValueError(
+                            "transforming one output Payload did not produce exactly one"
+                        )
+                    encoded = transformed[0].SerializeToString()
+                encoded_records.append(
+                    StagedOutputRecord(publish_index, record.kind, encoded)
+                )
+            encoded_by_topic[topic] = encoded_records
+
+        for topic in self._output_topics:
+            topic_stage = next(
+                value
+                for value in staged.topics
+                if value.manifest.stream_key.stream_name == topic
+            )
+            try:
+                provider_stage = await backend.stage_output(
+                    topic_stage.manifest, encoded_by_topic[topic]
+                )
+            except OutputStageConflictError as err:
+                raise StreamIntegrityError(
+                    "the output provider rejected an idempotent stage retry with "
+                    f"a conflicting manifest for topic {topic!r}"
+                ) from err
+            except (StreamIntegrityError, StreamStorageError):
+                raise
+            except Exception as err:
+                raise StreamStorageError(
+                    f"failed staging external output topic {topic!r}"
+                ) from err
+            if (
+                provider_stage.manifest != topic_stage.manifest
+                or provider_stage.status is not OutputStageStatus.PENDING
+            ):
+                raise StreamIntegrityError(
+                    "the output provider did not retain the exact stage as pending "
+                    f"for topic {topic!r}"
+                )
+        return staged
+
+    def output_stage_recorded(self) -> None:
+        """Start the next batch after its compact commit command was emitted."""
+        self._output_records = []
+        self._output_topics = []
+        self._output_segments = []
+        self._output_logical_bytes = 0
+        self._output_max_records = None
+        self._output_max_logical_bytes = None
+        self._output_max_publish_latency = None
+        self._output_rollover_requested = False
+        self._output_stage_token = None
+        self._staged_output = None
+
+    def begin_output_replay(self, manifest: Any) -> None:
+        """Install the marker's output expectations without touching a backend."""
+        if self._output_replay_manifest is not None:
+            raise RuntimeError("an external output replay is already in progress")
+        if manifest.schema_version != _OUTPUT_MANIFEST_SCHEMA_VERSION:
+            raise RuntimeError(
+                "external output marker schema version "
+                f"{manifest.schema_version} is unsupported"
+            )
+        if manifest.fingerprint_version != LOGICAL_FINGERPRINT_VERSION:
+            raise RuntimeError(
+                "external output logical fingerprint version "
+                f"{manifest.fingerprint_version} is unsupported"
+            )
+        self._output_replay_manifest = manifest
+        self._output_replay_finished_before = set(self._output_finished)
+        self._output_records = []
+        self._output_topics = []
+        self._output_segments = []
+        self._output_logical_bytes = 0
+        self._output_max_records = None
+        self._output_max_logical_bytes = None
+        self._output_max_publish_latency = None
+        self._output_rollover_requested = False
+        self._output_stage_token = None
+
+    def begin_output_replay_segment(self) -> None:
+        """Attach output expectations to the shared input/output drain frame."""
+        self._output_segments.append({})
+
+    def verify_output_replay(self) -> None:
+        """Match replayed publish calls against the compact logical manifest."""
+        expected = self._output_replay_manifest
+        if expected is None:
+            return
+        actual_topics = []
+        for topic in self._output_topics:
+            records = [
+                record for record in self._output_records if record.topic == topic
+            ]
+            fingerprint = fingerprint_logical_frames(record.frame for record in records)
+            actual_topics.append(
+                (
+                    topic,
+                    fingerprint.record_count,
+                    fingerprint.logical_byte_count,
+                    fingerprint.digest,
+                    any(record.kind is RecordKind.FINISH for record in records),
+                )
+            )
+        expected_topics = [
+            (
+                topic.topic,
+                topic.record_count,
+                topic.logical_byte_count,
+                bytes(topic.logical_fingerprint),
+                topic.finished,
+            )
+            for topic in expected.topics
+        ]
+        expected_segments = [
+            tuple(segment.record_counts_by_topic) for segment in expected.segments
+        ]
+        actual_segments = [
+            tuple(segment.get(topic, 0) for topic in self._output_topics)
+            for segment in self._output_segments
+        ]
+        if actual_topics != expected_topics or actual_segments != expected_segments:
+            raise temporalio.workflow.NondeterminismError(
+                "Workflow output publish calls do not match the external output "
+                "manifest recorded in History"
+            )
+        self._output_replay_manifest = None
+        self._output_replay_finished_before = None
+        self._output_records = []
+        self._output_topics = []
+        self._output_segments = []
+        self._output_logical_bytes = 0
+        self._output_max_records = None
+        self._output_max_logical_bytes = None
+        self._output_max_publish_latency = None
+        self._output_rollover_requested = False
+
+    def abandon_output_replay(self) -> None:
+        """Drop a failed marker's expectations without validating partial output."""
+        if self._output_replay_manifest is None:
+            return
+        if self._output_replay_finished_before is not None:
+            self._output_finished = self._output_replay_finished_before
+        self._output_replay_manifest = None
+        self._output_replay_finished_before = None
+        self._output_records = []
+        self._output_topics = []
+        self._output_segments = []
+        self._output_logical_bytes = 0
+        self._output_max_records = None
+        self._output_max_logical_bytes = None
+        self._output_max_publish_latency = None
+        self._output_rollover_requested = False
 
     def register(
         self,
@@ -1342,6 +1854,21 @@ class WorkflowStreamRuntime:
                 wait_id: binding.provider_format_version
                 for wait_id, binding in bindings.items()
             },
+        )
+
+    def output_continuation(self) -> OutputContinuation | None:
+        """Finished output topics that a successor Run must not reopen."""
+        if not self._output_finished:
+            return None
+        backend = self._backend
+        if not isinstance(backend, OutputStreamBackend):
+            raise RuntimeError(
+                "finished output topics have no configured output provider"
+            )
+        return OutputContinuation(
+            finished_topics=frozenset(self._output_finished),
+            provider_id=type(backend).provider_id,
+            provider_format_version=type(backend).provider_format_version,
         )
 
     def restored_start(self, wait_id: int, stream_name: str) -> Cursor:

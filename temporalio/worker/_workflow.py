@@ -19,6 +19,7 @@ import temporalio.api.common.v1
 import temporalio.api.enums.v1
 import temporalio.bridge.proto.common
 import temporalio.bridge.proto.workflow_activation
+import temporalio.bridge.proto.workflow_commands
 import temporalio.bridge.proto.workflow_completion
 import temporalio.bridge.runtime
 import temporalio.bridge.worker
@@ -76,6 +77,54 @@ def _set_external_storage_metrics(
     target.total_size_bytes = metrics.total_size
     target.total_duration.FromTimedelta(metrics.total_duration)
     target.driver_names.extend(sorted(metrics.driver_names))
+
+
+def _try_buffer_external_output(
+    completion: temporalio.bridge.proto.workflow_completion.WorkflowActivationCompletion,
+    runtime: Any,
+) -> bool:
+    """Tell Core to retain a live output batch when this completion can wait.
+
+    A quiescent input snapshot is the ordinary proof that Core can keep this
+    Workflow Task open. A park recheck that became ready is the other safe
+    retained transition: the attempted park lost to readiness and Core resumes
+    the same task. Any user/server command, a confirmed park, or capacity
+    backpressure takes the ordinary staging path instead.
+    """
+    if runtime.output_rollover_requested:
+        return False
+    max_publish_latency = runtime.output_max_publish_latency
+    if max_publish_latency is None:
+        return False
+
+    commands = completion.successful.commands
+    variants = [command.WhichOneof("variant") for command in commands]
+    became_ready = (
+        len(commands) == 1
+        and commands[0].HasField("external_stream_park_result")
+        and commands[0].external_stream_park_result.HasField("became_ready")
+    )
+    quiescent = "workflow_stream_quiescent" in variants and all(
+        variant in ("workflow_stream_progress", "workflow_stream_quiescent")
+        for variant in variants
+    )
+    if not became_ready and not quiescent:
+        return False
+
+    command = temporalio.bridge.proto.workflow_commands.WorkflowCommand()
+    command.workflow_output_stream_buffered.max_publish_latency.FromTimedelta(
+        max_publish_latency
+    )
+    # Keep input progress first and the quiescent snapshot last. This mirrors
+    # output commits and lets Core observe the cursor delta before retaining the
+    # task whose output deadline it is about to arm.
+    insert_at = 0
+    while insert_at < len(commands) and commands[insert_at].HasField(
+        "workflow_stream_progress"
+    ):
+        insert_at += 1
+    commands.insert(insert_at, command)
+    return True
 
 
 class _WorkflowWorker:  # type:ignore[reportUnusedClass]
@@ -202,6 +251,11 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         #: silently found nothing -- and the jobs that must never reach
         #: `activate()` quietly went to `_apply` instead.
         self._external_stream_runtimes: dict[str, Any] = {}
+        # Stages survive activations within the cached Run because Core may
+        # defer the server completion behind a local activity. A marker can be
+        # committed by that later activation even though it staged no new
+        # output of its own.
+        self._pending_external_output_stages: dict[str, list[Any]] = {}
         self._disable_eager_activity_execution = disable_eager_activity_execution
         self._on_eviction_hook = on_eviction_hook
         self._disable_safe_eviction = disable_safe_eviction
@@ -426,6 +480,7 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         )
         completion.successful.SetInParent()
         workflow = None
+        workflow_id: str | None = None
         data_converter = self._data_converter
         download_metrics = temporalio.converter._extstore.StorageOperationMetrics()
         try:
@@ -535,6 +590,19 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
                     # Set the task and raise
                     workflow.deadlocked_activation_task = activate_task
                     raise deadlock_exc from None
+
+            output_runtime = self._external_stream_runtimes.get(act.run_id)
+            if (
+                output_runtime is not None
+                and completion.HasField("successful")
+                and not act.is_replaying
+                and output_runtime.has_output
+            ):
+                await self._stage_or_buffer_external_output(
+                    act,
+                    completion,
+                    output_runtime,
+                )
 
         except Exception as err:
             if isinstance(err, _DeadlockError):
@@ -655,6 +723,11 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
                 "Failed completing activation on workflow with run ID %s", act.run_id
             )
         else:
+            if workflow_id is not None:
+                await self._promote_external_output(
+                    run_id=act.run_id,
+                    workflow_id=workflow_id,
+                )
             # A wake accepted by the service stays outstanding until the task it
             # caused completes successfully. Failed/rejected tasks replay, and
             # readiness rebuilt during that replay must remain coalesced behind
@@ -782,6 +855,7 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             # skips the instance's eviction job entirely, and a Run whose
             # watchers outlived it would keep a backend connection open forever.
             self._external_stream_runtimes.pop(act.run_id, None)
+            self._pending_external_output_stages.pop(act.run_id, None)
             if self._external_stream_manager is not None:
                 await self._external_stream_manager.evict_run(act.run_id)
         try:
@@ -971,9 +1045,11 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             # error or an integrity violation surfaces from here through the
             # activation-failure path rather than as a deadlock timeout, which
             # would misattribute a storage problem to the Workflow's own code.
-            plan = await self._stream_manager().prepare_replay(
-                act.run_id, replay.replay_annotation
-            )
+            plan = None
+            if replay.replay_annotation:
+                plan = await self._stream_manager().prepare_replay(
+                    act.run_id, replay.replay_annotation
+                )
             # The other half of the same record's decoding. `prepare_replay`
             # bound the codec to the stream key the *marker* recorded; the
             # converter that runs inside `activate()` would otherwise stay bound
@@ -982,7 +1058,8 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             # out here for the reason `_create_external_stream_runtime` gives:
             # `with_context` clones the user's component converters, and the
             # runtime crosses into the Workflow sandbox.
-            runtime.install_replay_converters(self._replay_stream_converters(plan))
+            if plan is not None:
+                runtime.install_replay_converters(self._replay_stream_converters(plan))
             return None
 
         if park is None and finalize is None:
@@ -1046,6 +1123,124 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
                 runtime.add_terminal()
             )
         return completion
+
+    async def _stage_or_buffer_external_output(
+        self,
+        act: temporalio.bridge.proto.workflow_activation.WorkflowActivation,
+        completion: temporalio.bridge.proto.workflow_completion.WorkflowActivationCompletion,
+        runtime: Any,
+    ) -> None:
+        """Retain a safe batch, or stage it before reporting this completion."""
+        if _try_buffer_external_output(completion, runtime):
+            return
+        staged_output = await self._stage_external_output(act, completion, runtime)
+        pending = self._pending_external_output_stages.setdefault(act.run_id, [])
+        for topic in staged_output.topics:
+            if topic.manifest not in pending:
+                pending.append(topic.manifest)
+
+    async def _stage_external_output(
+        self,
+        act: temporalio.bridge.proto.workflow_activation.WorkflowActivation,
+        completion: temporalio.bridge.proto.workflow_completion.WorkflowActivationCompletion,
+        runtime: Any,
+    ) -> Any:
+        """Stage Workflow output before its compact marker command reaches Core."""
+        staged = await runtime.stage_output(act.history_floor_event_id)
+        command = temporalio.bridge.proto.workflow_commands.WorkflowCommand()
+        output = command.workflow_output_stream_commit
+        output.request_rollover = runtime.output_rollover_requested
+        manifest = output.manifest
+        manifest.schema_version = staged.schema_version
+        manifest.fingerprint_version = staged.fingerprint_version
+        manifest.stage_token = staged.stage_token
+        manifest.history_floor_event_id = staged.history_floor_event_id
+        manifest.run_id = staged.run_id
+        manifest.provider_id = staged.provider_id
+        manifest.provider_format_version = staged.provider_format_version
+        for staged_topic in staged.topics:
+            source = staged_topic.manifest
+            topic = manifest.topics.add()
+            topic.topic = source.stream_key.stream_name
+            topic.record_count = source.record_count
+            topic.logical_byte_count = source.logical_byte_count
+            topic.logical_fingerprint = source.fingerprint
+            topic.finished = staged_topic.finished
+        for counts in staged.segment_record_counts:
+            segment = manifest.segments.add()
+            segment.record_counts_by_topic.extend(counts)
+
+        # Input progress remains first. It validates consumed input before any
+        # command that could depend on it, while this internal commit sits ahead
+        # of the user's server-bound commands.
+        commands = completion.successful.commands
+        insert_at = 0
+        while insert_at < len(commands) and commands[insert_at].HasField(
+            "workflow_stream_progress"
+        ):
+            insert_at += 1
+        commands.insert(insert_at, command)
+        runtime.output_stage_recorded()
+        return staged
+
+    async def _promote_external_output(
+        self,
+        *,
+        run_id: str,
+        workflow_id: str,
+    ) -> None:
+        """Promote a staged batch only after History proves its marker.
+
+        Core's completion call has already made its server RPC by this point,
+        but it deliberately absorbs report errors in order to drive eviction
+        and task retry. A successful bridge await therefore is not itself a
+        commit proof. Reusing the cold-client History predicate keeps definite
+        rejection and ambiguous transport outcomes safely pending/aborted while
+        making the healthy path visible without waiting for a reader.
+        """
+        backend = self._external_stream_backend
+        client = self._client
+        if backend is None or client is None:
+            return
+
+        from temporalio.contrib.external_workflow_streams._output_client import (
+            _reconcile_output_stage,
+        )
+
+        pending = self._pending_external_output_stages.get(run_id)
+        if not pending:
+            return
+        unresolved: list[Any] = []
+        for manifest in pending:
+            try:
+                resolved = await _reconcile_output_stage(
+                    backend=backend,
+                    client=client,
+                    workflow_id=workflow_id,
+                    manifest=manifest,
+                )
+                if not resolved:
+                    unresolved.append(manifest)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                # Promotion is an optimization over the durable pending
+                # barrier. A cold client repeats this exact reconciliation, so
+                # a transient History/backend failure must not retroactively
+                # turn an already-reported Workflow Task into an SDK failure.
+                self._stream_metrics.record(err)
+                logger.warning(
+                    "Could not opportunistically reconcile external output stage "
+                    "%s for Workflow %s; it remains pending for a client",
+                    manifest.stage_token,
+                    workflow_id,
+                    exc_info=True,
+                )
+                unresolved.append(manifest)
+        if unresolved:
+            self._pending_external_output_stages[run_id] = unresolved
+        else:
+            self._pending_external_output_stages.pop(run_id, None)
 
     def _replay_stream_converters(
         self, plan: Any
@@ -1300,6 +1495,9 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         from temporalio.contrib.external_workflow_streams._continuation import (
             read_continuation_header,
         )
+        from temporalio.contrib.external_workflow_streams._output_continuation import (
+            read_output_continuation_header,
+        )
         from temporalio.contrib.external_workflow_streams._runtime import (
             WorkflowStreamRuntime,
         )
@@ -1312,11 +1510,12 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
         # every stream call; otherwise the successor silently discards the
         # cursor and binding its predecessor committed.
         continuation = read_continuation_header(dict(init.headers))
+        output_continuation = read_output_continuation_header(dict(init.headers))
         if (
             continuation is not None
             and continuation.cursors
-            and not self._external_streams_configured
-        ):
+            or output_continuation is not None
+        ) and not self._external_streams_configured:
             raise RuntimeError(
                 "Workflow History contains external stream continuation state, "
                 "but external streams are not configured on this Worker; pass "
@@ -1362,6 +1561,7 @@ class _WorkflowWorker:  # type:ignore[reportUnusedClass]
             # was established would already have been overwritten by BEGINNING
             # (ADR-022).
             continuation=continuation,
+            output_continuation=output_continuation,
         )
 
     def nondeterminism_as_workflow_fail(self) -> bool:

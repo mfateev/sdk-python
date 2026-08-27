@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 from datetime import timedelta
 from typing import Any
 
@@ -36,11 +37,17 @@ from temporalio.worker import Worker
 
 with workflow.unsafe.imports_passed_through():
     from temporalio.contrib.external_workflow_streams._api import external_stream
+    from temporalio.contrib.external_workflow_streams._output_api import (
+        external_output_stream,
+    )
 
 STREAM_NAME = "tokens"
 
 READ_LOG = "reads"
 """Key suffix under which a recording provider logs the offsets it read."""
+
+OUTPUT_STAGE_LOG = "output-stages"
+"""Key suffix used to prove an output stage survived a process kill."""
 
 
 @workflow.defn
@@ -62,8 +69,45 @@ class CrashConsumeWorkflow:
         return seen
 
 
+@workflow.defn
+class CrashPublishWorkflow:
+    """Publishes output on a Workflow Task whose Worker will be killed."""
+
+    @workflow.run
+    async def run(self) -> str:
+        topic = external_output_stream.topic("events", type=str)
+        await topic.publish("accepted-after-crash")
+        await topic.finish()
+        return "done"
+
+
+@workflow.defn
+class CrashUpdatePublishWorkflow:
+    """Waits for an Update that publishes while its report is withheld."""
+
+    def __init__(self) -> None:
+        self._finished = False
+
+    @workflow.run
+    async def run(self) -> None:
+        await workflow.wait_condition(lambda: self._finished)
+
+    @workflow.update
+    async def publish(self, value: str) -> str:
+        await external_output_stream.topic("events", type=str).publish(value)
+        return value
+
+    @workflow.signal
+    def finish(self) -> None:
+        self._finished = True
+
+
 def read_log_key(prefix: str, reader: str) -> str:
     return f"{prefix}:{READ_LOG}:{reader}"
+
+
+def output_stage_log_key(prefix: str) -> str:
+    return f"{prefix}:{OUTPUT_STAGE_LOG}"
 
 
 def recording_backend(*, url: str, prefix: str, reader: str) -> Any:
@@ -102,6 +146,37 @@ def recording_backend(*, url: str, prefix: str, reader: str) -> Any:
     return ReadRecordingBackend(url=url, key_prefix=prefix)
 
 
+def blocking_output_backend(*, url: str, prefix: str) -> Any:
+    """A Redis provider that stops only after output is durably staged.
+
+    Blocking inside ``stage_output`` places the process at the exact boundary
+    the crash tests need: Redis has atomically stored the pending stage, while
+    the Worker has not returned the activation completion to Core/server.
+    """
+    from temporalio.contrib.external_workflow_streams._redis import RedisStreamBackend
+
+    class DurablyStageThenBlockBackend(RedisStreamBackend):
+        async def stage_output(self, manifest: Any, records: Any) -> Any:
+            stage = await super().stage_output(manifest, records)
+            await self._client.rpush(
+                output_stage_log_key(prefix),
+                json.dumps(
+                    {
+                        "run_id": manifest.run_id,
+                        "stage_token": manifest.stage_token,
+                        "sub_batch_id": manifest.sub_batch_id,
+                    },
+                    sort_keys=True,
+                ),
+            )
+            # There is deliberately no release path. The parent sends SIGKILL,
+            # so neither this call nor Worker shutdown can report completion.
+            await asyncio.Event().wait()
+            return stage
+
+    return DurablyStageThenBlockBackend(url=url, key_prefix=prefix)
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--address", required=True)
@@ -110,16 +185,31 @@ async def main() -> None:
     parser.add_argument("--redis-url", required=True)
     parser.add_argument("--prefix", required=True)
     parser.add_argument("--reader", default="crashed")
+    parser.add_argument(
+        "--mode",
+        choices=("consume", "publish", "update"),
+        default="consume",
+    )
     args = parser.parse_args()
 
     client = await Client.connect(args.address, namespace=args.namespace)
-    backend = recording_backend(
-        url=args.redis_url, prefix=args.prefix, reader=args.reader
-    )
+    workflows: list[type[Any]]
+    if args.mode == "consume":
+        backend = recording_backend(
+            url=args.redis_url, prefix=args.prefix, reader=args.reader
+        )
+        workflows = [CrashConsumeWorkflow]
+    else:
+        backend = blocking_output_backend(url=args.redis_url, prefix=args.prefix)
+        workflows = (
+            [CrashPublishWorkflow]
+            if args.mode == "publish"
+            else [CrashUpdatePublishWorkflow]
+        )
     async with Worker(
         client,
         task_queue=args.task_queue,
-        workflows=[CrashConsumeWorkflow],
+        workflows=workflows,
         external_stream_backend=backend,
     ):
         # Until killed. There is deliberately no shutdown path here.

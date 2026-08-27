@@ -5,9 +5,9 @@ them enforceable rather than aspirational: each case in the plan is mapped to th
 test that covers it, and the mapping is checked against both the plan and the
 test suite.
 
-A case that no test covers yet maps to :data:`BLOCKED` together with the
-deliverable it waits on. That is deliberately louder than leaving it out --
-an unmapped case would pass by omission, while a blocked one is counted and
+A case that no test fully covers yet maps to its concrete missing boundary in
+the corresponding gaps table. That is deliberately louder than leaving it out:
+an unmapped case would pass by omission, while an open one is counted and
 reported every time the gate runs.
 """
 
@@ -21,7 +21,7 @@ from tests.contrib.external_workflow_streams.m1_gate import (
     unresolved,
 )
 
-#: Case number -> the test(s) that cover it, or ``BLOCKED``. A case may need
+#: Case number -> the test(s) that fully cover it. A case may need
 #: more than one test: several of them name two independent properties, and
 #: mapping such a case to whichever half happened to be written first would
 #: claim coverage the suite does not have.
@@ -214,6 +214,42 @@ M1_COVERAGE: dict[int, str | tuple[str, ...]] = {
     # recovery attempt's effective wake and lease supersede the original
     # publish's, while cancellation delivered on either attempt remains owed.
     79: "test_wake.py::test_a_reinterrupted_append_recovery_preserves_its_latest_wake",
+    # 80-101 promote Workflow-originated output. Only cases with every named
+    # boundary asserted belong here; partial unit coverage stays in M1_GAPS.
+    80: "test_output_worker_integration.py::test_reader_waits_at_pending_barrier_until_marker_commit",
+    81: "test_output_worker_integration.py::test_rejected_post_stage_completion_never_exposes_phantom_output",
+    82: "external_streams.rs::speculative_output_redelivery_accepts_a_fresh_token_once",
+    83: "test_output_client.py::test_first_task_boundary_without_token_aborts_pending_stage",
+    84: "external_streams.rs::exact_output_floor_excludes_the_previous_workflow_task_close",
+    85: (
+        "test_worker_crash.py::test_disconnected_update_leaves_live_staged_output_undecided_until_timeout",
+        "test_output_client.py::test_disconnected_speculative_update_stays_pending_until_history_loss",
+    ),
+    86: "test_worker_crash.py::test_real_crash_after_output_stage_aborts_old_token_and_exposes_one_retry",
+    87: "test_output_worker_integration.py::test_cold_client_repairs_post_report_commit_failure",
+    88: (
+        "test_redis_output.py::test_exact_stage_retry_returns_actual_status_after_terminal",
+        "test_output_client.py::test_repeating_the_same_history_reconciliation_is_idempotent",
+    ),
+    89: "test_redis_output.py::test_reusing_stage_identity_with_another_manifest_conflicts_atomically",
+    90: "test_output_runtime.py::test_output_replay_performs_no_io_token_mint_or_live_policy_split",
+    91: "test_output_runtime.py::test_replay_keeps_recorded_segments_when_codec_wire_size_changes",
+    92: "test_output_worker_integration.py::test_output_latency_flushes_a_retained_workflow_task",
+    93: "test_output_worker_integration.py::test_three_retained_output_windows_write_three_markers_and_wfts",
+    94: "test_redis_output.py::test_pending_stage_blocks_later_direct_output_until_commit",
+    95: "test_output_producer.py::test_ambiguous_append_retries_exact_record_without_duplicate",
+    96: "test_output_runtime.py::test_changed_codec_bytes_keep_logical_retry_identity_and_first_bytes",
+    97: "test_output_codec.py::test_metadata_insertion_order_does_not_change_frame_or_fingerprint",
+    98: "test_output_worker_integration.py::test_concurrent_updates_preserve_their_own_turn_ids",
+    99: "test_output_worker_integration.py::test_stage_outage_blocks_wft_and_reports_external_storage_cause",
+    100: (
+        "test_redis_output.py::test_missing_staged_record_is_an_integrity_failure",
+        "test_output_client.py::test_history_loss_is_integrity_but_an_outage_is_storage",
+    ),
+    101: (
+        "test_output_runtime.py::test_oversized_marker_manifest_is_rejected_before_external_io",
+        "test_output_runtime.py::test_one_oversized_logical_record_is_refused_without_poisoning_batch",
+    ),
 }
 
 #: Case number -> what is still missing, for cases the suite does not fully
@@ -250,9 +286,18 @@ M2_COVERAGE: dict[int, str | tuple[str, ...]] = {
         "test_m2_required.py::test_resolving_twice_is_harmless",
     ),
     12: "test_continuation.py::test_a_chain_resumes_where_its_predecessor_stopped",
+    13: "test_replay_end_to_end.py::test_live_and_replay_share_one_input_output_drain_schedule",
+    14: "test_output_worker_integration.py::test_cursor_resume_crosses_rollover_and_continue_as_new",
+    15: "test_redis_output.py::test_input_and_output_with_same_user_identity_are_physically_isolated",
+    16: (
+        "test_output_worker_integration.py::test_output_deadline_wins_park_race_and_removes_every_intent",
+        "external_streams.rs::confirmed_park_flushes_output_in_its_marker_without_forcing_a_task",
+        "external_streams.rs::output_deadline_invalidates_an_issued_park_and_flushes_once",
+    ),
+    17: "test_output_worker_integration.py::test_finished_output_survives_continue_as_new_without_backend_reads",
 }
 
-#: The same, for `tests-m2.md`, which has none.
+#: The same, for `tests-m2.md`.
 M2_GAPS: dict[int, str] = {}
 
 
@@ -343,10 +388,9 @@ def test_every_open_case_says_what_is_missing(list_name: str) -> None:
 def test_the_gate_reports_how_far_each_milestone_is_from_met() -> None:
     """The gate's actual output, and the thing a human reads.
 
-    Not an assertion that a milestone *is* met -- Milestone 1 is not, and a test
-    that failed for that reason would be a permanent red mark saying nothing new
-    each run. What must not happen is losing track of which cases remain, which
-    the two maps above make impossible to do quietly.
+    Coverage and open cases are reported independently of the consistency
+    assertions above. If a future requirement is added before its test, its gap
+    remains visible without turning this reporting test into the failure itself.
     """
     for list_name in ("tests-m1.md", "tests-m2.md"):
         cases = {c.number: c.text for c in required_cases(list_name)}

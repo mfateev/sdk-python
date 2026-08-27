@@ -280,11 +280,14 @@ class Worker:
                 cancelled.
             external_stream_backend: External Workflow Stream provider instance.
                 The provider must declare ``guarantees_immutability = True``;
-                Worker construction fails otherwise.
+                Worker construction fails otherwise. Input subscriptions use
+                ``StreamBackend``. Workflow-originated output additionally
+                requires the provider to implement ``OutputStreamBackend``;
+                input-only providers remain supported.
 
                 .. warning::
-                    This option is experimental and the feature it configures
-                    is incomplete.
+                    This option and the External Workflow Streams feature are
+                    experimental.
             workflow_failure_exception_types: The types of exceptions that, if a
                 workflow-thrown exception extends, will cause the
                 workflow/update to fail instead of suspending the workflow via

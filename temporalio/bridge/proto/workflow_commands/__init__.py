@@ -29,6 +29,8 @@ from .workflow_commands_pb2 import (
     UpdateResponse,
     UpsertWorkflowSearchAttributes,
     WorkflowCommand,
+    WorkflowOutputStreamBuffered,
+    WorkflowOutputStreamCommit,
     WorkflowStreamProgress,
     WorkflowStreamQuiescent,
 )
@@ -64,6 +66,8 @@ __all__ = [
     "UpdateResponse",
     "UpsertWorkflowSearchAttributes",
     "WorkflowCommand",
+    "WorkflowOutputStreamBuffered",
+    "WorkflowOutputStreamCommit",
     "WorkflowStreamProgress",
     "WorkflowStreamQuiescent",
 ]

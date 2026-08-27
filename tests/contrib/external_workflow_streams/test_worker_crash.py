@@ -24,14 +24,28 @@ from typing import Any
 
 import pytest
 
-from temporalio.client import Client
-from temporalio.contrib.external_workflow_streams._backend import StreamKey
+from temporalio.client import Client, WorkflowUpdateRPCTimeoutOrCancelledError
+from temporalio.contrib.external_workflow_streams import (
+    ExternalOutputStreamClient,
+    WorkflowChainKey,
+)
+from temporalio.contrib.external_workflow_streams._backend import (
+    StreamDirection,
+    StreamKey,
+)
+from temporalio.contrib.external_workflow_streams._output_backend import (
+    OutputStageStatus,
+)
 from temporalio.contrib.external_workflow_streams._record import BEGINNING
+from temporalio.contrib.external_workflow_streams._redis import RedisStreamBackend
 from temporalio.worker import Worker
 from tests.contrib.external_workflow_streams.conftest import KEY_NAMESPACE, redis_url
 from tests.contrib.external_workflow_streams.crash_worker import (
     STREAM_NAME,
     CrashConsumeWorkflow,
+    CrashPublishWorkflow,
+    CrashUpdatePublishWorkflow,
+    output_stage_log_key,
     read_log_key,
     recording_backend,
 )
@@ -78,6 +92,59 @@ async def _wait_until(predicate: Any, timeout: float, message: str) -> None:
             return
         await asyncio.sleep(0.2)
     raise AssertionError(message)
+
+
+async def _spawn_crash_worker(
+    client: Client,
+    *,
+    task_queue: str,
+    prefix: str,
+    mode: str,
+) -> asyncio.subprocess.Process:
+    return await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "tests.contrib.external_workflow_streams.crash_worker",
+        "--address",
+        client.service_client.config.target_host,
+        "--namespace",
+        client.namespace,
+        "--task-queue",
+        task_queue,
+        "--redis-url",
+        redis_url(),
+        "--prefix",
+        prefix,
+        "--mode",
+        mode,
+        cwd=str(REPO_ROOT),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+
+
+def _output_marker_tokens(events: list[Any]) -> list[str]:
+    from temporalio.bridge.proto.external_data import ExternalStreamMarkerData
+
+    tokens: list[str] = []
+    for event in events:
+        if not event.HasField("marker_recorded_event_attributes"):
+            continue
+        attributes = event.marker_recorded_event_attributes
+        if attributes.marker_name != "core_external_stream":
+            continue
+        payloads = attributes.details["external_stream"].payloads
+        if len(payloads) != 1:
+            continue
+        marker = ExternalStreamMarkerData()
+        marker.ParseFromString(payloads[0].data)
+        if marker.HasField("output"):
+            tokens.append(marker.output.stage_token)
+    return tokens
+
+
+async def _output_stage_was_logged(redis_client: Any, prefix: str) -> bool:
+    return bool(await redis_client.llen(output_stage_log_key(prefix)))
 
 
 @pytest.mark.timeout(240)
@@ -242,6 +309,313 @@ async def test_a_crash_before_the_marker_makes_the_next_worker_re_read(
             await publisher._client.delete(*keys)
         await publisher.aclose()
         await successor.aclose()
+
+
+@pytest.mark.timeout(240)
+async def test_real_crash_after_output_stage_aborts_old_token_and_exposes_one_retry(
+    client: Client, redis_worker_id: str
+) -> None:
+    """SIGKILL after Redis staging leaves no phantom output before retry.
+
+    The child provider blocks only after the pending stage is atomically
+    durable. Killing that process therefore prevents both the activation report
+    and graceful reconciliation. A successor retries the Workflow Task with a
+    fresh token; the reader proves the dead attempt absent from exact-run
+    History, aborts it, and exposes only the accepted attempt.
+    """
+    pytest.importorskip("redis.asyncio", reason="redis is not installed")
+
+    prefix = f"{KEY_NAMESPACE}:{redis_worker_id}:{uuid.uuid4().hex}"
+    backend = RedisStreamBackend(url=redis_url(), key_prefix=prefix)
+    try:
+        await backend._client.ping()
+    except Exception as err:
+        await backend.aclose()
+        pytest.skip(f"Redis is not reachable at {redis_url()}: {err}")
+
+    task_queue = f"tq-{uuid.uuid4()}"
+    child = await _spawn_crash_worker(
+        client, task_queue=task_queue, prefix=prefix, mode="publish"
+    )
+    handle = None
+    try:
+        handle = await client.start_workflow(
+            CrashPublishWorkflow.run,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=task_queue,
+            task_timeout=timedelta(seconds=TASK_TIMEOUT_SECONDS),
+        )
+        await _wait_until(
+            lambda: _output_stage_was_logged(backend._client, prefix),
+            60,
+            "the child never durably staged Workflow output",
+        )
+
+        description = await handle.describe()
+        chain = WorkflowChainKey(
+            client.namespace,
+            handle.id,
+            description.raw_description.workflow_execution_info.first_run_id,
+        )
+        key = chain.stream_key("events", direction=StreamDirection.OUTPUT)
+        staged_read = await backend.read_output_after(
+            key, BEGINNING, max_records=100, block=timedelta(0)
+        )
+        assert staged_read.records == ()
+        assert staged_read.pending is not None
+        abandoned_manifest = staged_read.pending.manifest
+        abandoned = await backend.output_stage(abandoned_manifest)
+        assert abandoned is not None
+        assert abandoned.status is OutputStageStatus.PENDING
+        assert abandoned.records, "the pending stage is not physically durable"
+
+        before_kill = await _history(handle)
+        assert _output_marker_tokens(before_kill) == []
+        assert not any(
+            event.HasField("workflow_task_completed_event_attributes")
+            for event in before_kill
+        ), "the child reported the producing Workflow Task before it was killed"
+
+        child.kill()
+        await child.wait()
+
+        async with Worker(
+            client,
+            task_queue=task_queue,
+            workflows=[CrashPublishWorkflow],
+            external_stream_backend=backend,
+        ):
+            assert await asyncio.wait_for(handle.result(), 120) == "done"
+            output_client = await ExternalOutputStreamClient.connect(
+                backend=backend,
+                workflow=chain,
+                client=client,
+            )
+            visible = [
+                item.data
+                async for item in output_client.topic("events", type=str).subscribe()
+            ]
+
+        assert visible == ["accepted-after-crash"]
+        abandoned = await backend.output_stage(abandoned_manifest)
+        assert abandoned is not None
+        assert abandoned.status is OutputStageStatus.ABORTED
+
+        events = await _history(handle)
+        accepted_tokens = _output_marker_tokens(events)
+        assert len(accepted_tokens) == 1
+        assert accepted_tokens[0] != abandoned_manifest.stage_token
+        assert any(
+            event.HasField("workflow_task_timed_out_event_attributes")
+            for event in events
+        )
+
+        statuses = await backend._client.hvals(backend._output_status_key(key))
+        decoded_statuses = sorted(
+            value.decode() if isinstance(value, bytes) else value for value in statuses
+        )
+        assert decoded_statuses == ["aborted", "committed"]
+    finally:
+        if child.returncode is None:
+            child.kill()
+            await child.wait()
+        if handle is not None:
+            try:
+                await handle.terminate()
+            except Exception:
+                pass
+        keys = [key async for key in backend._client.scan_iter(match=f"{prefix}*")]
+        if keys:
+            await backend._client.delete(*keys)
+        await backend.aclose()
+
+
+@pytest.mark.timeout(240)
+async def test_disconnected_update_leaves_live_staged_output_undecided_until_timeout(
+    client: Client,
+    redis_worker_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling the Update caller cannot decide its staged output.
+
+    This uses a real speculative Update and a child Worker stopped between durable
+    Redis staging and its server report. A live output reader repeatedly checks
+    exact-run History after the caller disconnects and must leave the barrier
+    pending. Only the dead Worker's Workflow Task timeout is a deciding durable
+    boundary, at which point the reader may abort the abandoned stage.
+
+    Retention loss itself is covered separately with deterministic fake History;
+    the local test server cannot force expiry of one exact Run on demand.
+    """
+    pytest.importorskip("redis.asyncio", reason="redis is not installed")
+
+    prefix = f"{KEY_NAMESPACE}:{redis_worker_id}:{uuid.uuid4().hex}"
+    backend = RedisStreamBackend(url=redis_url(), key_prefix=prefix)
+    try:
+        await backend._client.ping()
+    except Exception as err:
+        await backend.aclose()
+        pytest.skip(f"Redis is not reachable at {redis_url()}: {err}")
+
+    task_queue = f"tq-{uuid.uuid4()}"
+    child = await _spawn_crash_worker(
+        client, task_queue=task_queue, prefix=prefix, mode="update"
+    )
+    handle = None
+    update_task: asyncio.Task[str] | None = None
+    read_task: asyncio.Task[Any] | None = None
+    try:
+        handle = await client.start_workflow(
+            CrashUpdatePublishWorkflow.run,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=task_queue,
+            task_timeout=timedelta(seconds=TASK_TIMEOUT_SECONDS),
+        )
+
+        async def initial_task_completed() -> bool:
+            return any(
+                event.HasField("workflow_task_completed_event_attributes")
+                for event in await _history(handle)
+            )
+
+        await _wait_until(
+            initial_task_completed,
+            60,
+            "the child never completed the Workflow's initial waiting task",
+        )
+        description = await handle.describe()
+        chain = WorkflowChainKey(
+            client.namespace,
+            handle.id,
+            description.raw_description.workflow_execution_info.first_run_id,
+        )
+        key = chain.stream_key("events", direction=StreamDirection.OUTPUT)
+
+        update_task = asyncio.create_task(
+            handle.execute_update(
+                CrashUpdatePublishWorkflow.publish,
+                "unreported-update-output",
+            )
+        )
+        await _wait_until(
+            lambda: _output_stage_was_logged(backend._client, prefix),
+            30,
+            "the speculative Update handler never durably staged its output",
+        )
+        staged_read = await backend.read_output_after(
+            key, BEGINNING, max_records=100, block=timedelta(0)
+        )
+        assert staged_read.records == ()
+        assert staged_read.pending is not None
+        pending = staged_read.pending
+        manifest = pending.manifest
+
+        output_client = await ExternalOutputStreamClient.connect(
+            backend=backend,
+            workflow=chain,
+            client=client,
+        )
+        topic = output_client.topic("events", type=str)
+        original_history_decision = topic._history_decision
+        reconciliation_attempts = 0
+
+        async def count_live_history_decisions(manifest_to_check: Any) -> Any:
+            nonlocal reconciliation_attempts
+            reconciliation_attempts += 1
+            return await original_history_decision(manifest_to_check)
+
+        monkeypatch.setattr(topic, "_history_decision", count_live_history_decisions)
+
+        async def reconcile_pending_stage() -> None:
+            while not await topic._resolve_pending(pending):
+                await asyncio.sleep(1)
+
+        read_task = asyncio.create_task(reconcile_pending_stage())
+
+        # This is the caller disconnect. It cancels only its wait for the Update
+        # result; the server-side speculative Update and its Workflow Task survive.
+        update_task.cancel()
+        with pytest.raises(WorkflowUpdateRPCTimeoutOrCancelledError):
+            await update_task
+
+        async def reader_retried_history() -> bool:
+            return reconciliation_attempts >= 3
+
+        await _wait_until(
+            reader_retried_history,
+            TASK_TIMEOUT_SECONDS - 1,
+            "the live reader did not retry ambiguous exact-run History",
+        )
+        undecided = await backend.output_stage(manifest)
+        assert undecided is not None
+        assert undecided.status is OutputStageStatus.PENDING
+        assert not read_task.done()
+
+        events_before_loss = await _history(handle)
+        relevant = [
+            event
+            for event in events_before_loss
+            if event.event_id > manifest.history_floor_event_id
+        ]
+        # This server delivered the Update speculatively: the handler ran (the
+        # stage above is durable proof of that), but admission itself cannot
+        # enter History until the withheld Workflow Task report is accepted.
+        assert not any(
+            event.HasField("workflow_execution_update_admitted_event_attributes")
+            for event in relevant
+        )
+        assert _output_marker_tokens(relevant) == []
+        assert not any(
+            event.HasField(field)
+            for event in relevant
+            for field in (
+                "workflow_task_completed_event_attributes",
+                "workflow_task_failed_event_attributes",
+                "workflow_task_timed_out_event_attributes",
+            )
+        )
+
+        child.kill()
+        await child.wait()
+
+        async def abandoned_stage_was_aborted() -> bool:
+            stage = await backend.output_stage(manifest)
+            return stage is not None and stage.status is OutputStageStatus.ABORTED
+
+        await _wait_until(
+            abandoned_stage_was_aborted,
+            30,
+            "the dead Update task timed out but its pending output was not aborted",
+        )
+        await asyncio.wait_for(read_task, 5)
+        events_after_loss = await _history(handle)
+        assert any(
+            event.event_id > manifest.history_floor_event_id
+            and event.HasField("workflow_task_timed_out_event_attributes")
+            for event in events_after_loss
+        )
+        assert _output_marker_tokens(events_after_loss) == []
+    finally:
+        if update_task is not None and not update_task.done():
+            update_task.cancel()
+        if read_task is not None and not read_task.done():
+            read_task.cancel()
+            try:
+                await read_task
+            except asyncio.CancelledError:
+                pass
+        if child.returncode is None:
+            child.kill()
+            await child.wait()
+        if handle is not None:
+            try:
+                await handle.terminate()
+            except Exception:
+                pass
+        keys = [key async for key in backend._client.scan_iter(match=f"{prefix}*")]
+        if keys:
+            await backend._client.delete(*keys)
+        await backend.aclose()
 
 
 async def _read_anything(redis_client: Any, prefix: str, reader: str) -> bool:

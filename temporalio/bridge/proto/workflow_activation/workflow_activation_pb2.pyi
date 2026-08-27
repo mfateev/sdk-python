@@ -97,6 +97,7 @@ class WorkflowActivation(google.protobuf.message.Message):
     LAST_SDK_VERSION_FIELD_NUMBER: builtins.int
     SUGGEST_CONTINUE_AS_NEW_REASONS_FIELD_NUMBER: builtins.int
     TARGET_WORKER_DEPLOYMENT_VERSION_CHANGED_FIELD_NUMBER: builtins.int
+    HISTORY_FLOOR_EVENT_ID_FIELD_NUMBER: builtins.int
     run_id: builtins.str
     """The id of the currently active run of the workflow. Also used as a cache key. There may
     only ever be one active workflow task (and hence activation) of a run at one time.
@@ -158,6 +159,11 @@ class WorkflowActivation(google.protobuf.message.Message):
     the workflow is Pinned.
     Experimental.
     """
+    history_floor_event_id: builtins.int
+    """The event immediately preceding this Workflow Task's WorkflowTaskScheduled event in the
+    ordered History view Core used to build the activation. Zero means Core could not identify
+    that exact predecessor, in which case output must not be staged for this task.
+    """
     def __init__(
         self,
         *,
@@ -177,6 +183,7 @@ class WorkflowActivation(google.protobuf.message.Message):
         ]
         | None = ...,
         target_worker_deployment_version_changed: builtins.bool = ...,
+        history_floor_event_id: builtins.int = ...,
     ) -> None: ...
     def HasField(
         self,
@@ -196,6 +203,8 @@ class WorkflowActivation(google.protobuf.message.Message):
             b"continue_as_new_suggested",
             "deployment_version_for_current_task",
             b"deployment_version_for_current_task",
+            "history_floor_event_id",
+            b"history_floor_event_id",
             "history_length",
             b"history_length",
             "history_size_bytes",
@@ -578,6 +587,7 @@ class ReplayExternalStreams(google.protobuf.message.Message):
     WAITS_FIELD_NUMBER: builtins.int
     REPLAY_ANNOTATION_FIELD_NUMBER: builtins.int
     TERMINAL_BOUNDARY_FIELD_NUMBER: builtins.int
+    OUTPUT_FIELD_NUMBER: builtins.int
     quiescence_generation: builtins.int
     @property
     def waits(
@@ -590,6 +600,11 @@ class ReplayExternalStreams(google.protobuf.message.Message):
     terminal_boundary: (
         temporalio.bridge.proto.external_data.external_data_pb2.ParkReason.ValueType
     )
+    @property
+    def output(
+        self,
+    ) -> temporalio.bridge.proto.external_data.external_data_pb2.ExternalOutputStreamManifest:
+        """The output manifest recorded in the same marker, if this Workflow Task published output."""
     def __init__(
         self,
         *,
@@ -600,10 +615,17 @@ class ReplayExternalStreams(google.protobuf.message.Message):
         | None = ...,
         replay_annotation: builtins.bytes = ...,
         terminal_boundary: temporalio.bridge.proto.external_data.external_data_pb2.ParkReason.ValueType = ...,
+        output: temporalio.bridge.proto.external_data.external_data_pb2.ExternalOutputStreamManifest
+        | None = ...,
     ) -> None: ...
+    def HasField(
+        self, field_name: typing_extensions.Literal["output", b"output"]
+    ) -> builtins.bool: ...
     def ClearField(
         self,
         field_name: typing_extensions.Literal[
+            "output",
+            b"output",
             "quiescence_generation",
             b"quiescence_generation",
             "replay_annotation",

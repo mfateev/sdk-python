@@ -1,4 +1,7 @@
 from .external_data_pb2 import (
+    ExternalOutputSegmentManifest,
+    ExternalOutputStreamManifest,
+    ExternalOutputTopicManifest,
     ExternalStreamMarkerData,
     ExternalWaitMarker,
     LocalActivityMarkerData,
@@ -7,6 +10,9 @@ from .external_data_pb2 import (
 )
 
 __all__ = [
+    "ExternalOutputSegmentManifest",
+    "ExternalOutputStreamManifest",
+    "ExternalOutputTopicManifest",
     "ExternalStreamMarkerData",
     "ExternalWaitMarker",
     "LocalActivityMarkerData",

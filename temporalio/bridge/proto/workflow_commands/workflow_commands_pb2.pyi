@@ -26,6 +26,7 @@ import temporalio.api.failure.v1.message_pb2
 import temporalio.api.sdk.v1.user_metadata_pb2
 import temporalio.bridge.proto.child_workflow.child_workflow_pb2
 import temporalio.bridge.proto.common.common_pb2
+import temporalio.bridge.proto.external_data.external_data_pb2
 import temporalio.bridge.proto.nexus.nexus_pb2
 
 if sys.version_info >= (3, 10):
@@ -105,6 +106,8 @@ class WorkflowCommand(google.protobuf.message.Message):
     WORKFLOW_STREAM_QUIESCENT_FIELD_NUMBER: builtins.int
     EXTERNAL_STREAM_PARK_RESULT_FIELD_NUMBER: builtins.int
     EXTERNAL_STREAM_FINALIZED_FIELD_NUMBER: builtins.int
+    WORKFLOW_OUTPUT_STREAM_COMMIT_FIELD_NUMBER: builtins.int
+    WORKFLOW_OUTPUT_STREAM_BUFFERED_FIELD_NUMBER: builtins.int
     @property
     def user_metadata(self) -> temporalio.api.sdk.v1.user_metadata_pb2.UserMetadata:
         """User metadata that may or may not be persisted into history depending on the command type.
@@ -177,6 +180,12 @@ class WorkflowCommand(google.protobuf.message.Message):
     def external_stream_park_result(self) -> global___ExternalStreamParkResult: ...
     @property
     def external_stream_finalized(self) -> global___ExternalStreamFinalized: ...
+    @property
+    def workflow_output_stream_commit(self) -> global___WorkflowOutputStreamCommit: ...
+    @property
+    def workflow_output_stream_buffered(
+        self,
+    ) -> global___WorkflowOutputStreamBuffered: ...
     def __init__(
         self,
         *,
@@ -215,6 +224,9 @@ class WorkflowCommand(google.protobuf.message.Message):
         workflow_stream_quiescent: global___WorkflowStreamQuiescent | None = ...,
         external_stream_park_result: global___ExternalStreamParkResult | None = ...,
         external_stream_finalized: global___ExternalStreamFinalized | None = ...,
+        workflow_output_stream_commit: global___WorkflowOutputStreamCommit | None = ...,
+        workflow_output_stream_buffered: global___WorkflowOutputStreamBuffered
+        | None = ...,
     ) -> None: ...
     def HasField(
         self,
@@ -271,6 +283,10 @@ class WorkflowCommand(google.protobuf.message.Message):
             b"user_metadata",
             "variant",
             b"variant",
+            "workflow_output_stream_buffered",
+            b"workflow_output_stream_buffered",
+            "workflow_output_stream_commit",
+            b"workflow_output_stream_commit",
             "workflow_stream_progress",
             b"workflow_stream_progress",
             "workflow_stream_quiescent",
@@ -332,6 +348,10 @@ class WorkflowCommand(google.protobuf.message.Message):
             b"user_metadata",
             "variant",
             b"variant",
+            "workflow_output_stream_buffered",
+            b"workflow_output_stream_buffered",
+            "workflow_output_stream_commit",
+            b"workflow_output_stream_commit",
             "workflow_stream_progress",
             b"workflow_stream_progress",
             "workflow_stream_quiescent",
@@ -368,6 +388,8 @@ class WorkflowCommand(google.protobuf.message.Message):
             "workflow_stream_quiescent",
             "external_stream_park_result",
             "external_stream_finalized",
+            "workflow_output_stream_commit",
+            "workflow_output_stream_buffered",
         ]
         | None
     ): ...
@@ -619,6 +641,70 @@ class ExternalStreamFinalized(google.protobuf.message.Message):
     ) -> None: ...
 
 global___ExternalStreamFinalized = ExternalStreamFinalized
+
+class WorkflowOutputStreamCommit(google.protobuf.message.Message):
+    """Reports that the output batch for this Workflow Task has been durably staged outside History.
+    Core records only this compact manifest in the shared external-stream marker.
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    MANIFEST_FIELD_NUMBER: builtins.int
+    REQUEST_ROLLOVER_FIELD_NUMBER: builtins.int
+    @property
+    def manifest(
+        self,
+    ) -> temporalio.bridge.proto.external_data.external_data_pb2.ExternalOutputStreamManifest: ...
+    request_rollover: builtins.bool
+    """The deterministic output capacity was reached and this task must request a replacement."""
+    def __init__(
+        self,
+        *,
+        manifest: temporalio.bridge.proto.external_data.external_data_pb2.ExternalOutputStreamManifest
+        | None = ...,
+        request_rollover: builtins.bool = ...,
+    ) -> None: ...
+    def HasField(
+        self, field_name: typing_extensions.Literal["manifest", b"manifest"]
+    ) -> builtins.bool: ...
+    def ClearField(
+        self,
+        field_name: typing_extensions.Literal[
+            "manifest", b"manifest", "request_rollover", b"request_rollover"
+        ],
+    ) -> None: ...
+
+global___WorkflowOutputStreamCommit = WorkflowOutputStreamCommit
+
+class WorkflowOutputStreamBuffered(google.protobuf.message.Message):
+    """Reports that external output is buffered in lang but has not yet been staged. Core retains the
+    open Workflow Task until the earliest reported deadline and then asks lang to finalize it.
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    MAX_PUBLISH_LATENCY_FIELD_NUMBER: builtins.int
+    @property
+    def max_publish_latency(self) -> google.protobuf.duration_pb2.Duration: ...
+    def __init__(
+        self,
+        *,
+        max_publish_latency: google.protobuf.duration_pb2.Duration | None = ...,
+    ) -> None: ...
+    def HasField(
+        self,
+        field_name: typing_extensions.Literal[
+            "max_publish_latency", b"max_publish_latency"
+        ],
+    ) -> builtins.bool: ...
+    def ClearField(
+        self,
+        field_name: typing_extensions.Literal[
+            "max_publish_latency", b"max_publish_latency"
+        ],
+    ) -> None: ...
+
+global___WorkflowOutputStreamBuffered = WorkflowOutputStreamBuffered
 
 class StartTimer(google.protobuf.message.Message):
     DESCRIPTOR: google.protobuf.descriptor.Descriptor

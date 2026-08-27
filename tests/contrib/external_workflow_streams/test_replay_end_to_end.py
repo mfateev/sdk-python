@@ -38,8 +38,12 @@ from temporalio.contrib.external_workflow_streams._record import (
 )
 from temporalio.worker import Replayer, Worker
 from tests.contrib.external_workflow_streams.memory_backend import MemoryStreamBackend
+from tests.contrib.external_workflow_streams.test_output_worker_integration import (
+    _OutputMemoryBackend,
+)
 
 with workflow.unsafe.imports_passed_through():
+    from temporalio.contrib.external_workflow_streams import external_output_stream
     from temporalio.contrib.external_workflow_streams._api import external_stream
     from tests.contrib.external_workflow_streams import observations
 
@@ -88,6 +92,41 @@ class ConditionWorkflow:
         # Recorded outside the Workflow as well as returned: the return value is
         # only visible for the live run, and the whole question here is whether
         # the *replay* saw the same thing.
+        observations.record(workflow.info().run_id, self._states_observed)
+        return self._states_observed
+
+    def _observe(self) -> bool:
+        self._states_observed.append(len(self._seen))
+        return len(self._seen) >= 2
+
+
+@workflow.defn(sandboxed=False)
+class CombinedInputOutputConditionWorkflow:
+    """Records the drain schedule while input and output share one retained WFT."""
+
+    def __init__(self) -> None:
+        self._seen: list[str] = []
+        self._states_observed: list[int] = []
+
+    @workflow.run
+    async def run(self, expected: int) -> list[int]:
+        tokens = external_stream.with_options(idle_timeout=timedelta(seconds=30)).topic(
+            "tokens", type=str
+        )
+        output = external_output_stream.with_options(
+            max_publish_latency=timedelta(seconds=30)
+        ).topic("events", type=str)
+
+        async def watch() -> None:
+            await workflow.wait_condition(self._observe)
+
+        watcher = asyncio.ensure_future(watch())
+        async for token in tokens.subscribe():
+            self._seen.append(token)
+            await output.publish(f"observed:{token}")
+            if len(self._seen) >= expected:
+                break
+        await watcher
         observations.record(workflow.info().run_id, self._states_observed)
         return self._states_observed
 
@@ -252,6 +291,79 @@ async def test_replaying_a_stream_history_reproduces_the_same_observations(
         f"boundaries were collapsed or re-cut. live={live_observed} "
         f"replayed={replayed_observed}"
     )
+
+
+async def test_live_and_replay_share_one_input_output_drain_schedule(
+    client: Client,
+) -> None:
+    """A real shared marker reproduces one drain sequence, not two drivers."""
+    backend = _OutputMemoryBackend()
+    task_queue = f"tq-{uuid.uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[CombinedInputOutputConditionWorkflow],
+        external_stream_backend=backend,
+    ):
+        handle = await client.start_workflow(
+            CombinedInputOutputConditionWorkflow.run,
+            2,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=task_queue,
+        )
+        key = await stream_key_for(client, handle, "tokens")
+        await asyncio.sleep(0.5)
+        await publish(backend, key, ["alpha"])
+        # The first readiness activation must finish and retain the same WFT
+        # before the second arrival, so the marker records two live drains.
+        await asyncio.sleep(0.25)
+        await publish(backend, key, ["beta"])
+
+        live = await asyncio.wait_for(handle.result(), 60)
+        history = await handle.fetch_history()
+        run_id = handle.first_execution_run_id or handle.result_run_id
+
+    markers = stream_markers(history.events)
+    assert len(markers) == 1
+    marker_event = markers[0]
+
+    from temporalio.bridge.proto.external_data import ExternalStreamMarkerData
+
+    marker = ExternalStreamMarkerData()
+    marker.ParseFromString(
+        marker_event.marker_recorded_event_attributes.details["external_stream"]
+        .payloads[0]
+        .data
+    )
+    assert marker.HasField("output")
+    assert marker.waits
+    annotation = decode_annotation(marker.replay_annotation)
+    assert len(annotation.segments) >= 3
+    assert len(marker.output.segments) == len(annotation.segments)
+    assert (
+        sum(sum(segment.record_counts_by_topic) for segment in marker.output.segments)
+        == 2
+    )
+    assert sum(bool(segment.runs) for segment in annotation.segments) == 2
+
+    result = await Replayer(
+        workflows=[CombinedInputOutputConditionWorkflow],
+        external_stream_backend=backend,
+    ).replay_workflow(history)
+    assert result.replay_failure is None, (
+        f"combined input/output replay failed: {result.replay_failure}"
+    )
+    assert len(live) > 1
+    assert run_id is not None
+    runs = observations.executions(run_id)
+    assert len(runs) == 2
+    live_observed, replayed_observed = runs
+    assert live_observed == live
+    assert replayed_observed == live_observed, (
+        "the shared input/output replay driver changed the live drain schedule: "
+        f"live={live_observed}, replay={replayed_observed}"
+    )
+    assert len(backend.stages) == 1, "replay must not stage output again"
 
 
 async def test_a_history_with_stream_markers_needs_its_backend_to_replay(

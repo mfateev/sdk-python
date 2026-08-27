@@ -322,6 +322,7 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         drain has run. Held here rather than on the runtime because what it
         defers is a step of the *activation*, not of the stream runtime.
         """
+        self._pending_output_replay_finish = False
         self._disable_eager_activity_execution = det.disable_eager_activity_execution
         self._worker_level_failure_exception_types = (
             det.worker_level_failure_exception_types
@@ -498,13 +499,22 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         )
         self._time_ns = act.timestamp.ToNanoseconds()
         self._is_replaying = act.is_replaying
-        if self._external_stream_runtime is not None:
+        if self._external_stream_runtime is not None and not any(
+            job.HasField("remove_from_cache") for job in act.jobs
+        ):
             # Re-arms the per-activation delivery budget. It has to be reset here
             # rather than anywhere later: a producer that keeps a subscription's
             # buffer non-empty would otherwise keep the iterator fed for the
             # whole of this call, and this call runs on a thread-pool executor
             # under a 2-second deadlock timeout that every retry would hit again.
-            self._external_stream_runtime.begin_activation()
+            #
+            # A cache-removal activation is not a Workflow Task. In particular,
+            # it must still be able to tear down a runtime whose output staging
+            # failed: treating the eviction's (empty) history floor as a new task
+            # would reject the still-uncommitted batch and poison eviction.
+            self._external_stream_runtime.begin_activation(
+                getattr(act, "history_floor_event_id", None)
+            )
         self._current_thread_id = threading.get_ident()
         self._current_internal_flags = act.available_internal_flags
         self._single_batch_activation = self._workflow_logic_flag_enabled(
@@ -907,19 +917,46 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         belongs to one Workflow Task, so ``workflow.now()`` is constant across
         them in both directions.
         """
-        del job
         runtime = self._external_stream_runtime
         if runtime is None:
             raise RuntimeError(
                 "received an external stream replay job without the per-Run "
                 "validation runtime"
             )
+        has_field = getattr(job, "HasField", None)
+        try:
+            has_output = bool(has_field and has_field("output"))
+        except ValueError:
+            # Compatible with a generated binding from before the additive
+            # output field (and with input-only replay driver test doubles).
+            has_output = False
+        output = cast(Any, job).output if has_output else None
+        output_segments = output.segments if output is not None else ()
+        if has_output:
+            runtime.begin_output_replay(output)
+            self._pending_output_replay_finish = True
         plan = runtime.take_replay_plan()
         if plan is None:
-            # Nothing was prepared -- the job reached the Workflow thread without
-            # its ranges being read, which would mean delivering from a buffer
-            # that live watching filled. Better to deliver nothing than to
-            # deliver something replay did not record.
+            if has_output:
+                # An output-only marker deliberately has no input ReplayPlan.
+                # Its segment list is still the shared activation schedule: run
+                # the first k - 1 drains here and leave the last to activate()'s
+                # ordinary trailing drain, exactly as the input-driven path
+                # below does. Treating all output-only markers as one segment
+                # collapsed retained multi-activation Workflow Tasks on replay.
+                for _segment in output_segments[:-1]:
+                    runtime.begin_output_replay_segment()
+                    runtime.resolve_all_pending()
+                    self._run_once(check_conditions=True)
+                if output_segments:
+                    runtime.begin_output_replay_segment()
+                runtime.resolve_all_pending()
+                return
+
+            # Nothing was prepared -- the input replay job reached the Workflow
+            # thread without its ranges being read, which would mean delivering
+            # from a buffer that live watching filled. Better to deliver nothing
+            # than to deliver something replay did not record.
             runtime.resolve_all_pending()
             return
 
@@ -943,11 +980,15 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
             # activation's single trailing drain served the records that
             # activation had just been handed.
             for segment in plan.segments[:-1]:
+                if has_output:
+                    runtime.begin_output_replay_segment()
                 runtime.begin_replay_segment(list(segment.deliveries))
                 runtime.resolve_all_pending()
                 self._run_once(check_conditions=True)
             # Reached only once every segment but the last has been drained.
             if plan.segments:
+                if has_output:
+                    runtime.begin_output_replay_segment()
                 runtime.begin_replay_segment(list(plan.segments[-1].deliveries))
                 runtime.resolve_all_pending()
                 # Closing the replay here would end replay mode before the drain
@@ -958,6 +999,8 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
                 self._pending_replay_finish = plan
                 deferred = True
             else:
+                if has_output:
+                    runtime.begin_output_replay_segment()
                 # A marker that recorded no activation of its own -- a Workflow
                 # Task that bound a wait and blocked with the stream never
                 # delivering. **Nothing is deferred, and that is not asymmetry
@@ -974,7 +1017,15 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
                 # they arrive on the activation the re-read announces.
                 self._pending_replay_finish = plan
                 closed = True
-                self._finish_replay_external_streams()
+                if has_output:
+                    # Input has no recorded drain and must reposition before the
+                    # activation's live drain. Output, however, is produced by
+                    # that drain and is validated after it.
+                    self._pending_output_replay_finish = False
+                    self._finish_replay_external_streams()
+                    self._pending_output_replay_finish = True
+                else:
+                    self._finish_replay_external_streams()
         finally:
             if not deferred and not closed:
                 # The walk raised part-way. Leaving replay mode set would make
@@ -984,6 +1035,9 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
                 # run here, where they would replace the error that got us here
                 # with one of their own.
                 self._pending_replay_finish = None
+                self._pending_output_replay_finish = False
+                if has_output:
+                    runtime.abandon_output_replay()
                 runtime.end_replay()
 
     def _abandon_replay_external_streams(self) -> None:
@@ -992,8 +1046,10 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         For the path where an activation is already failing. See the caller.
         """
         self._pending_replay_finish = None
+        self._pending_output_replay_finish = False
         runtime = self._external_stream_runtime
         if runtime is not None:
+            runtime.abandon_output_replay()
             runtime.end_replay()
 
     def _finish_replay_external_streams(self) -> None:
@@ -1004,9 +1060,11 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         :meth:`_apply_replay_external_streams` gives.
         """
         plan = self._pending_replay_finish
-        if plan is None:
+        output_pending = getattr(self, "_pending_output_replay_finish", False)
+        if plan is None and not output_pending:
             return
         self._pending_replay_finish = None
+        self._pending_output_replay_finish = False
         runtime = self._external_stream_runtime
         if runtime is None:
             return
@@ -1016,7 +1074,8 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
             # replay that ends holding one has run code that consumes less than
             # History says was consumed -- what a removed `subscribe()` call
             # looks like from here.
-            runtime.verify_replay_consumed()
+            if plan is not None:
+                runtime.verify_replay_consumed()
             # The manager knew nothing about this marker while replay was
             # running: its watcher has been reading the very same records from
             # the subscription's start cursor into the live buffer. The next live
@@ -1029,9 +1088,18 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
             # raised part-way committed nothing, and advancing a committed cursor
             # for records this Workflow may never have received would lose them
             # outright.
-            runtime.reposition_after_replay(plan.committed_boundaries)
+            if plan is not None:
+                runtime.reposition_after_replay(plan.committed_boundaries)
+            if output_pending:
+                runtime.verify_output_replay()
         finally:
-            runtime.end_replay()
+            if output_pending:
+                # Successful verification already cleared the manifest, so
+                # this is a no-op on success and cleanup of partial output on
+                # every validation/input-reposition failure path.
+                runtime.abandon_output_replay()
+            if plan is not None:
+                runtime.end_replay()
 
     def _apply_query_workflow(
         self, job: temporalio.bridge.proto.workflow_activation.QueryWorkflow
@@ -2436,16 +2504,25 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         if runtime is None:
             return
         continuation = runtime.continuation()
-        if not continuation.cursors:
-            return
-        from temporalio.contrib.external_workflow_streams._continuation import (
-            CONTINUATION_HEADER,
-            write_continuation_header,
-        )
+        if continuation.cursors:
+            from temporalio.contrib.external_workflow_streams._continuation import (
+                CONTINUATION_HEADER,
+                write_continuation_header,
+            )
 
-        command.headers[CONTINUATION_HEADER].CopyFrom(
-            write_continuation_header(continuation)
-        )
+            command.headers[CONTINUATION_HEADER].CopyFrom(
+                write_continuation_header(continuation)
+            )
+        output_continuation = runtime.output_continuation()
+        if output_continuation is not None:
+            from temporalio.contrib.external_workflow_streams._output_continuation import (
+                OUTPUT_CONTINUATION_HEADER,
+                write_output_continuation_header,
+            )
+
+            command.headers[OUTPUT_CONTINUATION_HEADER].CopyFrom(
+                write_output_continuation_header(output_continuation)
+            )
 
     def _refresh_external_stream_continuations(self) -> None:
         """Re-takes the continuation snapshot now the activation has quiesced.

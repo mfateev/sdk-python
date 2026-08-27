@@ -489,11 +489,19 @@ def test_the_handle_types_are_named_as_the_design_says() -> None:
     assert hasattr(ExternalStreamTopic, "subscribe")
 
 
-def test_the_package_still_exports_nothing() -> None:
-    """The public API is exported together with deterministic replay support."""
+def test_the_package_exports_both_directions_without_merging_their_roles() -> None:
     import temporalio.contrib.external_workflow_streams as package
 
-    assert package.__all__ == []
+    assert {
+        "ExternalOutputStreamClient",
+        "ExternalOutputStreamProducer",
+        "ExternalOutputStreamTopic",
+        "OutputStreamBackend",
+        "StreamDirection",
+        "external_output_stream",
+    } <= set(package.__all__)
+    assert not hasattr(package.ExternalOutputStreamTopic, "subscribe")
+    assert hasattr(package.ExternalOutputStreamTopic, "publish")
 
 
 @pytest.mark.asyncio
